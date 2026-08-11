@@ -6,6 +6,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from engineering_kg.ingest.openspec import (
+    OpenSpecStoreSourceValidationResult,
+    RegisteredOpenSpecStore,
+    validate_openspec_store_source,
+)
 from engineering_kg.ontology import GraphSnapshot
 from engineering_kg.openlore import OpenLoreSourceValidationResult, validate_workspace_openlore_source
 from engineering_kg.persistence import persist_graph_snapshot
@@ -21,6 +26,7 @@ class PipelineResult:
     executed_stages: tuple[str, ...]
     graph: GraphSnapshot
     openlore_source: OpenLoreSourceValidationResult | None = None
+    openspec_store_source: OpenSpecStoreSourceValidationResult | None = None
 
     @property
     def configured_stage_count(self) -> int:
@@ -41,12 +47,18 @@ class PipelineResult:
             data.pop("openlore_source")
         else:
             data["openlore_source"] = self.openlore_source.as_dict()
+        if self.openspec_store_source is None:
+            data.pop("openspec_store_source")
+        else:
+            data["openspec_store_source"] = self.openspec_store_source.as_dict()
         return data
 
 
 def run_pipeline(
     registry_path: str | Path | None = None,
     persistence_path: str | Path | None = None,
+    openspec_stores: tuple[RegisteredOpenSpecStore, ...] | None = None,
+    openspec_store_id: str | None = None,
 ) -> PipelineResult:
     """Start the MVP pipeline, optionally persisting a graph snapshot."""
 
@@ -58,9 +70,17 @@ def run_pipeline(
         )
         executed_stages: list[str] = []
         graph = GraphSnapshot()
+        openspec_store_source = None
         if "workspace-registry" in configured_stages:
             executed_stages.append("workspace-registry")
             graph = registry.to_graph_snapshot()
+        if "openspec-store-source" in configured_stages:
+            openspec_store_source = validate_openspec_store_source(
+                registry,
+                registered_stores=openspec_stores,
+                selected_store_id=openspec_store_id,
+            )
+            executed_stages.append("openspec-store-source")
         openlore_source = None
         if "workspace-openlore-source" in configured_stages:
             openlore_source = validate_workspace_openlore_source(registry)
@@ -74,6 +94,7 @@ def run_pipeline(
             executed_stages=tuple(executed_stages),
             graph=graph,
             openlore_source=openlore_source,
+            openspec_store_source=openspec_store_source,
         )
 
     if persistence_path is not None:

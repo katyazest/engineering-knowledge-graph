@@ -17,6 +17,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from engineering_kg.pipeline import run_pipeline
+from engineering_kg.ingest.openspec import RegisteredOpenSpecStore
 
 
 class PipelineRunnerSmokeTest(unittest.TestCase):
@@ -156,6 +157,72 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             "api_response",
         ):
             self.assertNotIn(forbidden, serialized)
+
+    def test_pipeline_executes_openspec_store_source_stage(self) -> None:
+        registry_path = (
+            FIXTURES
+            / "non-git-workspace"
+            / "openspec"
+            / "requirements_repo"
+            / "repo-index-openspec-store-stage.yaml"
+        )
+        requirements_repo = registry_path.parent
+        stores = (RegisteredOpenSpecStore("requirements-store", requirements_repo),)
+
+        first = run_pipeline(registry_path, openspec_stores=stores).as_dict()
+        second = run_pipeline(registry_path, openspec_stores=stores).as_dict()
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first["configured_stages"],
+            ["workspace-registry", "openspec-store-source"],
+        )
+        self.assertEqual(
+            first["executed_stages"],
+            ["workspace-registry", "openspec-store-source"],
+        )
+        self.assertEqual(first["configured_stage_count"], 2)
+        self.assertEqual(first["executed_stage_count"], 2)
+        self.assertEqual(first["graph"]["node_count"], 6)
+        self.assertEqual(first["graph"]["edge_count"], 5)
+        self.assertEqual(first["openspec_store_source"]["status"], "valid")
+        self.assertEqual(
+            first["openspec_store_source"]["selection_source"],
+            "registered-store",
+        )
+        self.assertEqual(first["openspec_store_source"]["store_id"], "requirements-store")
+        self.assertEqual(
+            first["openspec_store_source"]["repository_path"],
+            str(requirements_repo.resolve()),
+        )
+
+        serialized = str(first)
+        for forbidden in (
+            "specification body",
+            "change body",
+            "source_code",
+            "call_graph",
+            "dependency_graph",
+            "symbol_body",
+            "generated_graph_records",
+            "credentials",
+            "tokens",
+            "api_response",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_pipeline_preserves_registry_only_behavior_without_openspec_stage(self) -> None:
+        registry_path = (
+            FIXTURES / "non-git-workspace" / "openspec" / "requirements_repo" / "repo-index.yaml"
+        )
+        requirements_repo = registry_path.parent
+        stores = (RegisteredOpenSpecStore("requirements-store", requirements_repo),)
+
+        output = run_pipeline(registry_path, openspec_stores=stores).as_dict()
+
+        self.assertEqual(output["configured_stages"], ["workspace-registry"])
+        self.assertEqual(output["executed_stages"], ["workspace-registry"])
+        self.assertNotIn("openspec_store_source", output)
 
     def test_pipeline_preserves_registry_only_side_effect_free_behavior(self) -> None:
         registry_path = FIXTURES / "repo-index.yaml"

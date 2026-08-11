@@ -28,9 +28,17 @@ def main() -> int:
         "--persistence-path",
         help="Optional local LadybugDB persistence output path.",
     )
+    parser.add_argument(
+        "--openspec-store-id",
+        help="Optional explicit registered OpenSpec store id for store source validation.",
+    )
     args = parser.parse_args()
 
-    result = run_pipeline(args.registry_path, persistence_path=args.persistence_path)
+    result = run_pipeline(
+        args.registry_path,
+        persistence_path=args.persistence_path,
+        openspec_store_id=args.openspec_store_id,
+    )
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True))
     return 0
 
