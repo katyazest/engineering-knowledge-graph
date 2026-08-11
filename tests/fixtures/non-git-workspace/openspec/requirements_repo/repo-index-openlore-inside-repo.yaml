@@ -1,0 +1,30 @@
+version: 1
+
+workspace:
+  id: openlore-inside-repo-workspace
+  name: OpenLore Inside Repo Workspace
+
+layout:
+  root_path: ../..
+  openlore_path: openspec/requirements_repo/.openlore
+
+engineering_kg:
+  store_repository: requirements
+  output_path: .engineering-kg/ladybugdb
+
+repositories:
+  - id: requirements
+    path: .
+    description: OpenSpec store repository.
+    ssh_url: git@bitbucket.example.internal:PAYMENTS/requirements.git
+    default_branch: main
+    role: requirements
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true

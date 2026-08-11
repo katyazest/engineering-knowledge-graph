@@ -1,0 +1,63 @@
+version: 1
+
+workspace:
+  id: duplicate-service-workspace
+  name: Duplicate Service Workspace
+
+engineering_kg:
+  store_repository: requirements
+
+repositories:
+  - id: requirements
+    path: ..
+    description: Requirements repository.
+    ssh_url: git@bitbucket.example.internal:PAYMENTS/requirements.git
+    default_branch: main
+    role: requirements
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true
+
+  - id: service-a
+    path: ../../service-a
+    description: First service repository.
+    ssh_url: git@bitbucket.example.internal:APPLICATIONS/service-a.git
+    default_branch: main
+    role: code
+    service:
+      id: duplicate-service
+      name: Duplicate Service
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true
+
+  - id: service-b
+    path: ../../service-b
+    description: Second service repository.
+    ssh_url: git@bitbucket.example.internal:APPLICATIONS/service-b.git
+    default_branch: main
+    role: code
+    service:
+      id: duplicate-service
+      name: Duplicate Service
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true

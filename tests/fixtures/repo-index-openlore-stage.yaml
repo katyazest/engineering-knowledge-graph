@@ -1,0 +1,87 @@
+version: 1
+
+workspace:
+  id: payments-workspace
+  name: Payments Workspace
+  description: Workspace with configured OpenLore source validation.
+
+layout:
+  root_path: .
+  openlore_path: .openlore
+
+engineering_kg:
+  enabled: true
+  store_repository: requirements
+  output_path: .engineering-kg/ladybugdb
+  pipeline_stages:
+    - workspace-registry
+    - workspace-openlore-source
+
+openlore:
+  federation_enabled: true
+  freshness_policy: validate-only
+
+repositories:
+  - id: requirements
+    path: openspec/requirements_repo
+    description: OpenSpec changes, requirements, wiki content, and versioned Engineering KG configuration.
+    ssh_url: git@bitbucket.example.internal:PAYMENTS/requirements.git
+    default_branch: main
+    role: requirements
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+      notes: Start here for requirements and OpenSpec context.
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true
+      branch_rule: Keep requirements branches separate from implementation repositories.
+
+  - id: payment-service
+    path: src/codebase_repos/payment-service
+    description: Backend service that implements payment operations.
+    ssh_url: git@bitbucket.example.internal:APPLICATIONS/payment-service.git
+    default_branch: main
+    role: code
+    service:
+      id: payment-service
+      name: Payment Service
+    openlore:
+      include_in_federation: true
+      index_location: .openlore/index
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+        - build
+      notes: Search implementation and tests; ignore generated output.
+    git:
+      dirty_worktree: read-with-warning
+      fetch: allowed
+      pull: allowed
+      pull_requires_default_branch: true
+      branch_rule: Inspect the current branch; never change it during exploration.
+
+  - id: workflow-config
+    path: config/workflow
+    description: Deployment and workflow configuration for the process.
+    ssh_url: git@bitbucket.example.internal:PLATFORM/workflow-config.git
+    default_branch: master
+    role: configuration
+    openlore:
+      include_in_federation: false
+      index_location: ""
+    exploration:
+      include_by_default: false
+      search_exclusions:
+        - .git
+      notes: Include when requirements or code point to runtime configuration.
+    git:
+      dirty_worktree: skip
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true
+      branch_rule: Configuration may contain local experiments; do not inspect a dirty tree.

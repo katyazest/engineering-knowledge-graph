@@ -1,0 +1,55 @@
+version: 1
+
+workspace:
+  id: payments-workspace
+  name: Payments Workspace
+
+engineering_kg:
+  enabled: true
+  store_repository: requirements
+  output_path: .engineering-kg/ladybugdb
+  pipeline_stages:
+    - workspace-openlore-source
+
+openlore:
+  federation_enabled: true
+  freshness_policy: validate-only
+
+repositories:
+  - id: requirements
+    path: openspec/requirements_repo
+    description: OpenSpec changes, requirements, wiki content, and versioned Engineering KG configuration.
+    ssh_url: git@bitbucket.example.internal:PAYMENTS/requirements.git
+    default_branch: main
+    role: requirements
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true
+
+  - id: payment-service
+    path: src/codebase_repos/payment-service
+    description: Backend service that implements payment operations.
+    ssh_url: git@bitbucket.example.internal:APPLICATIONS/payment-service.git
+    default_branch: main
+    role: code
+    service:
+      id: payment-service
+      name: Payment Service
+    openlore:
+      include_in_federation: true
+      index_location: .openlore/index
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: allowed
+      pull: allowed
+      pull_requires_default_branch: true

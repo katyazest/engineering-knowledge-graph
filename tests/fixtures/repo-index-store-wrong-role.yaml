@@ -1,0 +1,25 @@
+version: 1
+
+workspace:
+  id: wrong-store-role-workspace
+  name: Wrong Store Role Workspace
+
+engineering_kg:
+  store_repository: payment-service
+
+repositories:
+  - id: payment-service
+    path: ../payment-service
+    description: Backend service incorrectly configured as the OpenSpec store.
+    ssh_url: git@bitbucket.example.internal:APPLICATIONS/payment-service.git
+    default_branch: main
+    role: code
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: allowed
+      pull: allowed
+      pull_requires_default_branch: true

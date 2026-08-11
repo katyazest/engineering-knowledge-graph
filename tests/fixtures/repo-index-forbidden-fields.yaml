@@ -1,0 +1,27 @@
+version: 1
+
+workspace:
+  id: forbidden-fields-workspace
+  name: Forbidden Fields Workspace
+
+engineering_kg:
+  store_repository: requirements
+
+repositories:
+  - id: requirements
+    path: ..
+    description: Requirements repository.
+    ssh_url: git@bitbucket.example.internal:PAYMENTS/requirements.git
+    default_branch: main
+    role: requirements
+    jira_data:
+      issue: PAY-1
+    exploration:
+      include_by_default: true
+      search_exclusions:
+        - .git
+    git:
+      dirty_worktree: read-with-warning
+      fetch: forbidden
+      pull: forbidden
+      pull_requires_default_branch: true

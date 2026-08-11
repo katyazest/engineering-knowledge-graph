@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engineering-kg"
+version = "0.1.0"
+description = "Local-first Engineering Knowledge Graph MVP pipeline"
+requires-python = ">=3.11"
+dependencies = ["PyYAML>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

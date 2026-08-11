@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Engineering KG workspace registry",
+  "description": "Canonical local workspace registry evolved from the multirepo exploration repo-index.yaml format.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "workspace", "repositories"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to the non-Git project workspace root, relative to the repo-index file when not absolute."
+        },
+        "openlore_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace-local generated OpenLore index path, relative to the workspace root when not absolute."
+        }
+      }
+    },
+    "engineering_kg": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "store_repository": { "type": "string", "minLength": 1 },
+        "output_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Workspace-local generated Engineering KG graph store path, relative to layout.root_path when layout is declared."
+        },
+        "pipeline_stages": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "openlore": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "federation_enabled": { "type": "boolean" },
+        "freshness_policy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/repository" }
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "description",
+        "ssh_url",
+        "default_branch",
+        "role",
+        "exploration",
+        "git"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository path relative to the repo-index file when not absolute."
+        },
+        "description": { "type": "string", "minLength": 1 },
+        "ssh_url": {
+          "type": "string",
+          "pattern": "^(ssh://|git@)"
+        },
+        "default_branch": { "type": "string", "minLength": 1 },
+        "role": {
+          "type": "string",
+          "enum": ["requirements", "code", "configuration", "infrastructure", "library", "test", "other"]
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9-]*$"
+            },
+            "name": { "type": "string", "minLength": 1 }
+          }
+        },
+        "openlore": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "include_in_federation": { "type": "boolean" },
+            "index_location": { "type": "string" }
+          }
+        },
+        "exploration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["include_by_default", "search_exclusions"],
+          "properties": {
+            "include_by_default": { "type": "boolean" },
+            "search_exclusions": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "notes": { "type": "string" }
+          }
+        },
+        "git": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dirty_worktree", "fetch", "pull", "pull_requires_default_branch"],
+          "properties": {
+            "dirty_worktree": {
+              "type": "string",
+              "enum": ["skip", "read-with-warning"]
+            },
+            "fetch": {
+              "type": "string",
+              "enum": ["allowed", "forbidden"]
+            },
+            "pull": {
+              "type": "string",
+              "enum": ["allowed", "forbidden"]
+            },
+            "pull_requires_default_branch": {
+              "type": "boolean"
+            },
+            "branch_rule": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
