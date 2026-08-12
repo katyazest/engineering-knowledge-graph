@@ -21,6 +21,7 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    OpenSpecLocator,
     stable_id,
 )
 
@@ -145,6 +146,75 @@ class CanonicalOntologyTest(unittest.TestCase):
                 "nodes": [],
             },
         )
+
+    def test_openspec_ontology_vocabulary_serializes_deterministically(self) -> None:
+        self.assertEqual(NodeKind.OPENSPEC_ACTIVE_CHANGE.value, "openspec-active-change")
+        self.assertEqual(NodeKind.OPENSPEC_ARCHIVED_CHANGE.value, "openspec-archived-change")
+        self.assertEqual(NodeKind.OPENSPEC_SPEC.value, "openspec-spec")
+        self.assertEqual(NodeKind.OPENSPEC_REQUIREMENT.value, "openspec-requirement")
+        self.assertEqual(NodeKind.OPENSPEC_SCENARIO.value, "openspec-scenario")
+        self.assertEqual(NodeKind.OPENSPEC_ARTIFACT.value, "openspec-artifact")
+        self.assertEqual(
+            EdgeKind.OPENSPEC_SPEC_CONTAINS_REQUIREMENT.value,
+            "openspec-spec-contains-requirement",
+        )
+        self.assertEqual(
+            EdgeKind.OPENSPEC_REQUIREMENT_CONTAINS_SCENARIO.value,
+            "openspec-requirement-contains-scenario",
+        )
+        self.assertEqual(EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT.value, "openspec-change-has-artifact")
+        self.assertEqual(EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC.value, "openspec-change-touches-spec")
+        self.assertEqual(EdgeKind.OPENSPEC_RELATED_SPEC.value, "openspec-related-spec")
+
+    def test_edge_confidence_serializes_only_when_set(self) -> None:
+        structural = Edge(
+            id=stable_id("edge", "structural"),
+            kind=EdgeKind.OPENSPEC_SPEC_CONTAINS_REQUIREMENT,
+            source_id="spec",
+            target_id="requirement",
+        )
+        related = Edge(
+            id=stable_id("edge", "related"),
+            kind=EdgeKind.OPENSPEC_RELATED_SPEC,
+            source_id="spec-a",
+            target_id="spec-b",
+            confidence="non-confident",
+        )
+
+        self.assertNotIn("confidence", structural.as_dict())
+        self.assertEqual(related.as_dict()["confidence"], "non-confident")
+
+    def test_openspec_locator_serializes_without_source_body(self) -> None:
+        evidence = Evidence(
+            id=stable_id("evidence", "openspec", "openspec/specs/payments/spec.md"),
+            source="openspec",
+            locator=OpenSpecLocator(
+                relative_file_path="openspec/specs/payments/spec.md",
+                artifact_type="openspec-requirement",
+                openspec_identity="durable:current:payments:requirement:Payment is submitted",
+                heading_name="Payment is submitted",
+                line_start=8,
+            ),
+        )
+
+        serialized = evidence.as_dict()
+
+        self.assertEqual(
+            serialized["locator"]["relative_file_path"],
+            "openspec/specs/payments/spec.md",
+        )
+        self.assertEqual(serialized["locator"]["artifact_type"], "openspec-requirement")
+        self.assertEqual(serialized["locator"]["heading_name"], "Payment is submitted")
+        for forbidden in (
+            "content",
+            "full_markdown",
+            "source_code",
+            "generated_graph_records",
+            "credentials",
+            "tokens",
+            "api_response",
+        ):
+            self.assertNotIn(forbidden, str(serialized))
 
 
 if __name__ == "__main__":

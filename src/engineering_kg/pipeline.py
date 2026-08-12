@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from engineering_kg.ingest.openspec import (
+    OpenSpecExtractionResult,
     OpenSpecStoreSourceValidationResult,
     RegisteredOpenSpecStore,
+    extract_openspec_graph,
     validate_openspec_store_source,
 )
 from engineering_kg.ontology import GraphSnapshot
@@ -27,6 +29,7 @@ class PipelineResult:
     graph: GraphSnapshot
     openlore_source: OpenLoreSourceValidationResult | None = None
     openspec_store_source: OpenSpecStoreSourceValidationResult | None = None
+    openspec_graph_extraction: OpenSpecExtractionResult | None = None
 
     @property
     def configured_stage_count(self) -> int:
@@ -51,6 +54,12 @@ class PipelineResult:
             data.pop("openspec_store_source")
         else:
             data["openspec_store_source"] = self.openspec_store_source.as_dict()
+        if self.openspec_graph_extraction is None:
+            data.pop("openspec_graph_extraction")
+        else:
+            data["openspec_graph_extraction"] = {
+                "metadata": self.openspec_graph_extraction.metadata.as_dict()
+            }
         return data
 
 
@@ -71,6 +80,7 @@ def run_pipeline(
         executed_stages: list[str] = []
         graph = GraphSnapshot()
         openspec_store_source = None
+        openspec_graph_extraction = None
         if "workspace-registry" in configured_stages:
             executed_stages.append("workspace-registry")
             graph = registry.to_graph_snapshot()
@@ -81,6 +91,14 @@ def run_pipeline(
                 selected_store_id=openspec_store_id,
             )
             executed_stages.append("openspec-store-source")
+        if "openspec-graph-extraction" in configured_stages:
+            if openspec_store_source is None:
+                raise ValueError(
+                    "openspec-graph-extraction requires successful openspec-store-source stage"
+                )
+            openspec_graph_extraction = extract_openspec_graph(openspec_store_source)
+            graph = graph.merged_with(openspec_graph_extraction.graph)
+            executed_stages.append("openspec-graph-extraction")
         openlore_source = None
         if "workspace-openlore-source" in configured_stages:
             openlore_source = validate_workspace_openlore_source(registry)
@@ -95,6 +113,7 @@ def run_pipeline(
             graph=graph,
             openlore_source=openlore_source,
             openspec_store_source=openspec_store_source,
+            openspec_graph_extraction=openspec_graph_extraction,
         )
 
     if persistence_path is not None:

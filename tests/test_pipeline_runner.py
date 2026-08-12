@@ -211,6 +211,108 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
+    def test_pipeline_executes_openspec_graph_extraction_after_store_source(self) -> None:
+        registry_path = (
+            FIXTURES
+            / "non-git-workspace"
+            / "openspec"
+            / "requirements_repo"
+            / "repo-index-openspec-graph-stage.yaml"
+        )
+        requirements_repo = registry_path.parent
+        stores = (RegisteredOpenSpecStore("requirements-store", requirements_repo),)
+
+        first = run_pipeline(registry_path, openspec_stores=stores).as_dict()
+        second = run_pipeline(registry_path, openspec_stores=stores).as_dict()
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            first["configured_stages"],
+            ["workspace-registry", "openspec-store-source", "openspec-graph-extraction"],
+        )
+        self.assertEqual(
+            first["executed_stages"],
+            ["workspace-registry", "openspec-store-source", "openspec-graph-extraction"],
+        )
+        self.assertEqual(first["openspec_graph_extraction"]["metadata"]["status"], "completed")
+        self.assertEqual(
+            first["openspec_graph_extraction"]["metadata"]["durable_spec_count"],
+            2,
+        )
+        self.assertGreater(first["graph"]["node_count"], 6)
+        self.assertTrue(
+            any(node["kind"] == "openspec-spec" for node in first["graph"]["nodes"])
+        )
+
+        serialized = str(first)
+        for forbidden in (
+            "The system SHALL submit payments",
+            "source_code",
+            "openlore_analysis",
+            "generated_graph_records",
+            "credentials",
+            "tokens",
+            "api_response",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_pipeline_rejects_graph_extraction_without_store_source(self) -> None:
+        registry_path = (
+            FIXTURES
+            / "non-git-workspace"
+            / "openspec"
+            / "requirements_repo"
+            / "repo-index-openspec-graph-missing-source.yaml"
+        )
+
+        with self.assertRaisesRegex(ValueError, "openspec-store-source"):
+            run_pipeline(registry_path, openspec_stores=())
+
+    def test_build_script_reports_openspec_graph_extraction(self) -> None:
+        registry_path = (
+            FIXTURES
+            / "non-git-workspace"
+            / "openspec"
+            / "requirements_repo"
+            / "repo-index-openspec-graph-stage.yaml"
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(SRC_ROOT)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "bin"
+            fake_bin.mkdir()
+            openspec = fake_bin / "openspec"
+            openspec.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '{\"stores\":[{\"id\":\"requirements-store\",\"path\":\""
+                + str(registry_path.parent)
+                + "\"}]}'\n",
+                encoding="utf-8",
+            )
+            openspec.chmod(0o755)
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "build.py"),
+                    str(registry_path),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        output = json.loads(completed.stdout)
+        self.assertEqual(
+            output["executed_stages"],
+            ["workspace-registry", "openspec-store-source", "openspec-graph-extraction"],
+        )
+        self.assertEqual(output["openspec_graph_extraction"]["metadata"]["status"], "completed")
+        self.assertGreater(output["openspec_graph_extraction"]["metadata"]["graph_counts"]["node_count"], 0)
+        self.assertEqual(completed.stderr, "")
+
     def test_pipeline_preserves_registry_only_behavior_without_openspec_stage(self) -> None:
         registry_path = (
             FIXTURES / "non-git-workspace" / "openspec" / "requirements_repo" / "repo-index.yaml"

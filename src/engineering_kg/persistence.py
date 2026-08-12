@@ -20,6 +20,7 @@ from engineering_kg.ontology import (
     Evidence,
     GraphSnapshot,
     Node,
+    OpenSpecLocator,
 )
 
 
@@ -252,6 +253,7 @@ def _edge_from_dict(data: dict[str, Any]) -> Edge:
         target_id=_expect_string(data.get("target_id"), "edge.target_id"),
         properties=dict(_expect_mapping(data.get("properties", {}), "edge.properties")),
         evidence_ids=tuple(_expect_string_tuple(data.get("evidence_ids", []), "edge.evidence_ids")),
+        confidence=_expect_optional_string(data.get("confidence"), "edge.confidence"),
     )
 
 
@@ -264,7 +266,7 @@ def _evidence_from_dict(data: dict[str, Any]) -> Evidence:
     )
 
 
-def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef:
+def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef | OpenSpecLocator:
     if isinstance(value, str):
         return value
     data = _expect_mapping(value, "evidence.locator")
@@ -278,6 +280,20 @@ def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef:
         )
     if keys == {"page_id"}:
         return ConfluencePageRef(page_id=_expect_string(data["page_id"], "locator.page_id"))
+    if {"artifact_type", "openspec_identity", "relative_file_path"}.issubset(keys):
+        return OpenSpecLocator(
+            relative_file_path=_expect_string(
+                data["relative_file_path"], "locator.relative_file_path"
+            ),
+            artifact_type=_expect_string(data["artifact_type"], "locator.artifact_type"),
+            openspec_identity=_expect_string(
+                data["openspec_identity"], "locator.openspec_identity"
+            ),
+            heading_name=_expect_optional_string(data.get("heading_name", ""), "locator.heading_name")
+            or "",
+            line_start=_expect_optional_int(data.get("line_start"), "locator.line_start"),
+            line_end=_expect_optional_int(data.get("line_end"), "locator.line_end"),
+        )
     raise PersistenceIntegrityError(f"Unsupported evidence locator shape: {sorted(keys)}")
 
 
@@ -306,6 +322,22 @@ def _expect_mapping(value: Any, context: str) -> dict[str, Any]:
 def _expect_string(value: Any, context: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PersistenceIntegrityError(f"{context} must be a non-empty string")
+    return value
+
+
+def _expect_optional_string(value: Any, context: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise PersistenceIntegrityError(f"{context} must be a string")
+    return value
+
+
+def _expect_optional_int(value: Any, context: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int):
+        raise PersistenceIntegrityError(f"{context} must be an integer")
     return value
 
 
