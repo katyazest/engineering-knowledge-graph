@@ -29,14 +29,26 @@ from engineering_kg.persistence import (
     persist_graph_snapshot,
     read_graph_snapshot,
 )
+from engineering_kg.query import (
+    EngineeringKgQuery,
+    GraphObjectNotFoundError,
+    GraphQueryError,
+    GraphQueryValidationError,
+    QueryNodeResult,
+    TraceabilityResult,
+)
 
 __all__ = [
     "CodeLocator",
     "ConfluencePageRef",
     "Edge",
     "EdgeKind",
+    "EngineeringKgQuery",
     "Evidence",
     "GraphSnapshot",
+    "GraphObjectNotFoundError",
+    "GraphQueryError",
+    "GraphQueryValidationError",
     "LadybugDbStore",
     "Node",
     "NodeKind",
@@ -49,6 +61,8 @@ __all__ = [
     "PersistenceReadError",
     "PersistenceWriteError",
     "PipelineResult",
+    "QueryNodeResult",
+    "TraceabilityResult",
     "initialize_ladybugdb_store",
     "persist_graph_snapshot",
     "read_graph_snapshot",

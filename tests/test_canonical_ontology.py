@@ -164,6 +164,10 @@ class CanonicalOntologyTest(unittest.TestCase):
         )
         self.assertEqual(EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT.value, "openspec-change-has-artifact")
         self.assertEqual(EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC.value, "openspec-change-touches-spec")
+        self.assertEqual(
+            EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC.value,
+            "openspec-change-traces-to-spec",
+        )
         self.assertEqual(EdgeKind.OPENSPEC_RELATED_SPEC.value, "openspec-related-spec")
 
     def test_edge_confidence_serializes_only_when_set(self) -> None:

@@ -42,6 +42,7 @@ class EdgeKind(StrEnum):
     OPENSPEC_REQUIREMENT_CONTAINS_SCENARIO = "openspec-requirement-contains-scenario"
     OPENSPEC_CHANGE_HAS_ARTIFACT = "openspec-change-has-artifact"
     OPENSPEC_CHANGE_TOUCHES_SPEC = "openspec-change-touches-spec"
+    OPENSPEC_CHANGE_TRACES_TO_SPEC = "openspec-change-traces-to-spec"
     OPENSPEC_RELATED_SPEC = "openspec-related-spec"
 
 
