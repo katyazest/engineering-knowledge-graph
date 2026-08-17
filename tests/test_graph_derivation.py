@@ -35,15 +35,85 @@ class GraphDerivationTest(unittest.TestCase):
         ]
 
         self.assertEqual(result["metadata"]["status"], "completed")
-        self.assertEqual(result["metadata"]["derived_edge_count"], 2)
-        self.assertEqual(len(derived_edges), 2)
+        self.assertEqual(result["metadata"]["derived_edge_count"], 4)
+        self.assertEqual(len(derived_edges), 4)
         self.assertEqual(
             {edge["properties"]["capability"] for edge in derived_edges},
-            {"payments"},
+            {"payments", "service/payments"},
         )
         self.assertTrue(all(edge["properties"]["derived"] for edge in derived_edges))
         self.assertTrue(
             all(edge["properties"]["target_scope"] == "durable" for edge in derived_edges)
+        )
+
+    def test_derives_namespaced_openspec_change_to_durable_spec_relationship(self) -> None:
+        graph = _extract_graph()
+
+        result = derive_graph_relationships(graph).as_dict()
+        derived_edges = [
+            edge
+            for edge in result["graph"]["edges"]
+            if edge["kind"] == EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC.value
+            and edge["properties"]["capability"] == "service/payments"
+        ]
+
+        self.assertEqual(len(derived_edges), 2)
+        self.assertEqual(
+            {edge["properties"]["source_scope"] for edge in derived_edges},
+            {"active-change", "archived-change"},
+        )
+        self.assertTrue(
+            all(edge["properties"]["target_scope"] == "durable" for edge in derived_edges)
+        )
+
+    def test_derivation_does_not_match_namespaced_capability_by_suffix(self) -> None:
+        change = Node(
+            id=stable_id("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-999-update-payments"),
+            kind=NodeKind.OPENSPEC_ACTIVE_CHANGE,
+            name="JIRA-999-update-payments",
+            properties={"change_identity": "JIRA-999-update-payments"},
+        )
+        change_spec = Node(
+            id=stable_id(
+                "node",
+                NodeKind.OPENSPEC_SPEC,
+                "active-change",
+                "JIRA-999-update-payments",
+                "service-a/payments",
+            ),
+            kind=NodeKind.OPENSPEC_SPEC,
+            name="Service A Payments",
+            properties={
+                "capability": "service-a/payments",
+                "change_identity": "JIRA-999-update-payments",
+                "scope": "active-change",
+            },
+        )
+        durable_spec = Node(
+            id=stable_id("node", NodeKind.OPENSPEC_SPEC, "durable", "current", "service-b/payments"),
+            kind=NodeKind.OPENSPEC_SPEC,
+            name="Service B Payments",
+            properties={
+                "capability": "service-b/payments",
+                "change_identity": "",
+                "scope": "durable",
+            },
+        )
+        touches = Edge(
+            id=stable_id("edge", EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC, change.id, change_spec.id),
+            kind=EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC,
+            source_id=change.id,
+            target_id=change_spec.id,
+        )
+        graph = GraphSnapshot(nodes=(change, change_spec, durable_spec), edges=(touches,))
+
+        result = derive_graph_relationships(graph).as_dict()
+
+        self.assertEqual(result["metadata"]["derived_edge_count"], 0)
+        self.assertEqual(result["metadata"]["unresolved_input_count"], 1)
+        self.assertIn(
+            "service-a/payments",
+            result["metadata"]["diagnostics"][0]["message"],
         )
 
     def test_derivation_is_deterministic_and_does_not_duplicate_edges(self) -> None:

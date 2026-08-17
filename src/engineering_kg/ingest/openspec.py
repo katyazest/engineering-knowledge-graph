@@ -227,8 +227,8 @@ def extract_openspec_graph(
     archived_change_count = 0
     artifact_count = 0
 
-    for spec_file in sorted(store_source.specs_path.glob("*/spec.md")):
-        parsed = _parse_spec_file(store_source, spec_file, "durable", None)
+    for spec_file in _spec_files(store_source.specs_path):
+        parsed = _parse_spec_file(store_source, store_source.specs_path, spec_file, "durable", None)
         durable_specs.append(parsed)
         _extend_spec(nodes, edges, evidence, parsed)
 
@@ -458,8 +458,9 @@ def _extract_change_scope(
     nodes.extend(artifact_nodes)
     edges.extend(artifact_edges)
     evidence.extend(artifact_evidence)
-    for spec_file in sorted((change_dir / "specs").glob("*/spec.md")):
-        parsed = _parse_spec_file(store_source, spec_file, scope, change_dir.name)
+    specs_root = change_dir / "specs"
+    for spec_file in _spec_files(specs_root):
+        parsed = _parse_spec_file(store_source, specs_root, spec_file, scope, change_dir.name)
         _extend_spec(nodes, edges, evidence, parsed)
         edges.append(
             _edge(
@@ -477,11 +478,12 @@ def _extract_change_scope(
 
 def _parse_spec_file(
     store_source: OpenSpecStoreSourceValidationResult,
+    specs_root: Path,
     spec_file: Path,
     scope: str,
     change_identity: str | None,
 ) -> _ParsedSpec:
-    capability = spec_file.parent.name
+    capability = _capability_from_spec_path(specs_root, spec_file)
     relative_path = _relative_path(store_source.repository_path, spec_file)
     identity_parts = (scope, change_identity or "current", capability)
     openspec_identity = ":".join(identity_parts)
@@ -622,6 +624,27 @@ def _parse_spec_file(
         edges=tuple(edges),
         evidence_items=tuple(evidence_items),
     )
+
+
+def _spec_files(specs_root: Path) -> tuple[Path, ...]:
+    if not specs_root.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            spec_file
+            for spec_file in specs_root.rglob("spec.md")
+            if spec_file.parent != specs_root
+        )
+    )
+
+
+def _capability_from_spec_path(specs_root: Path, spec_file: Path) -> str:
+    relative_path = spec_file.relative_to(specs_root)
+    if relative_path.name != "spec.md" or len(relative_path.parts) < 2:
+        raise OpenSpecGraphExtractionError(
+            f"OpenSpec spec file must live below a capability directory: {spec_file}"
+        )
+    return relative_path.parent.as_posix()
 
 
 def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:

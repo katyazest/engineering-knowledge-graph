@@ -245,7 +245,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         self.assertEqual(first["openspec_graph_extraction"]["metadata"]["status"], "completed")
         self.assertEqual(
             first["openspec_graph_extraction"]["metadata"]["durable_spec_count"],
-            2,
+            3,
         )
         self.assertGreater(first["graph"]["node_count"], 6)
         self.assertTrue(
@@ -378,7 +378,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         )
         self.assertEqual(first["executed_stages"], first["configured_stages"])
         self.assertEqual(first["graph_derivation"]["metadata"]["status"], "completed")
-        self.assertEqual(first["graph_derivation"]["metadata"]["derived_edge_count"], 2)
+        self.assertEqual(first["graph_derivation"]["metadata"]["derived_edge_count"], 4)
         self.assertTrue(
             any(edge["kind"] == "openspec-change-traces-to-spec" for edge in first["graph"]["edges"])
         )
@@ -484,7 +484,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             ],
         )
         self.assertEqual(output["executed_stages"], output["configured_stages"])
-        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 2)
+        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 4)
 
     def test_pipeline_proves_complete_mvp_e2e_scenario(self) -> None:
         registry_path = (
@@ -557,19 +557,19 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             "completed",
         )
         self.assertEqual(first_output["graph_derivation"]["metadata"]["status"], "completed")
-        self.assertEqual(first_output["graph_derivation"]["metadata"]["derived_edge_count"], 2)
+        self.assertEqual(first_output["graph_derivation"]["metadata"]["derived_edge_count"], 4)
         self.assertEqual(
             first_output["graph_integrity_validation"]["metadata"]["status"],
             "valid",
         )
-        self.assertEqual(first_output["graph"]["node_count"], 25)
-        self.assertEqual(first_output["graph"]["edge_count"], 23)
-        self.assertEqual(first_output["graph"]["evidence_count"], 19)
+        self.assertEqual(first_output["graph"]["node_count"], 34)
+        self.assertEqual(first_output["graph"]["edge_count"], 33)
+        self.assertEqual(first_output["graph"]["evidence_count"], 28)
 
         persisted_output = persisted.as_dict()
-        self.assertEqual(persisted_output["node_count"], 25)
-        self.assertEqual(persisted_output["edge_count"], 21)
-        self.assertEqual(persisted_output["evidence_count"], 19)
+        self.assertEqual(persisted_output["node_count"], 34)
+        self.assertEqual(persisted_output["edge_count"], 29)
+        self.assertEqual(persisted_output["evidence_count"], 28)
         self.assertEqual(
             [item["name"] for item in persisted_services],
             ["Payment Service", "Shared Model"],
@@ -578,7 +578,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             [item["name"] for item in persisted_changes],
             ["JIRA-123-add-refund", "2026-08-01-JIRA-122-add-payments"],
         )
-        self.assertEqual(len(persisted_requirements), 4)
+        self.assertEqual(len(persisted_requirements), 7)
         self.assertGreater(len(persisted_traceability["relationships"]), 0)
         self.assertTrue(
             any(
@@ -740,7 +740,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             )
 
         output = json.loads(completed.stdout)
-        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 2)
+        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 4)
         self.assertEqual(output["graph_integrity_validation"]["metadata"]["status"], "valid")
         self.assertEqual(completed.stderr, "")
 
@@ -782,7 +782,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
 
         output = json.loads(completed.stdout)
         self.assertEqual(output["graph_derivation"]["metadata"]["status"], "completed")
-        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 2)
+        self.assertEqual(output["graph_derivation"]["metadata"]["derived_edge_count"], 4)
         self.assertEqual(completed.stderr, "")
 
 

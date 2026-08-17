@@ -47,14 +47,22 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
             and node["properties"]["scope"] == "durable"
         ]
 
-        self.assertEqual({node["properties"]["capability"] for node in durable_specs}, {"payments", "settlement"})
+        self.assertEqual(
+            {node["properties"]["capability"] for node in durable_specs},
+            {"payments", "service/payments", "settlement"},
+        )
         self.assertEqual(
             {node["name"] for node in durable_requirements},
-            {"Payment is submitted", "Settlement is posted"},
+            {"Payment is submitted", "Service payment is routed", "Settlement is posted"},
         )
         self.assertEqual(
             {node["name"] for node in durable_scenarios},
-            {"Valid payment", "Still belongs to previous requirement", "Settlement complete"},
+            {
+                "Valid payment",
+                "Still belongs to previous requirement",
+                "Service payment route selected",
+                "Settlement complete",
+            },
         )
         self.assertFalse(any(node["name"] == "Unsupported heading is ignored" for node in durable_requirements))
         self.assertTrue(
@@ -77,6 +85,12 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
             if node["kind"] == NodeKind.OPENSPEC_SPEC.value
             and node["properties"]["capability"] == "payments"
         ]
+        service_payment_specs = [
+            node
+            for node in nodes
+            if node["kind"] == NodeKind.OPENSPEC_SPEC.value
+            and node["properties"]["capability"] == "service/payments"
+        ]
 
         self.assertEqual([node["name"] for node in active_changes], ["JIRA-123-add-refund"])
         self.assertEqual(
@@ -85,6 +99,10 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
         )
         self.assertEqual(
             {node["properties"]["scope"] for node in payment_specs},
+            {"durable", "active-change", "archived-change"},
+        )
+        self.assertEqual(
+            {node["properties"]["scope"] for node in service_payment_specs},
             {"durable", "active-change", "archived-change"},
         )
         self.assertEqual(active_changes[0]["properties"]["jira_reference_hints"], ["JIRA-123"])
@@ -121,11 +139,18 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first["metadata"]["status"], "completed")
-        self.assertEqual(first["metadata"]["durable_spec_count"], 2)
+        self.assertEqual(first["metadata"]["durable_spec_count"], 3)
         self.assertEqual(first["metadata"]["active_change_count"], 1)
         self.assertEqual(first["metadata"]["archived_change_count"], 1)
-        self.assertEqual(first["metadata"]["requirement_count"], 2)
-        self.assertEqual(first["metadata"]["scenario_count"], 3)
+        self.assertEqual(first["metadata"]["requirement_count"], 3)
+        self.assertEqual(first["metadata"]["scenario_count"], 4)
+        self.assertTrue(
+            any(
+                item["locator"]["relative_file_path"]
+                == "openspec/specs/service/payments/spec.md"
+                for item in first["graph"]["evidence"]
+            )
+        )
         self.assertTrue(
             all(
                 "relative_file_path" in item["locator"]
