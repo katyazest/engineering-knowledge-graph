@@ -1,5 +1,7 @@
 # Engineering Knowledge Graph Development Plan
 
+This is a full long-term value plan for the future development of the Knowledge Graph. It's not what is in the current work and is needed only for the understanding the long-term value.
+
 ## Stage 0 — Project skeleton
 
 Tasks
@@ -32,7 +34,7 @@ Verification
 
 ---
 
-## Stage 2 — Service registry
+## Stage 2 — Workspace registry
 
 Tasks
 

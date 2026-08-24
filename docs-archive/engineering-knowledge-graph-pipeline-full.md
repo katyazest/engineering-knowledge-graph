@@ -1,5 +1,7 @@
 # Engineering Knowledge Graph Pipeline
 
+This is a full long-term value pipeline for the future development of the Knowledge Graph. It's not what is in the current work and is needed only for the understanding the long-term value.
+
 ## Goal
 
 Build a product-level Engineering Knowledge Graph (EKG) that connects engineering artifacts while **keeping OpenLore as the authoritative code intelligence platform**.
@@ -47,12 +49,6 @@ Owns:
 - CodeLocator references
 
 LadybugDB never stores the complete code graph.
-
-Important runtime caveat:
-
-- `@ladybugdb/core` exposes a Node in-process API and no `ladybugdb` CLI.
-- The Python MVP uses an isolated deterministic local adapter-compatible store.
-- A later adapter-focused change can bind this persistence boundary to the Node package through a bridge without changing pipeline callers.
 
 ### OpenSpec
 
@@ -146,7 +142,7 @@ Detailed code information is resolved dynamically through OpenLore MCP.
 
 ## Pipeline
 
-1. Service registry
+1. Workspace registry
 2. OpenLore indexing (per repository)
 3. OpenSpec extraction
 4. Jira MCP extraction

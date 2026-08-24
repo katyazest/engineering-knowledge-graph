@@ -1,20 +1,124 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  Project: Engineering Knowledge Graph tooling.
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Project boundary:
+    This repository implements deterministic schemas, adapters,
+    transformations, validation, projections and pipeline orchestration.
+
+    The following components participate in the final pipeline but are
+    external infrastructure and are not implemented by this repository:
+    - Graphify
+    - Jira MCP server
+    - Bitbucket MCP server
+    - LadybugDB
+    - llmwiki-cli
+    - MkDocs
+
+    Project-owned code may adapt, configure and orchestrate these components,
+    but must not assume ownership of their internal implementation.
+
+    Implementation form:
+    - Project-owned functionality SHALL be implemented as reusable Python modules. Scripts, CLI commands and MCP tools are thin execution interfaces that delegate to the same deterministic implementation.
+    - Shared schemas and reusable logic may be organized as internal Python modules.
+    - The project is executed locally and in CI through script entry points.
+    - Publishing a Python package or compiled artifact is not required.
+  
+  Project-owned components:
+    - Canonical Pydantic schemas
+    - Stable identifier and provenance models
+    - Service-to-repository registry
+    - OpenSpec extractor
+    - Graphify output adapter
+    - Jira MCP response adapter
+    - Bitbucket MCP response adapter
+    - Data normalization
+    - Diff-to-code-symbol mapping
+    - LadybugDB persistence adapter
+    - Deterministic derivation rules
+    - Graph validation
+    - Projection DTOs
+    - Markdown rendering
+    - Pipeline CLI and orchestration
+
+  Architecture invariants:
+    - The canonical Engineering Knowledge Graph is the source of
+      structured engineering facts.
+    - Wiki pages are projections of the canonical graph.
+    - Generated Wiki content is not ingested as canonical graph facts.
+    - External data is normalized before entering the canonical graph.
+    - Provider-specific response models do not become canonical domain models.
+    - Extractors and external adapters do not write directly to LadybugDB.
+    - Asserted and derived relationships remain distinguishable.
+    - Every persisted node and relationship preserves provenance.
+    - Every derived relationship identifies its derivation rule.
+    - Ingestion, persistence and derivation are idempotent.
+    - Stable canonical identifiers do not depend on display names,
+      file paths or source-code line numbers.
+    - Semantic or probabilistic relationships are outside the initial scope.
+
+  Integration assumptions:
+    - One source-code repository represents one service.
+    - Graphify provides deterministic code structure.
+    - Every OpenSpec change references a Jira User Story.
+    - Jira and Bitbucket data are accessed through MCP.
+    - Bitbucket Pull Requests are associated with Jira User Stories.
+    - Only merged Pull Requests provide implementation evidence.
+    - LadybugDB provides embedded property-graph persistence.
+    - llmwiki-cli manages generated Markdown Wiki files.
+    - MkDocs publishes the Markdown Wiki.
+
+  Development conventions:
+    - Python 3.12 or newer
+    - Pydantic for canonical schemas and boundary validation
+    - Typer for the project CLI
+    - Jinja2 for Markdown rendering
+    - pytest for automated tests
+    - External integrations are isolated behind project-owned adapters
+    - Unit tests use fixtures or mocks for external responses
+    - Core domain tests do not require live external infrastructure
+    - Components are independently testable
+
+rules:
+  proposal:
+    - Describe the problem and expected outcome.
+    - Limit implementation work to project-owned components.
+    - Identify affected pipeline stages and integration boundaries.
+    - List external infrastructure involved in the change.
+    - State whether canonical schemas or persisted graph data are affected.
+    - Separate repository implementation from infrastructure configuration.
+    - Do not propose changes to the internal implementation of external tools.
+
+  specs:
+    - Define deterministic, externally observable behavior.
+    - Use SHALL for normative requirements.
+    - Make every requirement independently testable.
+    - Define adapter input and normalized output contracts where applicable.
+    - Specify behavior for missing, malformed or unsupported external data.
+    - Specify idempotency and provenance behavior where applicable.
+    - Do not specify undocumented behavior of external infrastructure.
+
+  design:
+    - Identify affected project-owned components.
+    - Describe integration boundaries and external assumptions.
+    - Describe canonical schema and stable identifier changes.
+    - Describe provenance and idempotency handling.
+    - Distinguish asserted facts from derived relationships.
+    - Describe persistence and migration impact.
+    - Describe derivation and validation changes.
+    - Describe projection DTO changes where applicable.
+    - Prevent provider-specific models from leaking into canonical schemas.
+    - Address backward compatibility of schemas and external contracts.
+    - Prefer simple executable scripts for pipeline stages.
+    - Extract shared logic into internal modules when used by multiple scripts.
+    - Do not introduce packaging or deployment infrastructure unless a change explicitly requires it.
+
+  tasks:
+    - Order tasks as independently verifiable increments.
+    - Separate schema, adapter, normalization, persistence, derivation,
+      validation and projection work.
+    - Add tests in the same task as the behavior they verify.
+    - Use fixtures or mocks for Graphify and MCP responses.
+    - Keep unit tests independent of live external infrastructure.
+    - Add explicit verification criteria to every task.

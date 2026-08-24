@@ -1,5 +1,7 @@
 # Engineering Knowledge Graph — Project Constraints
 
+These are the long-term valued product constraints must be used for mvp as well.
+
 ## General
 - Local-first architecture.
 - Deterministic processing by default.
