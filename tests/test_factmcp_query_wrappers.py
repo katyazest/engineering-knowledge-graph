@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from inspect import signature
 from pathlib import Path
 
 
@@ -45,7 +46,6 @@ class FactMcpQueryWrappersTest(unittest.TestCase):
         register_query_tools(server, graph_store_path="default-store", query_factory=query_factory)
 
         result = server.tools["list_requirements"](
-            graph_store="request-store",
             capability="payments",
             service="Payment Service",
             change="JIRA-1",
@@ -53,7 +53,7 @@ class FactMcpQueryWrappersTest(unittest.TestCase):
         )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(query.store_path, "request-store")
+        self.assertEqual(query.store_path, str((Path.cwd() / "default-store").resolve()))
         self.assertEqual(
             query.calls,
             [
@@ -69,6 +69,15 @@ class FactMcpQueryWrappersTest(unittest.TestCase):
             ],
         )
 
+    def test_tool_signatures_exclude_graph_store_parameter(self) -> None:
+        server = _FakeFactMcpServer()
+        register_query_tools(server, graph_store_path="default-store", query_factory=_factory(GraphSnapshot()))
+
+        self.assertNotIn("graph_store", signature(server.tools["list_requirements"]).parameters)
+        self.assertEqual(list(signature(server.tools["list_services"]).parameters), [])
+        self.assertEqual(list(signature(server.tools["list_changes"]).parameters), [])
+        self.assertEqual(list(signature(server.tools["get_traceability"]).parameters), ["object_id"])
+
     def test_service_change_and_traceability_tools_delegate_to_query_api(self) -> None:
         query = _RecordingQuery(GraphSnapshot())
         server = _FakeFactMcpServer()
@@ -83,16 +92,6 @@ class FactMcpQueryWrappersTest(unittest.TestCase):
             ["list_services", "list_changes", "get_traceability"],
         )
         self.assertEqual(query.calls[-1][1], {"object_id": "node-1", "require_validation": False})
-
-    def test_missing_graph_store_returns_structured_error(self) -> None:
-        server = _FakeFactMcpServer()
-        register_query_tools(server, query_factory=_factory(GraphSnapshot()))
-
-        result = server.tools["list_services"]()
-
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error"]["code"], "graph-query-error")
-        self.assertNotIn("token", str(result))
 
     def test_validation_required_traceability_returns_structured_error(self) -> None:
         node = Node(

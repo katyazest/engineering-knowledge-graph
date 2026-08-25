@@ -387,6 +387,52 @@ MCP query layer не является build stage в текущем `run_pipelin
 
 Wrappers тонкие: они не реализуют обход графа сами, а делегируют в reusable Python API.
 
+MCP server выбирает graph store один раз при старте, до регистрации tools. Агент не передает путь к graph store в `list_requirements`, `list_services`, `list_changes` или `get_traceability`.
+
+Нормальный запуск:
+
+```sh
+engineering-kg mcp
+```
+
+Порядок выбора graph store при старте детерминированный:
+
+1. `--graph-store` - явный путь к LadybugDB-compatible graph store для debug/CI.
+2. `--registry` - явный путь к `repo-index.yaml`; graph store берется из `WorkspaceRegistry.layout.resolved_graph_store_path`.
+3. `--openspec-store` - id зарегистрированного OpenSpec store; `repo-index.yaml` загружается из корня выбранного store.
+4. OpenSpec project context из текущей директории.
+
+При автоматическом выборе через OpenSpec project context текущая Git repository должна входить в `WorkspaceRegistry.repositories[*].resolved_path`. Для режимов, которым нужен OpenSpec или Git, передавайте `--openspec-command` и `--git-command` как абсолютные пути. Если контекст не резолвится, настройте `openspec/config.yaml` с `store: <id>`, зарегистрируйте store локально, используйте `--openspec-store` или передайте `--registry`.
+
+Пример явного запуска:
+
+```sh
+engineering-kg mcp --registry /path/to/requirements_repo/repo-index.yaml
+```
+
+Пример host-specific конфигурации для Gigacode должен оставаться простым command/args, без shell substitutions, aliases и one-liners:
+
+```json
+{
+  "mcpServers": {
+    "engineering-kg": {
+      "command": "/path/to/python-env/bin/engineering-kg",
+      "args": [
+        "mcp",
+        "--openspec-store",
+        "requirements-store",
+        "--openspec-command",
+        "/path/to/openspec",
+        "--git-command",
+        "/usr/bin/git"
+      ]
+    }
+  }
+}
+```
+
+Такую конфигурацию можно хранить в host-specific файле под `.gigacode/...`, если это соответствует локальным правилам проекта. Startup не обращается к web fetchers, `curl`, `wget`, Jira MCP, Bitbucket MCP, Confluence, OpenLore MCP, внешним API или LLM services и не пересобирает graph store.
+
 ## Команды запуска
 
 Пустой bootstrap run:
