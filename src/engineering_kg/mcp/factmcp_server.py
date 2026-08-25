@@ -13,7 +13,7 @@ QueryFactory = Callable[[str | Path], EngineeringKgQuery]
 
 def create_factmcp_server(
     *,
-    graph_store_path: str | Path | None = None,
+    graph_store_path: str | Path,
     require_validation: bool = False,
 ) -> Any:
     """Create a FactMCP-compatible server with Engineering KG query tools.
@@ -43,7 +43,7 @@ def create_factmcp_server(
 def register_query_tools(
     server: Any,
     *,
-    graph_store_path: str | Path | None = None,
+    graph_store_path: str | Path,
     query_factory: QueryFactory | None = None,
     require_validation: bool = False,
 ) -> Any:
@@ -53,10 +53,10 @@ def register_query_tools(
         raise TypeError("FactMCP-compatible server must provide a tool decorator")
 
     factory = query_factory or _store_query_factory(require_validation=require_validation)
+    bound_graph_store_path = Path(graph_store_path).expanduser().resolve()
 
     @server.tool()
     def list_requirements(
-        graph_store: str | None = None,
         capability: str | None = None,
         service: str | None = None,
         change: str | None = None,
@@ -65,7 +65,7 @@ def register_query_tools(
         """List Engineering KG requirement facts."""
 
         return _call_tool(
-            lambda: _query(factory, graph_store_path, graph_store).list_requirements(
+            lambda: _query(factory, bound_graph_store_path).list_requirements(
                 capability=capability,
                 service=service,
                 change=change,
@@ -74,26 +74,25 @@ def register_query_tools(
         )
 
     @server.tool()
-    def list_services(graph_store: str | None = None) -> dict[str, Any]:
+    def list_services() -> dict[str, Any]:
         """List Engineering KG service and repository facts."""
 
-        return _call_tool(lambda: _query(factory, graph_store_path, graph_store).list_services())
+        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_services())
 
     @server.tool()
-    def list_changes(graph_store: str | None = None) -> dict[str, Any]:
+    def list_changes() -> dict[str, Any]:
         """List Engineering KG OpenSpec change facts."""
 
-        return _call_tool(lambda: _query(factory, graph_store_path, graph_store).list_changes())
+        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_changes())
 
     @server.tool()
     def get_traceability(
         object_id: str,
-        graph_store: str | None = None,
     ) -> dict[str, Any]:
         """Return traceability relationships for one Engineering KG graph object."""
 
         return _call_tool(
-            lambda: _query(factory, graph_store_path, graph_store).get_traceability(
+            lambda: _query(factory, bound_graph_store_path).get_traceability(
                 object_id,
                 require_validation=require_validation,
             )
@@ -111,13 +110,9 @@ def _store_query_factory(*, require_validation: bool) -> QueryFactory:
 
 def _query(
     query_factory: QueryFactory,
-    default_graph_store_path: str | Path | None,
-    request_graph_store_path: str | None,
+    graph_store_path: str | Path,
 ) -> EngineeringKgQuery:
-    graph_store = request_graph_store_path or default_graph_store_path
-    if graph_store is None:
-        raise GraphQueryError("A local graph store path is required")
-    return query_factory(graph_store)
+    return query_factory(graph_store_path)
 
 
 def _call_tool(callback: Callable[[], Any]) -> dict[str, Any]:
