@@ -30,17 +30,17 @@ The system SHALL allow local code to construct the query API from the existing L
 - **THEN** it does not depend on LadybugDB-native APIs outside the existing persistence boundary
 
 ### Requirement: Query API lists requirements deterministically
-The system SHALL provide deterministic requirement query operations over canonical requirement and OpenSpec requirement facts.
+The system SHALL provide deterministic requirement query operations over canonical `requirement` facts and their evidence without exposing source-prefixed requirement kinds as a query contract.
 
-#### Scenario: Requirements are listed
-- **WHEN** local code requests requirements from a graph containing requirement nodes
-- **THEN** the query API returns requirement identifiers, kinds, names, properties, evidence identifiers, and supported locator identity fields
+#### Scenario: Canonical requirements are listed
+- **WHEN** local code requests requirements from a graph containing canonical requirement nodes
+- **THEN** the query API returns canonical identifiers, kinds, names, canonical properties, evidence identifiers, and supported locator identity fields
 - **THEN** results are ordered deterministically by stable graph identity
 
-#### Scenario: Requirements can be filtered by graph facts
-- **WHEN** local code requests requirements filtered by an explicit graph fact such as capability, service, OpenSpec change, or evidence reference
-- **THEN** the query API returns only requirements connected by existing canonical or derived graph relationships
-- **THEN** the query API does not infer missing relationships from names, repository hints, prompt context, or service-specific assumptions
+#### Scenario: Requirements are filtered by provenance
+- **WHEN** local code requests requirements filtered by an OpenSpec change or evidence reference
+- **THEN** the query API filters canonical requirements through represented relationships and evidence provenance
+- **THEN** it does not require, return, or infer an `openspec-requirement` node
 
 ### Requirement: Query API lists services deterministically
 The system SHALL provide deterministic service query operations over canonical workspace registry service and repository facts.
@@ -93,3 +93,11 @@ The system SHALL exclude source-owned payload bodies and sensitive values from s
 - **WHEN** a query result includes OpenSpec, Confluence, Jira, Bitbucket, or other external-system reference identities represented in the graph
 - **THEN** the serialized result includes only graph-stored identity, properties, evidence identifiers, and supported locator identity fields
 - **THEN** the serialized result excludes full markdown bodies, page content, comments, attachments, API payloads, credentials, and tokens
+
+### Requirement: Query API exposes canonical provenance without source payloads
+The system SHALL expose each returned canonical fact's source and supported locator identity as provenance while excluding provider payload bodies and source-specific ontology aliases.
+
+#### Scenario: OpenSpec provenance is returned
+- **WHEN** a query result is supported by OpenSpec evidence
+- **THEN** the result includes the evidence source, identifier, and supported OpenSpec locator identity fields
+- **THEN** the result does not include full markdown content, an OpenSpec-prefixed canonical kind, or a duplicated source-owned domain object

@@ -19,31 +19,13 @@ The system SHALL extract OpenSpec graph facts only from the OpenSpec root resolv
 - **THEN** extraction does not call Jira, Bitbucket, Confluence, OpenLore MCP, cloud services, external APIs, compilation, publishing, semantic extraction, or LLM services
 
 ### Requirement: Durable specifications are extracted with requirement and scenario granularity
-The system SHALL extract durable OpenSpec specifications, requirements, and scenarios from every `spec.md` file discovered recursively under `openspec/specs/` into canonical graph facts.
+The system SHALL extract every durable `spec.md` file beneath `openspec/specs/` into canonical specification, requirement, and scenario facts, each supported by OpenSpec evidence.
 
 #### Scenario: Current specification graph facts are produced
 - **WHEN** the extractor reads a durable spec file containing `### Requirement:` and `#### Scenario:` headings
-- **THEN** it produces an OpenSpec specification node for the capability identity derived from the spec path
-- **THEN** it produces one OpenSpec requirement node for each `### Requirement: <name>` heading
-- **THEN** it produces one OpenSpec scenario node for each `#### Scenario: <name>` heading under a requirement
-- **THEN** it links the specification to its requirements and each requirement to its scenarios
-
-#### Scenario: Nested durable specification graph facts are produced
-- **WHEN** the extractor reads `openspec/specs/service/payments/spec.md`
-- **THEN** it produces an OpenSpec specification node with capability `service/payments`
-- **THEN** the specification node uses the same namespaced capability identity in its deterministic OpenSpec identity
-- **THEN** source evidence identifies the nested spec file path
-
-#### Scenario: Flat durable capability identity is preserved
-- **WHEN** the extractor reads `openspec/specs/payments/spec.md`
-- **THEN** it produces an OpenSpec specification node with capability `payments`
-- **THEN** it does not rename the capability to a namespaced value
-
-#### Scenario: Local heading schema is respected
-- **WHEN** the extractor reads a durable spec file
-- **THEN** it treats `### Requirement: <name>` as the supported requirement heading shape
-- **THEN** it treats `#### Scenario: <name>` as the supported scenario heading shape
-- **THEN** it does not treat `## Requirement: <name>` as a valid requirement heading
+- **THEN** it produces canonical specification, requirement, and scenario nodes using source-independent identities
+- **THEN** it links the specification to its requirements and each requirement to its scenarios with canonical relationship kinds
+- **THEN** every emitted fact references evidence for the source file and supported heading
 
 ### Requirement: Active and archived changes are extracted as distinct facts
 The system SHALL extract active OpenSpec changes and archived OpenSpec changes as distinct canonical graph facts.
@@ -65,47 +47,26 @@ The system SHALL extract active OpenSpec changes and archived OpenSpec changes a
 - **THEN** Jira-looking tokens may be exposed only as optional metadata or reference hints
 
 ### Requirement: Change-local specs remain scoped to their change artifact state
-The system SHALL extract change-local spec delta files discovered recursively under a change's `specs/` directory as change-scoped or archive-scoped facts without blindly merging them into current durable specification facts.
+The system SHALL retain an active or archived OpenSpec change as a source-specific fact while emitting its delta specification, requirement, and scenario content as canonical facts supported by change-scoped OpenSpec evidence.
 
-#### Scenario: Archived delta spec duplicates durable spec
-- **WHEN** an archived change contains a delta spec for a capability that also exists under `openspec/specs`
-- **THEN** the extractor preserves the archived delta spec as an archive-scoped spec fact
-- **THEN** the extractor preserves the durable spec as the current specification fact
-- **THEN** it does not collapse the two facts into one node solely because their capability names match
+#### Scenario: Change delta converges on a canonical specification
+- **WHEN** an active or archived change contains `specs/<capability>/spec.md`
+- **THEN** the extractor emits or reuses the canonical specification for that repository and capability
+- **THEN** it links the source-specific change to the canonical specification with asserted OpenSpec evidence
+- **THEN** it does not create an `openspec-spec` node or encode the change identity in the canonical specification ID
 
-#### Scenario: Active delta spec is linked to active change
-- **WHEN** an active change contains `specs/<capability>/spec.md`
-- **THEN** the extractor links the change-scoped spec fact to the active change
-- **THEN** the extractor preserves the capability identity from the delta spec path
-
-#### Scenario: Nested active delta spec preserves namespaced capability identity
-- **WHEN** an active change contains `specs/service/payments/spec.md`
-- **THEN** the extractor links the change-scoped spec fact to the active change
-- **THEN** the change-scoped spec fact has capability `service/payments`
-- **THEN** the change-to-spec relationship preserves capability `service/payments`
-
-#### Scenario: Nested archived delta spec preserves namespaced capability identity
-- **WHEN** an archived change contains `specs/service/payments/spec.md`
-- **THEN** the extractor preserves the archived delta spec as an archive-scoped spec fact
-- **THEN** the archived spec fact has capability `service/payments`
-- **THEN** the change-to-spec relationship preserves capability `service/payments`
+#### Scenario: Durable specification is absent
+- **WHEN** a change delta names a capability that has no durable spec file
+- **THEN** the extractor creates the canonical specification using the same repository-and-capability identity
+- **THEN** the emitted fact remains supported by the change-scoped OpenSpec evidence without inventing a durable source file
 
 ### Requirement: OpenSpec spec capability identity is derived from relative spec path
-The system SHALL derive OpenSpec spec capability identity from the spec file path relative to the relevant `specs/` directory with the trailing `/spec.md` segment removed.
+The system SHALL derive the capability component of a canonical OpenSpec-backed specification identity from the relative spec path with the trailing `/spec.md` segment removed.
 
-#### Scenario: Durable nested capability identity is namespaced
-- **WHEN** the extractor reads a durable spec at `openspec/specs/service/directory1-n/spec.md`
-- **THEN** it derives capability `service/directory1-n`
-- **THEN** it uses `service/directory1-n` in specification, requirement, scenario, and relationship properties that identify capability
-
-#### Scenario: Change-scoped nested capability identity is namespaced
-- **WHEN** the extractor reads a change-scoped spec at `openspec/changes/add-x/specs/service/directory1-n/spec.md`
-- **THEN** it derives capability `service/directory1-n`
-- **THEN** it uses `service/directory1-n` in specification, requirement, scenario, and relationship properties that identify capability
-
-#### Scenario: Recursive discovery remains deterministic
-- **WHEN** local code runs OpenSpec graph extraction multiple times against unchanged nested and flat spec files
-- **THEN** each extraction result contains the same node IDs, edge IDs, evidence IDs, graph counts, and serialized extraction metadata
+#### Scenario: Same capability across OpenSpec scopes has one identity
+- **WHEN** durable and change-scoped spec files represent the same repository and capability
+- **THEN** extraction assigns the same canonical specification ID to their compatible facts
+- **THEN** both source locations are retained as provenance rather than separate scoped specification nodes
 
 ### Requirement: Optional specification frontmatter is extracted as non-authoritative metadata
 The system SHALL parse optional YAML frontmatter in durable spec files without requiring frontmatter or any individual frontmatter key.
@@ -145,3 +106,11 @@ The system SHALL produce deterministic graph facts and extraction metadata for t
 - **WHEN** extraction serializes source evidence for OpenSpec-originated facts
 - **THEN** evidence identifies local source file paths, artifact types, heading names, and OpenSpec object identities as needed
 - **THEN** evidence excludes full requirement bodies, full markdown artifact bodies, implementation source code, OpenLore analysis details, generated graph records, credentials, tokens, and external API payloads
+
+### Requirement: OpenSpec extraction merges canonical provenance deterministically
+The system SHALL coalesce compatible OpenSpec assertions of one canonical identity, sort resulting records and evidence identifiers deterministically, and reject conflicting canonical identity fields.
+
+#### Scenario: Repeated extraction is idempotent
+- **WHEN** extraction runs repeatedly against unchanged durable and change-scoped OpenSpec files
+- **THEN** it returns the same canonical node IDs, relationship IDs, evidence IDs, ordering, and extraction metadata
+- **THEN** it does not duplicate canonical facts or discard existing source evidence

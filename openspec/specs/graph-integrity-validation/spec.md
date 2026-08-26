@@ -31,16 +31,30 @@ The system SHALL validate that canonical graph object IDs identify one determini
 - **THEN** validation returns an invalid validation status
 
 ### Requirement: Graph integrity validation checks traceability shape
-The system SHALL validate derived and extracted traceability relationships against their expected graph object kinds.
+The system SHALL validate asserted and derived OpenSpec change-to-canonical-specification traceability relationships against source-specific change and canonical specification endpoint kinds.
 
-#### Scenario: OpenSpec change-to-spec traceability has valid endpoints
-- **WHEN** graph integrity validation reads an OpenSpec change-to-spec traceability relationship
-- **THEN** validation verifies that the source endpoint is an OpenSpec active change, archived change, or change-scoped spec node
-- **THEN** validation verifies that the target endpoint is an OpenSpec durable spec node
+#### Scenario: OpenSpec change traceability has valid endpoints
+- **WHEN** graph integrity validation reads an OpenSpec change traceability relationship
+- **THEN** validation verifies that its source is an `openspec-active-change` or `openspec-archived-change` node
+- **THEN** validation verifies that its target is a canonical `specification` node
+- **THEN** validation verifies that every referenced evidence identifier exists
 
-#### Scenario: Invalid traceability endpoints are reported
-- **WHEN** graph integrity validation reads a traceability relationship whose endpoints do not match the expected source and target object kinds
-- **THEN** validation reports an error diagnostic identifying the relationship and invalid endpoint kind
+#### Scenario: Retired source-prefixed domain endpoint is invalid
+- **WHEN** graph integrity validation reads a relationship using `openspec-spec`, `openspec-requirement`, or `openspec-scenario` as a canonical domain endpoint
+- **THEN** validation reports an error diagnostic identifying the retired source-prefixed ontology usage
+- **THEN** validation returns an invalid validation status
+
+### Requirement: Graph integrity validation checks canonical identity consistency
+The system SHALL validate that records sharing a canonical ID have one compatible canonical kind and natural-key shape while allowing multiple evidence records to support that fact.
+
+#### Scenario: Compatible evidence is accepted
+- **WHEN** canonical facts with the same ID have compatible canonical fields and distinct valid evidence identifiers
+- **THEN** validation accepts the fact as one canonical identity with multiple provenance records
+- **THEN** validation does not report a duplicate identity conflict solely because the source evidence differs
+
+#### Scenario: Incompatible canonical identity is invalid
+- **WHEN** records with the same canonical ID disagree on kind or a natural-key property
+- **THEN** validation reports an error diagnostic identifying the conflicting ID and fields
 - **THEN** validation returns an invalid validation status
 
 ### Requirement: Graph integrity validation separates errors from warnings

@@ -32,10 +32,10 @@ The system SHALL represent Confluence page references with a ConfluencePageRef c
 - **THEN** the serialized representation does not contain page content, page URL, comments, attachments, credentials, tokens, or Confluence API response data
 
 ### Requirement: Stable IDs are deterministic
-The system SHALL provide deterministic stable ID generation for canonical ontology objects based on object kind and explicit identity parts.
+The system SHALL provide deterministic stable ID generation for canonical ontology objects based on object kind and explicit source-independent identity parts.
 
-#### Scenario: Same identity produces same ID
-- **WHEN** local code generates a stable ID twice using the same object kind and identity parts
+#### Scenario: Same canonical identity produces same ID
+- **WHEN** local code generates a stable ID twice using the same canonical object kind and natural-key identity parts
 - **THEN** both generated IDs are identical
 
 #### Scenario: Different identity produces different ID
@@ -61,17 +61,17 @@ The system SHALL keep the canonical ontology core local and in-memory for this M
 - **THEN** the system does not create or update LadybugDB storage, external systems, OpenLore indexes, Confluence pages, generated wiki content, or published artifacts
 
 ### Requirement: Ontology represents OpenSpec extraction facts
-The system SHALL provide canonical graph vocabulary for OpenSpec-originated specifications, requirements, scenarios, active changes, archived changes, and change artifacts.
+The system SHALL provide source-independent canonical graph vocabulary for specifications, requirements, and scenarios, and source-specific vocabulary only for OpenSpec active changes, archived changes, and change artifacts.
 
-#### Scenario: OpenSpec node kinds are available
-- **WHEN** local code constructs canonical graph nodes for OpenSpec extraction output
-- **THEN** it can represent `openspec-active-change`, `openspec-archived-change`, `openspec-spec`, `openspec-requirement`, `openspec-scenario`, and `openspec-artifact` node kinds
-- **THEN** the nodes can be serialized deterministically without external services, API keys, cloud services, database access, or OpenLore queries
+#### Scenario: Canonical OpenSpec-backed facts are available
+- **WHEN** local code constructs graph nodes for facts extracted from OpenSpec specifications
+- **THEN** it can represent the facts as `specification`, `requirement`, and `scenario` node kinds without an OpenSpec-prefixed domain kind
+- **THEN** each node can retain OpenSpec source evidence and serialize deterministically without external services
 
-#### Scenario: OpenSpec relationship kinds are available
-- **WHEN** local code constructs canonical graph edges for OpenSpec extraction output
-- **THEN** it can represent relationships from specs to requirements, requirements to scenarios, changes to change artifacts, changes to change-scoped specs, and specs to related specs
-- **THEN** the edges can be serialized deterministically
+#### Scenario: Source-owned OpenSpec entities remain available
+- **WHEN** local code constructs graph nodes for an OpenSpec change or planning artifact
+- **THEN** it can represent `openspec-active-change`, `openspec-archived-change`, and `openspec-artifact` node kinds
+- **THEN** their OpenSpec lifecycle identity does not become the identity of a canonical specification, requirement, or scenario
 
 ### Requirement: Ontology supports non-confident graph relationships
 The system SHALL represent relationship confidence so manually maintained OpenSpec metadata can be distinguished from directly extracted structural facts.
@@ -98,3 +98,11 @@ The system SHALL represent source evidence for OpenSpec-originated graph facts w
 - **WHEN** local code constructs OpenSpec evidence or nodes for a change directory whose name includes a date, Jira issue ID, both, or only a Jira issue ID
 - **THEN** the full directory name can be preserved as the stable OpenSpec change identity
 - **THEN** any Jira-looking token can be represented only as optional metadata or a reference hint
+
+### Requirement: Canonical facts preserve source provenance
+The system SHALL attach evidence identifiers to canonical nodes and relationships and SHALL keep provider-specific locators and payload metadata outside canonical identity and domain vocabulary.
+
+#### Scenario: Canonical fact has OpenSpec evidence
+- **WHEN** an OpenSpec adapter emits a canonical specification, requirement, scenario, or relationship
+- **THEN** the fact references OpenSpec evidence containing its supported locator identity
+- **THEN** the canonical fact does not expose `openspec_identity`, scope, or source path as a required identity field

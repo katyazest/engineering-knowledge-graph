@@ -30,28 +30,22 @@ The system SHALL produce deterministic derived graph relationships for the same 
 - **THEN** repeated derivation does not create duplicate graph edges for the same derived relationship
 
 ### Requirement: Derivation links OpenSpec changes to durable specifications
-The system SHALL derive traceability between OpenSpec change-scoped specification facts and durable specification facts only when both facts already exist in the canonical graph snapshot and share the same OpenSpec capability identity, including namespaced capability identities emitted by extraction.
+The system SHALL derive traceability from a source-specific OpenSpec active or archived change to a canonical specification when the graph contains an asserted change-to-canonical-specification relationship with valid evidence.
 
-#### Scenario: Change-scoped spec maps to durable spec
-- **WHEN** the graph contains an OpenSpec active or archived change node, a change-scoped spec node for capability `payments`, and a durable spec node for capability `payments`
-- **THEN** derivation creates a deterministic relationship from the change or change-scoped spec context to the durable spec
-- **THEN** the relationship preserves evidence or derivation metadata identifying the rule that created it
+#### Scenario: Change assertion produces canonical traceability
+- **WHEN** the graph contains an OpenSpec change, an asserted evidenced link to a canonical specification, and the derivation rule is executed
+- **THEN** derivation creates one deterministic canonical traceability relationship from the change to that specification
+- **THEN** the derived relationship records `derived: true`, its derivation rule identity, the asserted input relationship, and the input evidence identifiers
 
-#### Scenario: Namespaced change-scoped spec maps to namespaced durable spec
-- **WHEN** the graph contains an OpenSpec active or archived change node, a change-scoped spec node for capability `service/payments`, and a durable spec node for capability `service/payments`
-- **THEN** derivation creates a deterministic relationship from the change or change-scoped spec context to the durable spec
-- **THEN** the relationship preserves capability `service/payments`
-- **THEN** the relationship preserves evidence or derivation metadata identifying the rule that created it
+#### Scenario: Traceability does not require a scoped duplicate
+- **WHEN** the graph contains a canonical specification supported by both durable and change-scoped OpenSpec evidence
+- **THEN** derivation uses that canonical specification identity directly
+- **THEN** it does not require or create a change-scoped `openspec-spec` node
 
-#### Scenario: Same final directory name does not create suffix match
-- **WHEN** the graph contains a change-scoped spec node for capability `service-a/payments` and a durable spec node for capability `service-b/payments`
-- **THEN** derivation does not create traceability between those specs
-- **THEN** derivation reports the skipped or unresolved derivation input in deterministic metadata
-
-#### Scenario: Missing durable spec is not invented
-- **WHEN** the graph contains a change-scoped spec node for a capability with no matching durable spec node
-- **THEN** derivation does not invent a durable spec node
-- **THEN** derivation reports the skipped or unresolved derivation input in deterministic metadata
+#### Scenario: Invalid asserted input is skipped
+- **WHEN** a purported OpenSpec change-to-specification assertion has a missing endpoint, missing evidence, or a non-canonical target kind
+- **THEN** derivation does not create traceability from that input
+- **THEN** it reports a deterministic diagnostic identifying the skipped input
 
 ### Requirement: Derivation preserves source ownership boundaries
 The system SHALL NOT derive authoritative implementation, service, or code traceability from manually maintained hints, names, or non-confident relationships alone.
