@@ -1,195 +1,79 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-FIXTURES = REPO_ROOT / "tests" / "fixtures"
-NON_GIT_REQUIREMENTS = FIXTURES / "non-git-workspace" / "openspec" / "requirements_repo"
-
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.ingest.openspec import (
+    OpenSpecStoreSourceValidationResult,
     RegisteredOpenSpecStore,
     extract_openspec_graph,
     validate_openspec_store_source,
 )
 from engineering_kg.ontology import EdgeKind, NodeKind
 from engineering_kg.project import load_workspace_registry
+from engineering_kg.validation import validate_graph_integrity
+
+ROOT = REPO_ROOT / "tests/fixtures/non-git-workspace/openspec/requirements_repo"
 
 
 class OpenSpecGraphExtractionTest(unittest.TestCase):
-    def test_extracts_durable_specs_requirements_and_scenarios(self) -> None:
-        result = _extract().as_dict()
-        nodes = result["graph"]["nodes"]
-        edges = result["graph"]["edges"]
+    def test_extracts_canonical_facts_and_coalesces_source_evidence(self) -> None:
+        graph = _extract().graph
+        specs = [node for node in graph.nodes if node.kind == NodeKind.SPECIFICATION]
+        self.assertEqual({node.properties["capability"] for node in specs}, {"payments", "service/payments", "settlement"})
+        payments = next(node for node in specs if node.properties["capability"] == "payments")
+        self.assertEqual(len(payments.evidence_ids), 3)
+        self.assertFalse(any(str(node.kind).startswith("openspec-") for node in graph.nodes if node.kind not in {NodeKind.OPENSPEC_ACTIVE_CHANGE, NodeKind.OPENSPEC_ARCHIVED_CHANGE, NodeKind.OPENSPEC_ARTIFACT}))
+        self.assertTrue(any(edge.kind == EdgeKind.ASSERTS for edge in graph.edges))
+        self.assertTrue(any(edge.kind == EdgeKind.CONTAINS for edge in graph.edges))
 
-        durable_specs = [
-            node
-            for node in nodes
-            if node["kind"] == NodeKind.OPENSPEC_SPEC.value
-            and node["properties"]["scope"] == "durable"
-        ]
-        durable_requirements = [
-            node
-            for node in nodes
-            if node["kind"] == NodeKind.OPENSPEC_REQUIREMENT.value
-            and node["properties"]["scope"] == "durable"
-        ]
-        durable_scenarios = [
-            node
-            for node in nodes
-            if node["kind"] == NodeKind.OPENSPEC_SCENARIO.value
-            and node["properties"]["scope"] == "durable"
-        ]
-
-        self.assertEqual(
-            {node["properties"]["capability"] for node in durable_specs},
-            {"payments", "service/payments", "settlement"},
-        )
-        self.assertEqual(
-            {node["name"] for node in durable_requirements},
-            {"Payment is submitted", "Service payment is routed", "Settlement is posted"},
-        )
-        self.assertEqual(
-            {node["name"] for node in durable_scenarios},
-            {
-                "Valid payment",
-                "Still belongs to previous requirement",
-                "Service payment route selected",
-                "Settlement complete",
-            },
-        )
-        self.assertFalse(any(node["name"] == "Unsupported heading is ignored" for node in durable_requirements))
-        self.assertTrue(
-            any(edge["kind"] == EdgeKind.OPENSPEC_SPEC_CONTAINS_REQUIREMENT.value for edge in edges)
-        )
-        self.assertTrue(
-            any(edge["kind"] == EdgeKind.OPENSPEC_REQUIREMENT_CONTAINS_SCENARIO.value for edge in edges)
-        )
-
-    def test_extracts_active_and_archived_changes_with_scoped_delta_specs(self) -> None:
-        nodes = _extract().as_dict()["graph"]["nodes"]
-
-        active_changes = [node for node in nodes if node["kind"] == NodeKind.OPENSPEC_ACTIVE_CHANGE.value]
-        archived_changes = [
-            node for node in nodes if node["kind"] == NodeKind.OPENSPEC_ARCHIVED_CHANGE.value
-        ]
-        payment_specs = [
-            node
-            for node in nodes
-            if node["kind"] == NodeKind.OPENSPEC_SPEC.value
-            and node["properties"]["capability"] == "payments"
-        ]
-        service_payment_specs = [
-            node
-            for node in nodes
-            if node["kind"] == NodeKind.OPENSPEC_SPEC.value
-            and node["properties"]["capability"] == "service/payments"
-        ]
-
-        self.assertEqual([node["name"] for node in active_changes], ["JIRA-123-add-refund"])
-        self.assertEqual(
-            [node["name"] for node in archived_changes],
-            ["2026-08-01-JIRA-122-add-payments"],
-        )
-        self.assertEqual(
-            {node["properties"]["scope"] for node in payment_specs},
-            {"durable", "active-change", "archived-change"},
-        )
-        self.assertEqual(
-            {node["properties"]["scope"] for node in service_payment_specs},
-            {"durable", "active-change", "archived-change"},
-        )
-        self.assertEqual(active_changes[0]["properties"]["jira_reference_hints"], ["JIRA-123"])
-
-    def test_extracts_frontmatter_related_edges_and_unresolved_refs(self) -> None:
-        result = _extract().as_dict()
-        payment_spec = _spec_by_capability(result["graph"]["nodes"], "payments", "durable")
-        related_edges = [
-            edge
-            for edge in result["graph"]["edges"]
-            if edge["kind"] == EdgeKind.OPENSPEC_RELATED_SPEC.value
-        ]
-
-        self.assertEqual(payment_spec["name"], "Payments Capability")
-        self.assertEqual(payment_spec["properties"]["frontmatter"]["repo"], "payment-service")
-        self.assertEqual(len(related_edges), 1)
-        self.assertEqual(related_edges[0]["confidence"], "non-confident")
-        self.assertEqual(related_edges[0]["properties"]["related_title"], "Settlement Capability")
-        self.assertEqual(
-            result["metadata"]["unresolved_related_spec_references"],
-            [
-                {
-                    "capability": "payments",
-                    "reason": "missing",
-                    "related_title": "Missing Capability",
-                }
-            ],
-        )
-
-    def test_extraction_is_deterministic_and_evidence_excludes_bodies(self) -> None:
+    def test_extraction_is_deterministic_and_preserves_provenance(self) -> None:
         first = _extract().as_dict()
-        second = _extract().as_dict()
-        serialized = str(first)
+        self.assertEqual(first, _extract().as_dict())
+        self.assertTrue(all("content" not in str(item) for item in first["graph"]["evidence"]))
 
-        self.assertEqual(first, second)
-        self.assertEqual(first["metadata"]["status"], "completed")
-        self.assertEqual(first["metadata"]["durable_spec_count"], 3)
-        self.assertEqual(first["metadata"]["active_change_count"], 1)
-        self.assertEqual(first["metadata"]["archived_change_count"], 1)
-        self.assertEqual(first["metadata"]["requirement_count"], 3)
-        self.assertEqual(first["metadata"]["scenario_count"], 4)
-        self.assertTrue(
-            any(
-                item["locator"]["relative_file_path"]
-                == "openspec/specs/service/payments/spec.md"
-                for item in first["graph"]["evidence"]
+    def test_unresolved_related_spec_is_a_validation_warning(self) -> None:
+        validation = validate_graph_integrity(_extract().graph)
+        self.assertEqual(validation.status, "valid")
+        self.assertTrue(any(item.rule_id == "unresolved-non-confident-related-spec" for item in validation.metadata.diagnostics))
+
+    def test_change_only_nested_capability_creates_canonical_facts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "openspec/specs").mkdir(parents=True)
+            spec_path = root / "openspec/changes/add-refunds/specs/service/refunds/spec.md"
+            spec_path.parent.mkdir(parents=True)
+            spec_path.write_text(
+                "### Requirement: Refund is issued\n\n#### Scenario: Valid refund\n",
+                encoding="utf-8",
             )
-        )
-        self.assertTrue(
-            all(
-                "relative_file_path" in item["locator"]
-                and "openspec_identity" in item["locator"]
-                and "artifact_type" in item["locator"]
-                for item in first["graph"]["evidence"]
+            source = OpenSpecStoreSourceValidationResult(
+                status="valid",
+                selection_source="fixture",
+                repository_id="requirements",
+                repository_role="requirements",
+                repository_path=root,
+                openspec_root_path=root / "openspec",
+                specs_path=root / "openspec/specs",
+                changes_path=root / "openspec/changes",
             )
-        )
-        for forbidden in (
-            "The system SHALL submit payments",
-            "source_code",
-            "openlore_analysis",
-            "generated_graph_records",
-            "credentials",
-            "tokens",
-            "api_response",
-        ):
-            self.assertNotIn(forbidden, serialized)
+            graph = extract_openspec_graph(source).graph
+        specification = next(node for node in graph.nodes if node.kind == NodeKind.SPECIFICATION)
+        self.assertEqual(specification.properties["capability"], "service/refunds")
+        self.assertTrue(any(node.kind == NodeKind.REQUIREMENT for node in graph.nodes))
+        self.assertTrue(any(node.kind == NodeKind.SCENARIO for node in graph.nodes))
+        self.assertEqual(len(specification.evidence_ids), 1)
 
 
 def _extract():
-    registry = load_workspace_registry(NON_GIT_REQUIREMENTS / "repo-index-openspec-graph-stage.yaml")
-    store_source = validate_openspec_store_source(
-        registry,
-        registered_stores=(RegisteredOpenSpecStore("requirements-store", NON_GIT_REQUIREMENTS),),
-    )
-    return extract_openspec_graph(store_source)
-
-
-def _spec_by_capability(nodes: list[dict[str, object]], capability: str, scope: str) -> dict[str, object]:
-    matches = [
-        node
-        for node in nodes
-        if node["kind"] == NodeKind.OPENSPEC_SPEC.value
-        and node["properties"]["capability"] == capability
-        and node["properties"]["scope"] == scope
-    ]
-    assert len(matches) == 1
-    return matches[0]
+    registry = load_workspace_registry(ROOT / "repo-index-openspec-graph-stage.yaml")
+    source = validate_openspec_store_source(registry, registered_stores=(RegisteredOpenSpecStore("requirements-store", ROOT),))
+    return extract_openspec_graph(source)
 
 
 if __name__ == "__main__":

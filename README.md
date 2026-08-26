@@ -14,7 +14,7 @@ Engineering KG решает эту проблему так:
 - отделяет requirements-репозиторий от implementation-репозиториев;
 - извлекает из OpenSpec структуру спецификаций, требований, сценариев, активных и архивных изменений;
 - сохраняет факты в локальный graph store;
-- выводит производные связи, например связь OpenSpec change с durable specification;
+- выводит производные связи, например traceability между source-owned OpenSpec change и canonical specification;
 - валидирует целостность графа;
 - дает локальный Python API и тонкие MCP/FastMCP wrappers для запросов.
 
@@ -356,13 +356,13 @@ Persistence делает merge по deterministic IDs и возвращает gr
 openspec-change-to-durable-spec
 ```
 
-Она ищет change-scoped spec, который touched by OpenSpec change, и durable spec с тем же capability. Если durable spec найден, создается связь:
+Она использует подтвержденную OpenSpec связь source-owned change с canonical specification и создает производимую traceability связь с тем же canonical specification:
 
 ```text
-openspec-change-traces-to-spec
+traces_to
 ```
 
-Если durable spec не найден, stage не выдумывает связь. Он добавляет deterministic diagnostic с объяснением unresolved input.
+Если утвержденная связь или ее evidence некорректны, stage не выдумывает связь. Он добавляет deterministic diagnostic с объяснением unresolved input.
 
 ### `graph-integrity-validation` - реализовано в MVP
 
@@ -541,8 +541,8 @@ Python Query API + FactMCP/FastMCP tools
 
 Граф состоит из трех типов записей:
 
-- `Node` - объект: workspace, repository, service, OpenSpec spec, requirement, scenario, change, artifact.
-- `Edge` - связь между объектами: contains, owns, spec contains requirement, requirement contains scenario, change touches spec, change traces to spec.
+- `Node` - объект: workspace, repository, service, canonical specification, requirement, scenario, OpenSpec change, artifact.
+- `Edge` - связь между объектами: contains, owns, specification-to-requirement, requirement-to-scenario, asserted change-to-specification, derived `traces_to`.
 - `Evidence` - ссылка на источник факта: OpenSpec file/heading, CodeLocator, Confluence page ref и другие locators.
 
 Идентификаторы создаются детерминированно через stable hash от типа объекта и его identity parts. Поэтому одинаковый input должен давать одинаковые node IDs, edge IDs и evidence IDs.
@@ -595,7 +595,7 @@ Engineering KG намеренно не хранит:
 
 `stage` - один шаг pipeline. Например, `workspace-registry`, `openspec-graph-extraction` или `graph-integrity-validation`.
 
-`derivation` - вывод новых связей из уже известных фактов без LLM и без догадок. Например, active change touches spec delta, а durable spec с тем же capability существует; значит можно построить traceability edge.
+`derivation` - вывод новых связей из уже известных фактов без LLM и без догадок. Например, asserted OpenSpec change-to-canonical-specification evidence produces a derived `traces_to` edge to that same canonical fact.
 
 `validation` - проверка, что graph snapshot не содержит битых ссылок, конфликтующих IDs и некорректных traceability edges.
 

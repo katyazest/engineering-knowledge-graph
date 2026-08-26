@@ -172,7 +172,7 @@ class EngineeringKgQuery:
         nodes = [
             node
             for node in self.snapshot.nodes
-            if _value(node.kind) in {NodeKind.REQUIREMENT.value, NodeKind.OPENSPEC_REQUIREMENT.value}
+            if _value(node.kind) == NodeKind.REQUIREMENT.value
         ]
         if capability:
             nodes = [node for node in nodes if self._node_related_to_property(node, "capability", capability)]
@@ -260,11 +260,11 @@ class EngineeringKgQuery:
     def _change_result(self, node: Node) -> QueryNodeResult:
         properties = dict(node.properties)
         properties["artifact_ids"] = self._targets_for(node.id, EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT)
-        touched = self._targets_for(node.id, EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC)
-        traced = self._targets_for(node.id, EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC)
-        properties["touched_spec_ids"] = touched
+        touched = self._targets_for(node.id, EdgeKind.ASSERTS)
+        traced = self._targets_for(node.id, EdgeKind.TRACES_TO)
+        properties["asserted_spec_ids"] = touched
         properties["traceability_spec_ids"] = traced
-        properties["missing_durable_spec_links"] = [
+        properties["missing_traceability_spec_ids"] = [
             item for item in touched if item not in set(traced)
         ]
         return QueryNodeResult(

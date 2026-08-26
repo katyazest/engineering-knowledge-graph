@@ -71,13 +71,13 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
     """Derive deterministic relationships from a canonical graph snapshot."""
 
     nodes_by_id = {node.id: node for node in snapshot.nodes}
-    durable_specs_by_capability = _durable_specs_by_capability(snapshot.nodes)
     derived_edges: list[Edge] = []
     diagnostics: list[GraphDerivationDiagnostic] = []
-    seen_change_spec_inputs: set[tuple[str, str, str]] = set()
+    evidence_ids = {item.id for item in snapshot.evidence}
+    seen_inputs: set[str] = set()
 
     for edge in sorted(snapshot.edges, key=lambda item: item.id):
-        if _value(edge.kind) != EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC.value:
+        if _value(edge.kind) != EdgeKind.ASSERTS.value:
             continue
         change_node = nodes_by_id.get(edge.source_id)
         change_scoped_spec = nodes_by_id.get(edge.target_id)
@@ -86,26 +86,44 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
                 GraphDerivationDiagnostic(
                     rule_id=OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
                     affected_object_id=edge.id,
-                    message="Cannot derive OpenSpec traceability because the change-to-spec edge has a missing endpoint.",
+                    message="Cannot derive OpenSpec traceability because the asserted edge has a missing endpoint.",
                     severity="warning",
                 )
             )
             continue
-        capability = str(change_scoped_spec.properties.get("capability", ""))
-        scope = str(change_scoped_spec.properties.get("scope", ""))
-        input_key = (change_node.id, change_scoped_spec.id, capability)
-        if input_key in seen_change_spec_inputs:
+        if edge.id in seen_inputs:
             continue
-        seen_change_spec_inputs.add(input_key)
-
-        durable_spec = durable_specs_by_capability.get(capability)
-        if durable_spec is None:
+        seen_inputs.add(edge.id)
+        if _value(change_node.kind) not in {
+            NodeKind.OPENSPEC_ACTIVE_CHANGE.value,
+            NodeKind.OPENSPEC_ARCHIVED_CHANGE.value,
+        }:
             diagnostics.append(
                 GraphDerivationDiagnostic(
                     rule_id=OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
-                    affected_object_id=change_scoped_spec.id,
-                    message=f"No durable OpenSpec spec exists for capability: {capability}",
-                    severity="info",
+                    affected_object_id=edge.id,
+                    message="Cannot derive OpenSpec traceability because the source is not an OpenSpec change.",
+                    severity="warning",
+                )
+            )
+            continue
+        if _value(change_scoped_spec.kind) != NodeKind.SPECIFICATION.value:
+            diagnostics.append(
+                GraphDerivationDiagnostic(
+                    rule_id=OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
+                    affected_object_id=edge.id,
+                    message="Cannot derive OpenSpec traceability because the target is not a canonical specification.",
+                    severity="warning",
+                )
+            )
+            continue
+        if not edge.evidence_ids or any(item not in evidence_ids for item in edge.evidence_ids):
+            diagnostics.append(
+                GraphDerivationDiagnostic(
+                    rule_id=OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
+                    affected_object_id=edge.id,
+                    message="Cannot derive OpenSpec traceability because asserted evidence is missing.",
+                    severity="warning",
                 )
             )
             continue
@@ -113,22 +131,19 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
             Edge(
                 id=stable_id(
                     "edge",
-                    EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC,
+                    EdgeKind.TRACES_TO,
                     OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
                     change_node.id,
-                    durable_spec.id,
-                    capability,
+                    change_scoped_spec.id,
+                    edge.id,
                 ),
-                kind=EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC,
+                kind=EdgeKind.TRACES_TO,
                 source_id=change_node.id,
-                target_id=durable_spec.id,
+                target_id=change_scoped_spec.id,
                 properties={
-                    "capability": capability,
                     "derived": True,
+                    "input_edge_ids": (edge.id,),
                     "rule_id": OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
-                    "source_scope": scope,
-                    "target_scope": str(durable_spec.properties.get("scope", "")),
-                    "via_spec_id": change_scoped_spec.id,
                 },
                 evidence_ids=edge.evidence_ids,
             )
@@ -151,19 +166,6 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
         diagnostics=diagnostics_tuple,
     )
     return GraphDerivationResult(graph=graph, metadata=metadata)
-
-
-def _durable_specs_by_capability(nodes: tuple[Node, ...]) -> dict[str, Node]:
-    durable_specs: dict[str, Node] = {}
-    for node in sorted(nodes, key=lambda item: item.id):
-        if _value(node.kind) != NodeKind.OPENSPEC_SPEC.value:
-            continue
-        if node.properties.get("scope") != "durable":
-            continue
-        capability = str(node.properties.get("capability", ""))
-        if capability and capability not in durable_specs:
-            durable_specs[capability] = node
-    return durable_specs
 
 
 def _diagnostic_sort_key(item: GraphDerivationDiagnostic) -> tuple[str, str, str, str]:

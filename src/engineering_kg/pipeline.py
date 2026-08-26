@@ -16,7 +16,11 @@ from engineering_kg.ingest.openspec import (
 )
 from engineering_kg.ontology import GraphSnapshot
 from engineering_kg.openlore import OpenLoreSourceValidationResult, validate_workspace_openlore_source
-from engineering_kg.persistence import persist_graph_snapshot
+from engineering_kg.persistence import (
+    OntologyMigrationResult,
+    PersistenceError,
+    initialize_ladybugdb_store,
+)
 from engineering_kg.project import load_workspace_registry
 from engineering_kg.validation import (
     GraphIntegrityValidationError,
@@ -38,6 +42,7 @@ class PipelineResult:
     openspec_graph_extraction: OpenSpecExtractionResult | None = None
     graph_derivation: GraphDerivationResult | None = None
     graph_integrity_validation: GraphValidationResult | None = None
+    ontology_migration: OntologyMigrationResult | None = None
 
     @property
     def configured_stage_count(self) -> int:
@@ -80,6 +85,10 @@ class PipelineResult:
             data["graph_integrity_validation"] = {
                 "metadata": self.graph_integrity_validation.metadata.as_dict()
             }
+        if self.ontology_migration is None:
+            data.pop("ontology_migration")
+        else:
+            data["ontology_migration"] = self.ontology_migration.as_dict()
         return data
 
 
@@ -103,6 +112,7 @@ def run_pipeline(
         openspec_graph_extraction = None
         graph_derivation = None
         graph_integrity_validation = None
+        ontology_migration = None
         if "workspace-registry" in configured_stages:
             executed_stages.append("workspace-registry")
             graph = registry.to_graph_snapshot()
@@ -126,8 +136,32 @@ def run_pipeline(
             openlore_source = validate_workspace_openlore_source(registry)
             executed_stages.append("workspace-openlore-source")
         if persistence_path is not None and "ladybugdb-persistence" in configured_stages:
+            store = initialize_ladybugdb_store(persistence_path)
+            executed_stages.append("ontology-migration")
+            try:
+                ontology_migration = store.migrate_persisted_snapshot()
+            except PersistenceError as exc:
+                return PipelineResult(
+                    status="failed",
+                    configured_stages=configured_stages,
+                    executed_stages=tuple(executed_stages),
+                    graph=graph,
+                    openlore_source=openlore_source,
+                    openspec_store_source=openspec_store_source,
+                    openspec_graph_extraction=openspec_graph_extraction,
+                    ontology_migration=OntologyMigrationResult(
+                        graph,
+                        status="failed",
+                        diagnostics=(str(exc),),
+                    ),
+                )
             executed_stages.append("ladybugdb-persistence")
-            graph = persist_graph_snapshot(persistence_path, graph)
+            graph = store.write_snapshot(graph)
+            ontology_migration = OntologyMigrationResult(
+                graph,
+                ontology_migration.migrated_node_count,
+                ontology_migration.migrated_edge_count,
+            )
         if "graph-derivation" in configured_stages:
             graph_derivation = derive_graph_relationships(graph)
             graph = graph_derivation.graph
@@ -147,15 +181,24 @@ def run_pipeline(
             openspec_graph_extraction=openspec_graph_extraction,
             graph_derivation=graph_derivation,
             graph_integrity_validation=graph_integrity_validation,
+            ontology_migration=ontology_migration,
         )
 
     if persistence_path is not None:
-        graph = persist_graph_snapshot(persistence_path, GraphSnapshot())
+        store = initialize_ladybugdb_store(persistence_path)
+        ontology_migration = store.migrate_persisted_snapshot()
+        graph = store.write_snapshot(GraphSnapshot())
+        ontology_migration = OntologyMigrationResult(
+            graph,
+            ontology_migration.migrated_node_count,
+            ontology_migration.migrated_edge_count,
+        )
         return PipelineResult(
             status="completed",
-            configured_stages=("ladybugdb-persistence",),
-            executed_stages=("ladybugdb-persistence",),
+            configured_stages=("ontology-migration", "ladybugdb-persistence"),
+            executed_stages=("ontology-migration", "ladybugdb-persistence"),
             graph=graph,
+            ontology_migration=ontology_migration,
         )
 
     return PipelineResult(
@@ -177,4 +220,6 @@ def _configured_stages(
             if stage in stages:
                 insertion_index = min(insertion_index, stages.index(stage))
         stages.insert(insertion_index, "ladybugdb-persistence")
+    if persistence_path is not None and "ontology-migration" not in stages:
+        stages.insert(stages.index("ladybugdb-persistence"), "ontology-migration")
     return tuple(stages)

@@ -6,12 +6,29 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from engineering_kg.ontology import Edge, EdgeKind, GraphSnapshot, Node, NodeKind
+from engineering_kg.ontology import (
+    Edge,
+    EdgeKind,
+    GraphSnapshot,
+    Node,
+    NodeKind,
+    openspec_requirement_id,
+    openspec_scenario_id,
+    openspec_specification_id,
+)
 
 
 SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
-OPENSPEC_CHANGE_TRACEABILITY_KINDS = {
-    EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC.value,
+OPENSPEC_CHANGE_TRACEABILITY_KINDS = {EdgeKind.ASSERTS.value, EdgeKind.TRACES_TO.value}
+RETIRED_OPENSPEC_DOMAIN_KINDS = {
+    "openspec-spec",
+    "openspec-requirement",
+    "openspec-scenario",
+    "openspec-spec-contains-requirement",
+    "openspec-requirement-contains-scenario",
+    "openspec-change-touches-spec",
+    "openspec-change-traces-to-spec",
+    "openspec-related-spec",
 }
 
 
@@ -88,8 +105,10 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     evidence_by_id = {item.id: item for item in snapshot.evidence}
     diagnostics.extend(_edge_endpoint_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_evidence_reference_diagnostics(snapshot, evidence_by_id))
+    diagnostics.extend(_retired_vocabulary_diagnostics(snapshot))
+    diagnostics.extend(_canonical_identity_diagnostics(snapshot.nodes))
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
-    diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges))
+    diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
 
     sorted_diagnostics = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     severity_counts = Counter(item.severity for item in sorted_diagnostics)
@@ -177,7 +196,16 @@ def _duplicate_conflict_diagnostics(
 ) -> list[GraphValidationDiagnostic]:
     by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in items:
-        by_id[item.id].append(item.as_dict())
+        serialized = item.as_dict()
+        if collection in {"node", "edge"}:
+            serialized.pop("evidence_ids")
+        if collection == "node" and _value(item.kind) in {
+            NodeKind.SPECIFICATION.value,
+            NodeKind.REQUIREMENT.value,
+            NodeKind.SCENARIO.value,
+        }:
+            serialized.pop("name")
+        by_id[item.id].append(serialized)
 
     diagnostics: list[GraphValidationDiagnostic] = []
     for item_id, serialized_items in sorted(by_id.items()):
@@ -202,27 +230,24 @@ def _traceability_shape_diagnostics(
 ) -> list[GraphValidationDiagnostic]:
     diagnostics: list[GraphValidationDiagnostic] = []
     for edge in edges:
-        if _value(edge.kind) not in OPENSPEC_CHANGE_TRACEABILITY_KINDS:
+        is_openspec_trace = (
+            _value(edge.kind) == EdgeKind.ASSERTS.value
+            or (
+                _value(edge.kind) == EdgeKind.TRACES_TO.value
+                and edge.properties.get("rule_id") == "openspec-change-to-durable-spec"
+            )
+        )
+        if not is_openspec_trace:
             continue
         source = nodes_by_id.get(edge.source_id)
         target = nodes_by_id.get(edge.target_id)
         if source is None or target is None:
             continue
-        source_valid = (
-            _value(source.kind)
-            in {
-                NodeKind.OPENSPEC_ACTIVE_CHANGE.value,
-                NodeKind.OPENSPEC_ARCHIVED_CHANGE.value,
-            }
-            or (
-                _value(source.kind) == NodeKind.OPENSPEC_SPEC.value
-                and source.properties.get("scope") in {"active-change", "archived-change"}
-            )
-        )
-        target_valid = (
-            _value(target.kind) == NodeKind.OPENSPEC_SPEC.value
-            and target.properties.get("scope") == "durable"
-        )
+        source_valid = _value(source.kind) in {
+            NodeKind.OPENSPEC_ACTIVE_CHANGE.value,
+            NodeKind.OPENSPEC_ARCHIVED_CHANGE.value,
+        }
+        target_valid = _value(target.kind) == NodeKind.SPECIFICATION.value
         if not source_valid:
             diagnostics.append(
                 GraphValidationDiagnostic(
@@ -238,7 +263,7 @@ def _traceability_shape_diagnostics(
                     severity="error",
                     rule_id="openspec-traceability-target-kind",
                     affected_object_id=edge.id,
-                    message="OpenSpec traceability target endpoint must be a durable OpenSpec spec.",
+                    message="OpenSpec traceability target endpoint must be a canonical specification.",
                 )
             )
     return diagnostics
@@ -247,24 +272,28 @@ def _traceability_shape_diagnostics(
 def _unresolved_related_spec_diagnostics(
     nodes: tuple[Node, ...],
     edges: tuple[Edge, ...],
+    evidence: tuple[Any, ...],
 ) -> list[GraphValidationDiagnostic]:
     related_edges_by_source: dict[str, set[str]] = defaultdict(set)
     for edge in edges:
-        if _value(edge.kind) != EdgeKind.OPENSPEC_RELATED_SPEC.value:
+        if _value(edge.kind) != EdgeKind.RELATED_TO.value:
             continue
         related_title = edge.properties.get("related_title")
         if isinstance(related_title, str):
             related_edges_by_source[edge.source_id].add(related_title)
 
+    related_by_specification: dict[str, set[str]] = defaultdict(set)
+    for item in evidence:
+        related = item.properties.get("related", ())
+        specification_id = item.properties.get("specification_id")
+        if isinstance(specification_id, str):
+            related_by_specification[specification_id].update(_related_titles(related))
+
     diagnostics: list[GraphValidationDiagnostic] = []
     for node in nodes:
-        if _value(node.kind) != NodeKind.OPENSPEC_SPEC.value:
+        if _value(node.kind) != NodeKind.SPECIFICATION.value:
             continue
-        frontmatter = node.properties.get("frontmatter", {})
-        if not isinstance(frontmatter, dict):
-            continue
-        related = frontmatter.get("related", ())
-        for related_title in _related_titles(related):
+        for related_title in sorted(related_by_specification.get(node.id, ())):
             if related_title in related_edges_by_source.get(node.id, set()):
                 continue
             diagnostics.append(
@@ -273,6 +302,70 @@ def _unresolved_related_spec_diagnostics(
                     rule_id="unresolved-non-confident-related-spec",
                     affected_object_id=node.id,
                     message=f"Non-confident related spec reference is unresolved: {related_title}",
+                )
+            )
+    return diagnostics
+
+
+def _canonical_identity_diagnostics(nodes: tuple[Node, ...]) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    for node in nodes:
+        kind = _value(node.kind)
+        properties = node.properties
+        if kind == NodeKind.SPECIFICATION.value:
+            expected = _specification_id(properties)
+        elif kind == NodeKind.REQUIREMENT.value:
+            expected = _requirement_id(properties)
+        elif kind == NodeKind.SCENARIO.value:
+            expected = _scenario_id(properties)
+        else:
+            continue
+        if expected is None or node.id != expected:
+            diagnostics.append(
+                GraphValidationDiagnostic(
+                    severity="error",
+                    rule_id="canonical-natural-key-identity",
+                    affected_object_id=node.id,
+                    message="Canonical node ID does not match its required natural-key properties.",
+                )
+            )
+    return diagnostics
+
+
+def _specification_id(properties: dict[str, Any]) -> str | None:
+    repository_id = properties.get("repository_id")
+    capability = properties.get("capability")
+    if isinstance(repository_id, str) and isinstance(capability, str):
+        return openspec_specification_id(repository_id, capability)
+    return None
+
+
+def _requirement_id(properties: dict[str, Any]) -> str | None:
+    specification_id = properties.get("specification_id")
+    requirement_key = properties.get("requirement_key")
+    if isinstance(specification_id, str) and isinstance(requirement_key, str):
+        return openspec_requirement_id(specification_id, requirement_key)
+    return None
+
+
+def _scenario_id(properties: dict[str, Any]) -> str | None:
+    requirement_id = properties.get("requirement_id")
+    scenario_key = properties.get("scenario_key")
+    if isinstance(requirement_id, str) and isinstance(scenario_key, str):
+        return openspec_scenario_id(requirement_id, scenario_key)
+    return None
+
+
+def _retired_vocabulary_diagnostics(snapshot: GraphSnapshot) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    for item in (*snapshot.nodes, *snapshot.edges):
+        if _value(item.kind) in RETIRED_OPENSPEC_DOMAIN_KINDS:
+            diagnostics.append(
+                GraphValidationDiagnostic(
+                    severity="error",
+                    rule_id="retired-openspec-domain-vocabulary",
+                    affected_object_id=item.id,
+                    message="Retired OpenSpec-prefixed domain vocabulary is not valid in a canonical graph.",
                 )
             )
     return diagnostics

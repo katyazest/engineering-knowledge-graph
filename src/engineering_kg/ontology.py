@@ -15,6 +15,7 @@ class NodeKind(StrEnum):
     REPOSITORY = "repository"
     SPECIFICATION = "specification"
     REQUIREMENT = "requirement"
+    SCENARIO = "scenario"
     OPENSPEC_CHANGE = "openspec_change"
     JIRA_STORY = "jira_story"
     PULL_REQUEST = "pull_request"
@@ -24,9 +25,6 @@ class NodeKind(StrEnum):
     ADR = "adr"
     OPENSPEC_ACTIVE_CHANGE = "openspec-active-change"
     OPENSPEC_ARCHIVED_CHANGE = "openspec-archived-change"
-    OPENSPEC_SPEC = "openspec-spec"
-    OPENSPEC_REQUIREMENT = "openspec-requirement"
-    OPENSPEC_SCENARIO = "openspec-scenario"
     OPENSPEC_ARTIFACT = "openspec-artifact"
 
 
@@ -38,12 +36,9 @@ class EdgeKind(StrEnum):
     TRACES_TO = "traces_to"
     REFERENCES_CODE = "references_code"
     OWNS = "owns"
-    OPENSPEC_SPEC_CONTAINS_REQUIREMENT = "openspec-spec-contains-requirement"
-    OPENSPEC_REQUIREMENT_CONTAINS_SCENARIO = "openspec-requirement-contains-scenario"
     OPENSPEC_CHANGE_HAS_ARTIFACT = "openspec-change-has-artifact"
-    OPENSPEC_CHANGE_TOUCHES_SPEC = "openspec-change-touches-spec"
-    OPENSPEC_CHANGE_TRACES_TO_SPEC = "openspec-change-traces-to-spec"
-    OPENSPEC_RELATED_SPEC = "openspec-related-spec"
+    ASSERTS = "asserts"
+    RELATED_TO = "related_to"
 
 
 def stable_id(object_kind: str, *identity_parts: object) -> str:
@@ -56,6 +51,24 @@ def stable_id(object_kind: str, *identity_parts: object) -> str:
     raw_identity = "\x1f".join(normalized_parts)
     digest = hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()[:16]
     return f"{normalized_parts[0]}:{digest}"
+
+
+def openspec_specification_id(repository_id: str, capability: str) -> str:
+    """Return the source-independent ID for an OpenSpec-backed specification."""
+
+    return stable_id("node", NodeKind.SPECIFICATION, repository_id, capability)
+
+
+def openspec_requirement_id(specification_id: str, requirement_key: str) -> str:
+    """Return the source-independent ID for an OpenSpec-backed requirement."""
+
+    return stable_id("node", NodeKind.REQUIREMENT, specification_id, requirement_key)
+
+
+def openspec_scenario_id(requirement_id: str, scenario_key: str) -> str:
+    """Return the source-independent ID for an OpenSpec-backed scenario."""
+
+    return stable_id("node", NodeKind.SCENARIO, requirement_id, scenario_key)
 
 
 def _normalize_identity_part(part: object) -> str:
@@ -229,10 +242,43 @@ class GraphSnapshot:
 
 
 def _merge_records(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:
-    records = {item.id: item for item in left}
-    order = [item.id for item in left]
-    for item in right:
-        records[item.id] = item
-        if item.id not in order:
+    records: dict[str, Any] = {}
+    order: list[str] = []
+    for item in (*left, *right):
+        existing = records.get(item.id)
+        if existing is None:
+            records[item.id] = item
             order.append(item.id)
+        else:
+            records[item.id] = _merge_record(existing, item)
     return tuple(records[item_id] for item_id in order)
+
+
+def _merge_record(left: Any, right: Any) -> Any:
+    if type(left) is not type(right):
+        raise ValueError(f"Conflicting graph record types for ID: {left.id}")
+    if isinstance(left, (Node, Edge)):
+        left_data = left.as_dict()
+        right_data = right.as_dict()
+        left_data.pop("evidence_ids")
+        right_data.pop("evidence_ids")
+        if isinstance(left, Node):
+            left_data.pop("name")
+            right_data.pop("name")
+        if left_data != right_data:
+            raise ValueError(f"Conflicting graph record values for ID: {left.id}")
+        evidence_ids = tuple(sorted(set(left.evidence_ids) | set(right.evidence_ids)))
+        if isinstance(left, Node):
+            return dataclass_replace(left, name=min(left.name, right.name), evidence_ids=evidence_ids)
+        return dataclass_replace(left, evidence_ids=evidence_ids)
+    if left.as_dict() != right.as_dict():
+        raise ValueError(f"Conflicting graph record values for ID: {left.id}")
+    return left
+
+
+def dataclass_replace(value: Any, **changes: Any) -> Any:
+    """Avoid exposing dataclasses.replace at the graph model boundary."""
+
+    from dataclasses import replace
+
+    return replace(value, **changes)

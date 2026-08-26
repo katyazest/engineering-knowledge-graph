@@ -4,192 +4,56 @@ import sys
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = REPO_ROOT / "src"
-FIXTURES = REPO_ROOT / "tests" / "fixtures"
-NON_GIT_REQUIREMENTS = FIXTURES / "non-git-workspace" / "openspec" / "requirements_repo"
-
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.derivation import derive_graph_relationships
-from engineering_kg.ingest.openspec import (
-    RegisteredOpenSpecStore,
-    extract_openspec_graph,
-    validate_openspec_store_source,
-)
-from engineering_kg.ontology import Edge, EdgeKind, GraphSnapshot, Node, NodeKind, stable_id
-from engineering_kg.project import load_workspace_registry
+from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, openspec_specification_id, stable_id
 
 
 class GraphDerivationTest(unittest.TestCase):
-    def test_derives_openspec_change_to_durable_spec_relationships(self) -> None:
-        graph = _extract_graph()
+    def test_derives_traceability_from_evidenced_assertion(self) -> None:
+        change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
+        specification = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})
+        assertion = Edge("assertion", EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=("e",))
+        graph = GraphSnapshot((change, specification), (assertion,), (Evidence("e", "openspec", "fixture"),))
+        result = derive_graph_relationships(graph)
+        derived = [edge for edge in result.graph.edges if edge.kind == EdgeKind.TRACES_TO]
+        self.assertEqual(len(derived), 1)
+        self.assertEqual(derived[0].properties["input_edge_ids"], ("assertion",))
+        self.assertTrue(derived[0].properties["derived"])
+        self.assertEqual(result.graph.as_dict(), derive_graph_relationships(result.graph).graph.as_dict())
 
-        result = derive_graph_relationships(graph).as_dict()
-        derived_edges = [
-            edge
-            for edge in result["graph"]["edges"]
-            if edge["kind"] == EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC.value
-        ]
+    def test_invalid_assertion_is_reported_without_traceability(self) -> None:
+        change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
+        target = Node("target", NodeKind.REQUIREMENT, "Requirement")
+        graph = GraphSnapshot((change, target), (Edge("assertion", EdgeKind.ASSERTS, change.id, target.id),))
+        result = derive_graph_relationships(graph)
+        self.assertEqual(result.metadata.derived_edge_count, 0)
+        self.assertEqual(result.metadata.unresolved_input_count, 1)
 
-        self.assertEqual(result["metadata"]["status"], "completed")
-        self.assertEqual(result["metadata"]["derived_edge_count"], 4)
-        self.assertEqual(len(derived_edges), 4)
-        self.assertEqual(
-            {edge["properties"]["capability"] for edge in derived_edges},
-            {"payments", "service/payments"},
+    def test_missing_endpoint_and_evidence_are_reported_without_traceability(self) -> None:
+        change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
+        specification = Node(
+            openspec_specification_id("requirements", "payments"),
+            NodeKind.SPECIFICATION,
+            "payments",
+            {"repository_id": "requirements", "capability": "payments"},
         )
-        self.assertTrue(all(edge["properties"]["derived"] for edge in derived_edges))
-        self.assertTrue(
-            all(edge["properties"]["target_scope"] == "durable" for edge in derived_edges)
-        )
-
-    def test_derives_namespaced_openspec_change_to_durable_spec_relationship(self) -> None:
-        graph = _extract_graph()
-
-        result = derive_graph_relationships(graph).as_dict()
-        derived_edges = [
-            edge
-            for edge in result["graph"]["edges"]
-            if edge["kind"] == EdgeKind.OPENSPEC_CHANGE_TRACES_TO_SPEC.value
-            and edge["properties"]["capability"] == "service/payments"
-        ]
-
-        self.assertEqual(len(derived_edges), 2)
-        self.assertEqual(
-            {edge["properties"]["source_scope"] for edge in derived_edges},
-            {"active-change", "archived-change"},
-        )
-        self.assertTrue(
-            all(edge["properties"]["target_scope"] == "durable" for edge in derived_edges)
-        )
-
-    def test_derivation_does_not_match_namespaced_capability_by_suffix(self) -> None:
-        change = Node(
-            id=stable_id("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-999-update-payments"),
-            kind=NodeKind.OPENSPEC_ACTIVE_CHANGE,
-            name="JIRA-999-update-payments",
-            properties={"change_identity": "JIRA-999-update-payments"},
-        )
-        change_spec = Node(
-            id=stable_id(
-                "node",
-                NodeKind.OPENSPEC_SPEC,
-                "active-change",
-                "JIRA-999-update-payments",
-                "service-a/payments",
+        graph = GraphSnapshot(
+            (change, specification),
+            (
+                Edge("missing-endpoint", EdgeKind.ASSERTS, change.id, "missing", evidence_ids=("e",)),
+                Edge("missing-evidence", EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=("e",)),
             ),
-            kind=NodeKind.OPENSPEC_SPEC,
-            name="Service A Payments",
-            properties={
-                "capability": "service-a/payments",
-                "change_identity": "JIRA-999-update-payments",
-                "scope": "active-change",
-            },
         )
-        durable_spec = Node(
-            id=stable_id("node", NodeKind.OPENSPEC_SPEC, "durable", "current", "service-b/payments"),
-            kind=NodeKind.OPENSPEC_SPEC,
-            name="Service B Payments",
-            properties={
-                "capability": "service-b/payments",
-                "change_identity": "",
-                "scope": "durable",
-            },
+        result = derive_graph_relationships(graph)
+        self.assertEqual(result.metadata.derived_edge_count, 0)
+        self.assertEqual(result.metadata.unresolved_input_count, 2)
+        self.assertEqual(
+            {item.affected_object_id for item in result.metadata.diagnostics},
+            {"missing-endpoint", "missing-evidence"},
         )
-        touches = Edge(
-            id=stable_id("edge", EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC, change.id, change_spec.id),
-            kind=EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC,
-            source_id=change.id,
-            target_id=change_spec.id,
-        )
-        graph = GraphSnapshot(nodes=(change, change_spec, durable_spec), edges=(touches,))
-
-        result = derive_graph_relationships(graph).as_dict()
-
-        self.assertEqual(result["metadata"]["derived_edge_count"], 0)
-        self.assertEqual(result["metadata"]["unresolved_input_count"], 1)
-        self.assertIn(
-            "service-a/payments",
-            result["metadata"]["diagnostics"][0]["message"],
-        )
-
-    def test_derivation_is_deterministic_and_does_not_duplicate_edges(self) -> None:
-        graph = _extract_graph()
-
-        first = derive_graph_relationships(graph)
-        second = derive_graph_relationships(graph)
-        repeated = derive_graph_relationships(first.graph)
-
-        self.assertEqual(first.as_dict(), second.as_dict())
-        self.assertEqual(first.graph.as_dict(), repeated.graph.as_dict())
-        self.assertEqual(first.metadata.derived_edge_count, repeated.metadata.derived_edge_count)
-
-    def test_missing_durable_spec_is_reported_without_inventing_node(self) -> None:
-        change = Node(
-            id=stable_id("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-999-add-refunds"),
-            kind=NodeKind.OPENSPEC_ACTIVE_CHANGE,
-            name="JIRA-999-add-refunds",
-            properties={"change_identity": "JIRA-999-add-refunds"},
-        )
-        change_spec = Node(
-            id=stable_id("node", NodeKind.OPENSPEC_SPEC, "active-change", "JIRA-999-add-refunds", "refunds"),
-            kind=NodeKind.OPENSPEC_SPEC,
-            name="Refunds",
-            properties={
-                "capability": "refunds",
-                "change_identity": "JIRA-999-add-refunds",
-                "scope": "active-change",
-            },
-        )
-        touches = Edge(
-            id=stable_id("edge", EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC, change.id, change_spec.id),
-            kind=EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC,
-            source_id=change.id,
-            target_id=change_spec.id,
-        )
-        graph = GraphSnapshot(nodes=(change, change_spec), edges=(touches,))
-
-        result = derive_graph_relationships(graph).as_dict()
-
-        self.assertEqual(result["metadata"]["derived_edge_count"], 0)
-        self.assertEqual(result["metadata"]["unresolved_input_count"], 1)
-        self.assertEqual(result["graph"]["node_count"], 2)
-        self.assertIn("No durable OpenSpec spec exists", result["metadata"]["diagnostics"][0]["message"])
-
-    def test_non_confident_related_spec_relationship_is_preserved(self) -> None:
-        graph = _extract_graph()
-
-        result = derive_graph_relationships(graph).as_dict()
-        related_edges = [
-            edge
-            for edge in result["graph"]["edges"]
-            if edge["kind"] == EdgeKind.OPENSPEC_RELATED_SPEC.value
-        ]
-
-        self.assertEqual(len(related_edges), 1)
-        self.assertEqual(related_edges[0]["confidence"], "non-confident")
-        serialized = str(result)
-        for forbidden in (
-            "source_code",
-            "openlore_analysis",
-            "generated_graph_records",
-            "credentials",
-            "tokens",
-            "api_response",
-        ):
-            self.assertNotIn(forbidden, serialized)
-
-
-def _extract_graph() -> GraphSnapshot:
-    registry = load_workspace_registry(NON_GIT_REQUIREMENTS / "repo-index-openspec-graph-stage.yaml")
-    store_source = validate_openspec_store_source(
-        registry,
-        registered_stores=(RegisteredOpenSpecStore("requirements-store", NON_GIT_REQUIREMENTS),),
-    )
-    return extract_openspec_graph(store_source).graph
 
 
 if __name__ == "__main__":

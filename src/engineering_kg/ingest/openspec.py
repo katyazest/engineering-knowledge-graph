@@ -19,6 +19,9 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     OpenSpecLocator,
+    openspec_requirement_id,
+    openspec_scenario_id,
+    openspec_specification_id,
     stable_id,
 )
 from engineering_kg.project import RepositoryEntry, WorkspaceRegistry
@@ -464,10 +467,10 @@ def _extract_change_scope(
         _extend_spec(nodes, edges, evidence, parsed)
         edges.append(
             _edge(
-                EdgeKind.OPENSPEC_CHANGE_TOUCHES_SPEC,
+                EdgeKind.ASSERTS,
                 change_node.id,
                 parsed.node.id,
-                f"{scope}-spec",
+                "openspec-change-specification",
                 change_dir.name,
                 parsed.capability,
                 evidence_ids=(parsed.evidence.id,),
@@ -485,8 +488,7 @@ def _parse_spec_file(
 ) -> _ParsedSpec:
     capability = _capability_from_spec_path(specs_root, spec_file)
     relative_path = _relative_path(store_source.repository_path, spec_file)
-    identity_parts = (scope, change_identity or "current", capability)
-    openspec_identity = ":".join(identity_parts)
+    openspec_identity = ":".join((scope, change_identity or "current", capability))
     source_text = spec_file.read_text(encoding="utf-8")
     frontmatter, body = _split_frontmatter(source_text)
     title = _optional_string(frontmatter.get("title")) or capability
@@ -498,16 +500,12 @@ def _parse_spec_file(
     }
     evidence_id = stable_id("evidence", "openspec", relative_path, openspec_identity)
     spec_node = Node(
-        id=stable_id("node", NodeKind.OPENSPEC_SPEC, *identity_parts),
-        kind=NodeKind.OPENSPEC_SPEC,
-        name=title,
+        id=openspec_specification_id(store_source.repository_id, capability),
+        kind=NodeKind.SPECIFICATION,
+        name=capability,
         properties={
             "capability": capability,
-            "change_identity": change_identity or "",
-            "frontmatter": supported_frontmatter,
-            "openspec_identity": openspec_identity,
             "repository_id": store_source.repository_id,
-            "scope": scope,
         },
         evidence_ids=(evidence_id,),
     )
@@ -516,6 +514,10 @@ def _parse_spec_file(
         relative_path,
         "openspec-spec",
         openspec_identity,
+        properties={
+            "related": related,
+            "specification_id": spec_node.id,
+        },
     )
 
     requirement_nodes: list[Node] = []
@@ -532,14 +534,13 @@ def _parse_spec_file(
                 "evidence", "openspec", relative_path, requirement_identity
             )
             current_requirement = Node(
-                id=stable_id("node", NodeKind.OPENSPEC_REQUIREMENT, requirement_identity),
-                kind=NodeKind.OPENSPEC_REQUIREMENT,
+                id=openspec_requirement_id(spec_node.id, requirement_name),
+                kind=NodeKind.REQUIREMENT,
                 name=requirement_name,
                 properties={
                     "capability": capability,
-                    "change_identity": change_identity or "",
-                    "openspec_identity": requirement_identity,
-                    "scope": scope,
+                    "requirement_key": _normalize_identity_part(requirement_name),
+                    "specification_id": spec_node.id,
                 },
                 evidence_ids=(requirement_evidence_id,),
             )
@@ -556,12 +557,11 @@ def _parse_spec_file(
             )
             edges.append(
                 _edge(
-                    EdgeKind.OPENSPEC_SPEC_CONTAINS_REQUIREMENT,
+                    EdgeKind.CONTAINS,
                     spec_node.id,
                     current_requirement.id,
                     "spec-requirement",
-                    openspec_identity,
-                    requirement_name,
+                    "specification-requirement",
                     evidence_ids=(requirement_evidence_id,),
                 )
             )
@@ -570,21 +570,18 @@ def _parse_spec_file(
         scenario_match = _SCENARIO_RE.match(line)
         if scenario_match and current_requirement is not None:
             scenario_name = scenario_match.group(1).strip()
-            scenario_identity = (
-                f"{current_requirement.properties['openspec_identity']}:scenario:{scenario_name}"
-            )
+            scenario_identity = f"{requirement_identity}:scenario:{scenario_name}"
             scenario_evidence_id = stable_id(
                 "evidence", "openspec", relative_path, scenario_identity
             )
             scenario_node = Node(
-                id=stable_id("node", NodeKind.OPENSPEC_SCENARIO, scenario_identity),
-                kind=NodeKind.OPENSPEC_SCENARIO,
+                id=openspec_scenario_id(current_requirement.id, scenario_name),
+                kind=NodeKind.SCENARIO,
                 name=scenario_name,
                 properties={
                     "capability": capability,
-                    "change_identity": change_identity or "",
-                    "openspec_identity": scenario_identity,
-                    "scope": scope,
+                    "requirement_id": current_requirement.id,
+                    "scenario_key": _normalize_identity_part(scenario_name),
                 },
                 evidence_ids=(scenario_evidence_id,),
             )
@@ -601,12 +598,11 @@ def _parse_spec_file(
             )
             edges.append(
                 _edge(
-                    EdgeKind.OPENSPEC_REQUIREMENT_CONTAINS_SCENARIO,
+                    EdgeKind.CONTAINS,
                     current_requirement.id,
                     scenario_node.id,
                     "requirement-scenario",
-                    current_requirement.id,
-                    scenario_name,
+                    "requirement-scenario",
                     evidence_ids=(scenario_evidence_id,),
                 )
             )
@@ -750,13 +746,14 @@ def _related_spec_edges(durable_specs: list[_ParsedSpec]) -> tuple[list[Edge], l
                 target = matches[0]
                 edges.append(
                     _edge(
-                        EdgeKind.OPENSPEC_RELATED_SPEC,
+                        EdgeKind.RELATED_TO,
                         spec.node.id,
                         target.node.id,
                         "related-spec",
                         spec.capability,
                         related_title,
                         confidence="non-confident",
+                        evidence_ids=spec.node.evidence_ids,
                         properties={"related_title": related_title},
                     )
                 )
@@ -798,6 +795,7 @@ def _evidence(
     openspec_identity: str,
     heading_name: str = "",
     line_start: int | None = None,
+    properties: dict[str, Any] | None = None,
 ) -> Evidence:
     return Evidence(
         id=evidence_id,
@@ -809,16 +807,17 @@ def _evidence(
             heading_name=heading_name,
             line_start=line_start,
         ),
+        properties=properties or {},
     )
 
 
 def _snapshot(nodes: list[Node], edges: list[Edge], evidence: list[Evidence]) -> GraphSnapshot:
-    return GraphSnapshot(
-        nodes=tuple({item.id: item for item in sorted(nodes, key=lambda item: item.id)}.values()),
-        edges=tuple({item.id: item for item in sorted(edges, key=lambda item: item.id)}.values()),
-        evidence=tuple(
-            {item.id: item for item in sorted(evidence, key=lambda item: item.id)}.values()
-        ),
+    return GraphSnapshot().merged_with(
+        GraphSnapshot(
+            nodes=tuple(sorted(nodes, key=lambda item: item.id)),
+            edges=tuple(sorted(edges, key=lambda item: item.id)),
+            evidence=tuple(sorted(evidence, key=lambda item: item.id)),
+        )
     )
 
 
@@ -846,3 +845,7 @@ def _frontmatter_value(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _frontmatter_value(nested) for key, nested in sorted(value.items())}
     return str(value)
+
+
+def _normalize_identity_part(value: object) -> str:
+    return " ".join(str(value).strip().lower().split())

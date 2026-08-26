@@ -9,6 +9,8 @@ pipeline stages or scripts.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,10 +23,18 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     OpenSpecLocator,
+    EdgeKind,
+    NodeKind,
+    openspec_requirement_id,
+    openspec_scenario_id,
+    openspec_specification_id,
+    stable_id,
 )
+from engineering_kg.validation import validate_graph_integrity
 
 
 GRAPH_FILE_NAME = "graph.json"
+MIGRATION_BACKUP_FILE_NAME = "graph.pre-canonical-migration.json"
 
 FORBIDDEN_PERSISTENCE_FIELDS = frozenset(
     {
@@ -70,6 +80,34 @@ class PersistenceIntegrityError(PersistenceError):
 
 
 @dataclass(frozen=True)
+class OntologyMigrationResult:
+    """Deterministic summary of one persisted ontology migration."""
+
+    snapshot: GraphSnapshot
+    migrated_node_count: int = 0
+    migrated_edge_count: int = 0
+    status: str | None = None
+    diagnostics: tuple[str, ...] = ()
+
+    @property
+    def migrated(self) -> bool:
+        return bool(self.migrated_node_count or self.migrated_edge_count)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "diagnostics": list(self.diagnostics),
+            "graph_counts": {
+                "edge_count": self.snapshot.edge_count,
+                "evidence_count": self.snapshot.evidence_count,
+                "node_count": self.snapshot.node_count,
+            },
+            "migrated_edge_count": self.migrated_edge_count,
+            "migrated_node_count": self.migrated_node_count,
+            "status": self.status or ("migrated" if self.migrated else "not-needed"),
+        }
+
+
+@dataclass(frozen=True)
 class LadybugDbStore:
     """Adapter-shaped local graph store for canonical Engineering KG snapshots."""
 
@@ -102,7 +140,7 @@ class LadybugDbStore:
     def write_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         try:
             _validate_snapshot(snapshot)
-            current = self._read_raw()
+            current = self._migrate_raw_if_needed(self._read_raw())
             merged = _merge_snapshot(current, snapshot)
             self._write_raw(merged)
             return self.read_snapshot()
@@ -113,11 +151,33 @@ class LadybugDbStore:
 
     def read_snapshot(self) -> GraphSnapshot:
         try:
-            return _snapshot_from_data(self._read_raw())
+            data = self._migrate_raw_if_needed(self._read_raw())
+            return _snapshot_from_data(data)
         except PersistenceError:
             raise
         except OSError as exc:
             raise PersistenceReadError(f"Cannot read graph snapshot: {exc}") from exc
+
+    def migrate_persisted_snapshot(self) -> OntologyMigrationResult:
+        """Migrate the local graph file, if needed, before downstream use."""
+
+        try:
+            data = self._read_raw()
+            snapshot = _snapshot_from_data(data)
+            result = migrate_graph_snapshot(snapshot)
+            if result.migrated:
+                _validate_snapshot(result.snapshot)
+                validation = validate_graph_integrity(result.snapshot)
+                if validation.status != "valid":
+                    raise PersistenceIntegrityError("Migrated graph snapshot failed integrity validation")
+                if self._graph_file.exists():
+                    shutil.copy2(self._graph_file, self.path / MIGRATION_BACKUP_FILE_NAME)
+                self._write_raw(_merge_snapshot(_empty_graph_data(), result.snapshot))
+            return result
+        except PersistenceError:
+            raise
+        except OSError as exc:
+            raise PersistenceWriteError(f"Cannot migrate persisted graph snapshot: {exc}") from exc
 
     def _read_raw(self) -> dict[str, Any]:
         if not self._graph_file.exists():
@@ -129,9 +189,17 @@ class LadybugDbStore:
         return data
 
     def _write_raw(self, data: dict[str, Any]) -> None:
-        with self._graph_file.open("w", encoding="utf-8") as handle:
+        temporary = self.path / f"{GRAPH_FILE_NAME}.tmp"
+        with temporary.open("w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2, sort_keys=True)
             handle.write("\n")
+        os.replace(temporary, self._graph_file)
+
+    def _migrate_raw_if_needed(self, data: dict[str, Any]) -> dict[str, Any]:
+        result = self.migrate_persisted_snapshot()
+        if not result.migrated:
+            return data
+        return _merge_snapshot(_empty_graph_data(), result.snapshot)
 
 
 def initialize_ladybugdb_store(path: str | Path) -> LadybugDbStore:
@@ -152,6 +220,203 @@ def read_graph_snapshot(path: str | Path) -> GraphSnapshot:
     return initialize_ladybugdb_store(path).read_snapshot()
 
 
+def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
+    """Convert retired OpenSpec domain records to the canonical ontology."""
+
+    node_ids: dict[str, str] = {}
+    nodes: list[Node] = []
+    migrated_nodes = 0
+    for node in snapshot.nodes:
+        kind = _value(node.kind)
+        if kind == "openspec-spec":
+            capability = _expect_string(node.properties.get("capability"), "legacy specification.capability")
+            repository_id = _expect_string(node.properties.get("repository_id"), "legacy specification.repository_id")
+            new_id = openspec_specification_id(repository_id, capability)
+            nodes.append(Node(new_id, NodeKind.SPECIFICATION, capability, {
+                "capability": capability, "repository_id": repository_id
+            }, node.evidence_ids))
+            node_ids[node.id] = new_id
+            migrated_nodes += 1
+        elif kind == "openspec-requirement":
+            capability = _expect_string(node.properties.get("capability"), "legacy requirement.capability")
+            repository_id = _repository_for_legacy_requirement(snapshot.nodes, node, capability)
+            specification_id = openspec_specification_id(repository_id, capability)
+            new_id = openspec_requirement_id(specification_id, node.name)
+            nodes.append(Node(new_id, NodeKind.REQUIREMENT, node.name, {
+                "capability": capability,
+                "requirement_key": _normalized(node.name),
+                "specification_id": specification_id,
+            }, node.evidence_ids))
+            node_ids[node.id] = new_id
+            migrated_nodes += 1
+        elif kind == "openspec-scenario":
+            requirement = _legacy_requirement_for_scenario(snapshot.edges, snapshot.nodes, node.id)
+            capability = _expect_string(requirement.properties.get("capability"), "legacy requirement.capability")
+            repository_id = _repository_for_legacy_requirement(snapshot.nodes, requirement, capability)
+            requirement_id = openspec_requirement_id(
+                openspec_specification_id(repository_id, capability), requirement.name
+            )
+            new_id = openspec_scenario_id(requirement_id, node.name)
+            nodes.append(Node(new_id, NodeKind.SCENARIO, node.name, {
+                "capability": capability,
+                "requirement_id": requirement_id,
+                "scenario_key": _normalized(node.name),
+            }, node.evidence_ids))
+            node_ids[node.id] = new_id
+            migrated_nodes += 1
+        else:
+            nodes.append(node)
+            node_ids[node.id] = node.id
+
+    edge_records: list[tuple[Edge, EdgeKind | str, str, str, dict[str, Any]]] = []
+    migrated_edges = 0
+    legacy_kinds = {
+        "openspec-spec-contains-requirement": EdgeKind.CONTAINS,
+        "openspec-requirement-contains-scenario": EdgeKind.CONTAINS,
+        "openspec-change-touches-spec": EdgeKind.ASSERTS,
+        "openspec-change-traces-to-spec": EdgeKind.TRACES_TO,
+        "openspec-related-spec": EdgeKind.RELATED_TO,
+    }
+    for edge in snapshot.edges:
+        new_kind = legacy_kinds.get(_value(edge.kind))
+        source_id = node_ids[edge.source_id]
+        target_id = node_ids[edge.target_id]
+        properties = dict(edge.properties)
+        if new_kind is None:
+            edge_records.append((edge, edge.kind, source_id, target_id, properties))
+            continue
+        if new_kind == EdgeKind.TRACES_TO:
+            properties.pop("source_scope", None)
+            properties.pop("target_scope", None)
+            properties.pop("via_spec_id", None)
+        edge_records.append((edge, new_kind, source_id, target_id, properties))
+        migrated_edges += 1
+
+    # Resolve asserted edge IDs before rebuilding derived traceability references.
+    nodes_by_id = {node.id: node for node in nodes}
+    edge_ids = {
+        edge.id: _migrated_edge_id(edge, kind, source_id, target_id, properties, nodes_by_id)
+        for edge, kind, source_id, target_id, properties in edge_records
+        if "input_edge_ids" not in properties
+    }
+    edges: list[Edge] = []
+    for edge, kind, source_id, target_id, properties in edge_records:
+        input_edge_ids = properties.get("input_edge_ids")
+        if isinstance(input_edge_ids, (list, tuple)):
+            properties["input_edge_ids"] = tuple(
+                edge_ids.get(input_edge_id, input_edge_id) for input_edge_id in input_edge_ids
+            )
+        edges.append(
+            Edge(
+                _migrated_edge_id(
+                    edge, kind, source_id, target_id, properties, nodes_by_id
+                ),
+                kind,
+                source_id,
+                target_id,
+                properties,
+                edge.evidence_ids,
+                edge.confidence,
+            )
+        )
+    try:
+        migrated = GraphSnapshot(nodes=tuple(nodes), edges=tuple(edges), evidence=snapshot.evidence)
+        migrated = GraphSnapshot().merged_with(migrated)
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    return OntologyMigrationResult(migrated, migrated_nodes, migrated_edges)
+
+
+def _repository_for_legacy_requirement(
+    nodes: tuple[Node, ...], requirement: Node, capability: str
+) -> str:
+    for node in nodes:
+        if _value(node.kind) != "openspec-spec":
+            continue
+        if node.properties.get("capability") == capability:
+            repository_id = node.properties.get("repository_id")
+            if isinstance(repository_id, str) and repository_id:
+                return repository_id
+    raise PersistenceIntegrityError(
+        f"Cannot migrate legacy requirement without a specification repository: {requirement.id}"
+    )
+
+
+def _legacy_requirement_for_scenario(
+    edges: tuple[Edge, ...], nodes: tuple[Node, ...], scenario_id: str
+) -> Node:
+    nodes_by_id = {node.id: node for node in nodes}
+    for edge in edges:
+        if edge.target_id == scenario_id and _value(edge.kind) == "openspec-requirement-contains-scenario":
+            requirement = nodes_by_id.get(edge.source_id)
+            if requirement is not None and _value(requirement.kind) == "openspec-requirement":
+                return requirement
+    raise PersistenceIntegrityError(
+        f"Cannot migrate legacy scenario without its containing requirement: {scenario_id}"
+    )
+
+
+def _normalized(value: object) -> str:
+    return " ".join(str(value).strip().lower().split())
+
+
+def _migrated_edge_id(
+    edge: Edge,
+    kind: EdgeKind | str,
+    source_id: str,
+    target_id: str,
+    properties: dict[str, Any],
+    nodes_by_id: dict[str, Node],
+) -> str:
+    if _value(edge.kind) == _value(kind):
+        return edge.id
+    if _value(edge.kind) == "openspec-spec-contains-requirement":
+        return stable_id(
+            "edge", kind, source_id, target_id, "spec-requirement", "specification-requirement"
+        )
+    if _value(edge.kind) == "openspec-requirement-contains-scenario":
+        return stable_id(
+            "edge", kind, source_id, target_id, "requirement-scenario", "requirement-scenario"
+        )
+    if _value(edge.kind) == "openspec-change-touches-spec":
+        change = nodes_by_id[source_id]
+        specification = nodes_by_id[target_id]
+        return stable_id(
+            "edge",
+            kind,
+            source_id,
+            target_id,
+            "openspec-change-specification",
+            change.properties.get("change_identity", change.name),
+            specification.properties["capability"],
+        )
+    if _value(edge.kind) == "openspec-change-traces-to-spec":
+        return stable_id(
+            "edge",
+            kind,
+            properties["rule_id"],
+            source_id,
+            target_id,
+            *properties.get("input_edge_ids", ()),
+        )
+    if _value(edge.kind) == "openspec-related-spec":
+        source = nodes_by_id[source_id]
+        return stable_id(
+            "edge",
+            kind,
+            source_id,
+            target_id,
+            "related-spec",
+            source.properties["capability"],
+            properties["related_title"],
+        )
+    return stable_id("edge", kind, source_id, target_id, *sorted(properties.items()))
+
+
+def _value(value: object) -> object:
+    return getattr(value, "value", value)
+
+
 def _empty_graph_data() -> dict[str, dict[str, Any]]:
     return {
         "edge_order": [],
@@ -164,29 +429,28 @@ def _empty_graph_data() -> dict[str, dict[str, Any]]:
 
 
 def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, Any]:
+    try:
+        merged_snapshot = _snapshot_from_data(data).merged_with(snapshot)
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
     merged = {
-        "edge_order": list(_expect_string_tuple(data.get("edge_order", []), "edge_order")),
-        "edges": dict(_expect_mapping(data.get("edges", {}), "edges")),
-        "evidence": dict(_expect_mapping(data.get("evidence", {}), "evidence")),
-        "evidence_order": list(
-            _expect_string_tuple(data.get("evidence_order", []), "evidence_order")
-        ),
-        "node_order": list(_expect_string_tuple(data.get("node_order", []), "node_order")),
-        "nodes": dict(_expect_mapping(data.get("nodes", {}), "nodes")),
+        "edge_order": [],
+        "edges": {},
+        "evidence": {},
+        "evidence_order": [],
+        "node_order": [],
+        "nodes": {},
     }
 
-    for node in snapshot.nodes:
+    for node in merged_snapshot.nodes:
         merged["nodes"][node.id] = node.as_dict()
-        if node.id not in merged["node_order"]:
-            merged["node_order"].append(node.id)
-    for edge in snapshot.edges:
+        merged["node_order"].append(node.id)
+    for edge in merged_snapshot.edges:
         merged["edges"][edge.id] = edge.as_dict()
-        if edge.id not in merged["edge_order"]:
-            merged["edge_order"].append(edge.id)
-    for evidence in snapshot.evidence:
+        merged["edge_order"].append(edge.id)
+    for evidence in merged_snapshot.evidence:
         merged["evidence"][evidence.id] = evidence.as_dict()
-        if evidence.id not in merged["evidence_order"]:
-            merged["evidence_order"].append(evidence.id)
+        merged["evidence_order"].append(evidence.id)
 
     return merged
 
