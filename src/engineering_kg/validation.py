@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from engineering_kg.ontology import (
+    CROSS_GRAPH_LINK_LIFECYCLE_STATES,
+    CodeLocator,
+    CrossGraphLinkClaim,
+    CrossGraphLinkEvidence,
+    CrossGraphLinkLifecycle,
     Edge,
     EdgeKind,
     GraphSnapshot,
@@ -100,6 +105,9 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_duplicate_conflict_diagnostics("node", snapshot.nodes))
     diagnostics.extend(_duplicate_conflict_diagnostics("edge", snapshot.edges))
     diagnostics.extend(_duplicate_conflict_diagnostics("evidence", snapshot.evidence))
+    diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-claim", snapshot.cross_graph_link_claims))
+    diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-evidence", snapshot.cross_graph_link_evidence))
+    diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-lifecycle", snapshot.cross_graph_link_lifecycle))
 
     nodes_by_id = {node.id: node for node in snapshot.nodes}
     evidence_by_id = {item.id: item for item in snapshot.evidence}
@@ -109,6 +117,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_canonical_identity_diagnostics(snapshot.nodes))
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
+    diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
 
     sorted_diagnostics = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     severity_counts = Counter(item.severity for item in sorted_diagnostics)
@@ -121,6 +130,9 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
         graph_counts={
             "edge_count": snapshot.edge_count,
             "evidence_count": snapshot.evidence_count,
+            "cross_graph_link_claim_count": snapshot.cross_graph_link_claim_count,
+            "cross_graph_link_evidence_count": snapshot.cross_graph_link_evidence_count,
+            "cross_graph_link_lifecycle_count": snapshot.cross_graph_link_lifecycle_count,
             "node_count": snapshot.node_count,
         },
     )
@@ -182,6 +194,9 @@ def _duplicate_counts(snapshot: GraphSnapshot) -> dict[str, int]:
         "edge": _duplicate_id_count(snapshot.edges),
         "evidence": _duplicate_id_count(snapshot.evidence),
         "node": _duplicate_id_count(snapshot.nodes),
+        "cross_graph_link_claim": _duplicate_id_count(snapshot.cross_graph_link_claims),
+        "cross_graph_link_evidence": _duplicate_id_count(snapshot.cross_graph_link_evidence),
+        "cross_graph_link_lifecycle": _duplicate_id_count(snapshot.cross_graph_link_lifecycle),
     }
 
 
@@ -222,6 +237,55 @@ def _duplicate_conflict_diagnostics(
                 )
             )
     return diagnostics
+
+
+def _cross_graph_link_diagnostics(
+    snapshot: GraphSnapshot, nodes_by_id: dict[str, Node], evidence_by_id: dict[str, object]
+) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    claims_by_id = {item.id: item for item in snapshot.cross_graph_link_claims}
+    for claim in snapshot.cross_graph_link_claims:
+        if claim.subject_id not in nodes_by_id:
+            diagnostics.append(_cross_error("cross-graph-subject-exists", claim.id, "Cross-graph claim subject_id does not reference an existing node."))
+        if not _complete_code_locator(claim.target):
+            diagnostics.append(_cross_error("cross-graph-target-complete", claim.id, "Cross-graph claim target must be a complete CodeLocator."))
+    for observation in snapshot.cross_graph_link_evidence:
+        if observation.claim_id not in claims_by_id:
+            diagnostics.append(_cross_error("cross-graph-claim-exists", observation.id, "Cross-graph evidence references an absent claim."))
+        if observation.provenance_evidence_id not in evidence_by_id:
+            diagnostics.append(_cross_error("cross-graph-provenance-exists", observation.id, "Cross-graph evidence references absent provenance evidence."))
+    revisions: dict[tuple[str, int], CrossGraphLinkLifecycle] = {}
+    lifecycle_claims: set[str] = set()
+    for entry in snapshot.cross_graph_link_lifecycle:
+        lifecycle_claims.add(entry.claim_id)
+        if entry.claim_id not in claims_by_id:
+            diagnostics.append(_cross_error("cross-graph-claim-exists", entry.id, "Cross-graph lifecycle references an absent claim."))
+        if entry.provenance_evidence_id not in evidence_by_id:
+            diagnostics.append(_cross_error("cross-graph-provenance-exists", entry.id, "Cross-graph lifecycle references absent provenance evidence."))
+        if not isinstance(entry.revision, int) or isinstance(entry.revision, bool) or entry.revision <= 0:
+            diagnostics.append(_cross_error("cross-graph-lifecycle-revision", entry.id, "Cross-graph lifecycle revision must be a positive integer."))
+        if _value(entry.state) not in CROSS_GRAPH_LINK_LIFECYCLE_STATES:
+            diagnostics.append(_cross_error("cross-graph-lifecycle-state", entry.id, "Cross-graph lifecycle state is unsupported."))
+        key = (entry.claim_id, entry.revision)
+        previous = revisions.get(key)
+        if previous is not None and previous.as_dict() != entry.as_dict():
+            diagnostics.append(_cross_error("cross-graph-lifecycle-revision-conflict", entry.id, "Cross-graph lifecycle revision has conflicting values."))
+        revisions[key] = entry
+    for claim in snapshot.cross_graph_link_claims:
+        if claim.id not in lifecycle_claims:
+            diagnostics.append(_cross_error("cross-graph-lifecycle-current", claim.id, "Cross-graph claim has no determinable current lifecycle revision."))
+    return diagnostics
+
+
+def _complete_code_locator(value: object) -> bool:
+    return isinstance(value, CodeLocator) and all(
+        isinstance(getattr(value, field), str) and getattr(value, field).strip()
+        for field in ("repository", "revision", "file", "symbol")
+    )
+
+
+def _cross_error(rule_id: str, object_id: str, message: str) -> GraphValidationDiagnostic:
+    return GraphValidationDiagnostic("error", rule_id, object_id, message)
 
 
 def _traceability_shape_diagnostics(

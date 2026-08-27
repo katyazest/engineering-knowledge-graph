@@ -3,6 +3,10 @@
 from engineering_kg.ontology import (
     CodeLocator,
     ConfluencePageRef,
+    CrossGraphLinkClaim,
+    CrossGraphLinkEvidence,
+    CrossGraphLinkLifecycle,
+    CrossGraphLinkLifecycleState,
     Edge,
     EdgeKind,
     Evidence,
@@ -41,6 +45,10 @@ from engineering_kg.query import (
 __all__ = [
     "CodeLocator",
     "ConfluencePageRef",
+    "CrossGraphLinkClaim",
+    "CrossGraphLinkEvidence",
+    "CrossGraphLinkLifecycle",
+    "CrossGraphLinkLifecycleState",
     "Edge",
     "EdgeKind",
     "EngineeringKgQuery",
