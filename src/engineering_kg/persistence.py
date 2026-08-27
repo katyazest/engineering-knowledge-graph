@@ -18,6 +18,9 @@ from typing import Any
 from engineering_kg.ontology import (
     CodeLocator,
     ConfluencePageRef,
+    CrossGraphLinkClaim,
+    CrossGraphLinkEvidence,
+    CrossGraphLinkLifecycle,
     Edge,
     Evidence,
     GraphSnapshot,
@@ -139,9 +142,9 @@ class LadybugDbStore:
 
     def write_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         try:
-            _validate_snapshot(snapshot)
             current = self._migrate_raw_if_needed(self._read_raw())
             merged = _merge_snapshot(current, snapshot)
+            _snapshot_from_data(merged)
             self._write_raw(merged)
             return self.read_snapshot()
         except PersistenceError:
@@ -320,7 +323,12 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
             )
         )
     try:
-        migrated = GraphSnapshot(nodes=tuple(nodes), edges=tuple(edges), evidence=snapshot.evidence)
+        migrated = GraphSnapshot(
+            nodes=tuple(nodes), edges=tuple(edges), evidence=snapshot.evidence,
+            cross_graph_link_claims=snapshot.cross_graph_link_claims,
+            cross_graph_link_evidence=snapshot.cross_graph_link_evidence,
+            cross_graph_link_lifecycle=snapshot.cross_graph_link_lifecycle,
+        )
         migrated = GraphSnapshot().merged_with(migrated)
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -423,6 +431,12 @@ def _empty_graph_data() -> dict[str, dict[str, Any]]:
         "edges": {},
         "evidence": {},
         "evidence_order": [],
+        "cross_graph_link_claims": {},
+        "cross_graph_link_claim_order": [],
+        "cross_graph_link_evidence": {},
+        "cross_graph_link_evidence_order": [],
+        "cross_graph_link_lifecycle": {},
+        "cross_graph_link_lifecycle_order": [],
         "node_order": [],
         "nodes": {},
     }
@@ -438,6 +452,12 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
         "edges": {},
         "evidence": {},
         "evidence_order": [],
+        "cross_graph_link_claims": {},
+        "cross_graph_link_claim_order": [],
+        "cross_graph_link_evidence": {},
+        "cross_graph_link_evidence_order": [],
+        "cross_graph_link_lifecycle": {},
+        "cross_graph_link_lifecycle_order": [],
         "node_order": [],
         "nodes": {},
     }
@@ -451,6 +471,15 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
     for evidence in merged_snapshot.evidence:
         merged["evidence"][evidence.id] = evidence.as_dict()
         merged["evidence_order"].append(evidence.id)
+    for claim in merged_snapshot.cross_graph_link_claims:
+        merged["cross_graph_link_claims"][claim.id] = claim.as_dict()
+        merged["cross_graph_link_claim_order"].append(claim.id)
+    for observation in merged_snapshot.cross_graph_link_evidence:
+        merged["cross_graph_link_evidence"][observation.id] = observation.as_dict()
+        merged["cross_graph_link_evidence_order"].append(observation.id)
+    for lifecycle in merged_snapshot.cross_graph_link_lifecycle:
+        merged["cross_graph_link_lifecycle"][lifecycle.id] = lifecycle.as_dict()
+        merged["cross_graph_link_lifecycle_order"].append(lifecycle.id)
 
     return merged
 
@@ -477,7 +506,28 @@ def _snapshot_from_data(data: dict[str, Any]) -> GraphSnapshot:
             _expect_string_tuple(data.get("evidence_order", []), "evidence_order"),
         )
     )
-    snapshot = GraphSnapshot(nodes=nodes, edges=edges, evidence=evidence)
+    claims = tuple(
+        _cross_graph_link_claim_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("cross_graph_link_claims", {}), "cross_graph_link_claims"),
+            _expect_string_tuple(data.get("cross_graph_link_claim_order", []), "cross_graph_link_claim_order"),
+        )
+    )
+    observations = tuple(
+        _cross_graph_link_evidence_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("cross_graph_link_evidence", {}), "cross_graph_link_evidence"),
+            _expect_string_tuple(data.get("cross_graph_link_evidence_order", []), "cross_graph_link_evidence_order"),
+        )
+    )
+    lifecycle = tuple(
+        _cross_graph_link_lifecycle_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("cross_graph_link_lifecycle", {}), "cross_graph_link_lifecycle"),
+            _expect_string_tuple(data.get("cross_graph_link_lifecycle_order", []), "cross_graph_link_lifecycle_order"),
+        )
+    )
+    snapshot = GraphSnapshot(nodes, edges, evidence, claims, observations, lifecycle)
     _validate_snapshot(snapshot)
     return snapshot
 
@@ -530,6 +580,56 @@ def _evidence_from_dict(data: dict[str, Any]) -> Evidence:
     )
 
 
+def _cross_graph_link_claim_from_dict(data: dict[str, Any]) -> CrossGraphLinkClaim:
+    target = _locator_from_value(data.get("target"))
+    if not isinstance(target, CodeLocator):
+        raise PersistenceIntegrityError("cross_graph_link_claim.target must be a CodeLocator")
+    try:
+        record = CrossGraphLinkClaim(
+            _expect_string(data.get("subject_id"), "cross_graph_link_claim.subject_id"),
+            _expect_string(data.get("relation_kind"), "cross_graph_link_claim.relation_kind"), target,
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "cross_graph_link_claim")
+    return record
+
+
+def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLinkEvidence:
+    try:
+        record = CrossGraphLinkEvidence(
+            _expect_string(data.get("claim_id"), "cross_graph_link_evidence.claim_id"),
+            _expect_string(data.get("strategy_id"), "cross_graph_link_evidence.strategy_id"),
+            _expect_string(data.get("observation_id"), "cross_graph_link_evidence.observation_id"),
+            _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_evidence.provenance_evidence_id"),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "cross_graph_link_evidence")
+    return record
+
+
+def _cross_graph_link_lifecycle_from_dict(data: dict[str, Any]) -> CrossGraphLinkLifecycle:
+    revision = data.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int):
+        raise PersistenceIntegrityError("cross_graph_link_lifecycle.revision must be an integer")
+    try:
+        record = CrossGraphLinkLifecycle(
+            _expect_string(data.get("claim_id"), "cross_graph_link_lifecycle.claim_id"), revision,
+            _expect_string(data.get("state"), "cross_graph_link_lifecycle.state"),
+            _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_lifecycle.provenance_evidence_id"),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "cross_graph_link_lifecycle")
+    return record
+
+
+def _expect_record_id(data: dict[str, Any], expected: str, context: str) -> None:
+    if data.get("id") != expected:
+        raise PersistenceIntegrityError(f"{context}.id does not match its stable identity")
+
+
 def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef | OpenSpecLocator:
     if isinstance(value, str):
         return value
@@ -563,6 +663,13 @@ def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef | O
 
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
     _reject_forbidden_fields(snapshot.as_dict())
+    validation = validate_graph_integrity(snapshot)
+    cross_graph_errors = [
+        item for item in validation.metadata.diagnostics
+        if item.rule_id.startswith("cross-graph-") and item.severity == "error"
+    ]
+    if cross_graph_errors:
+        raise PersistenceIntegrityError(cross_graph_errors[0].message)
 
 
 def _reject_forbidden_fields(value: Any, path: str = "graph") -> None:

@@ -111,6 +111,152 @@ class CodeLocator:
         }
 
 
+class CrossGraphLinkLifecycleState(StrEnum):
+    CANDIDATE = "candidate"
+    TRUSTED = "trusted"
+    REJECTED = "rejected"
+    SUPERSEDED = "superseded"
+
+
+CROSS_GRAPH_LINK_LIFECYCLE_STATES = frozenset(
+    state.value for state in CrossGraphLinkLifecycleState
+)
+
+
+def _required_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _validate_code_locator(locator: CodeLocator) -> None:
+    if not isinstance(locator, CodeLocator):
+        raise ValueError("target must be a CodeLocator")
+    for field_name in ("repository", "revision", "file", "symbol"):
+        _required_text(getattr(locator, field_name), f"target.{field_name}")
+
+
+def cross_graph_link_claim_id(subject_id: str, relation_kind: str, target: CodeLocator) -> str:
+    """Return the stable identity of a proposed EKG-to-code relationship."""
+
+    _required_text(subject_id, "subject_id")
+    _required_text(relation_kind, "relation_kind")
+    _validate_code_locator(target)
+    # CodeLocator fields are exact code-side identity values.  Unlike generic
+    # graph identity parts, they must not be case-folded or whitespace-normalized.
+    identity = json.dumps(
+        [
+            _normalize_identity_part("cross-graph-link"),
+            _normalize_identity_part(subject_id),
+            _normalize_identity_part(relation_kind),
+            target.repository,
+            target.revision,
+            target.file,
+            target.symbol,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return f"cross-graph-link:{digest}"
+
+
+def cross_graph_link_evidence_id(
+    claim_id: str, strategy_id: str, observation_id: str, provenance_evidence_id: str
+) -> str:
+    """Return the stable identity of one attributable link observation."""
+
+    return stable_id(
+        "cross-graph-link-evidence",
+        _required_text(claim_id, "claim_id"),
+        _required_text(strategy_id, "strategy_id"),
+        _required_text(observation_id, "observation_id"),
+        _required_text(provenance_evidence_id, "provenance_evidence_id"),
+    )
+
+
+def cross_graph_link_lifecycle_id(claim_id: str, revision: int) -> str:
+    """Return the stable identity of an append-only lifecycle revision."""
+
+    _required_text(claim_id, "claim_id")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise ValueError("revision must be a positive integer")
+    return stable_id("cross-graph-link-lifecycle", claim_id, revision)
+
+
+@dataclass(frozen=True)
+class CrossGraphLinkClaim:
+    subject_id: str
+    relation_kind: str
+    target: CodeLocator
+
+    def __post_init__(self) -> None:
+        cross_graph_link_claim_id(self.subject_id, self.relation_kind, self.target)
+
+    @property
+    def id(self) -> str:
+        return cross_graph_link_claim_id(self.subject_id, self.relation_kind, self.target)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "relation_kind": self.relation_kind, "subject_id": self.subject_id, "target": self.target.as_dict()}
+
+
+@dataclass(frozen=True)
+class CrossGraphLinkEvidence:
+    claim_id: str
+    strategy_id: str
+    observation_id: str
+    provenance_evidence_id: str
+
+    def __post_init__(self) -> None:
+        cross_graph_link_evidence_id(self.claim_id, self.strategy_id, self.observation_id, self.provenance_evidence_id)
+
+    @property
+    def id(self) -> str:
+        return cross_graph_link_evidence_id(self.claim_id, self.strategy_id, self.observation_id, self.provenance_evidence_id)
+
+    def as_dict(self) -> dict[str, str]:
+        return {"claim_id": self.claim_id, "id": self.id, "observation_id": self.observation_id, "provenance_evidence_id": self.provenance_evidence_id, "strategy_id": self.strategy_id}
+
+
+@dataclass(frozen=True)
+class CrossGraphLinkLifecycle:
+    claim_id: str
+    revision: int
+    state: CrossGraphLinkLifecycleState | str
+    provenance_evidence_id: str
+
+    def __post_init__(self) -> None:
+        cross_graph_link_lifecycle_id(self.claim_id, self.revision)
+        if _lifecycle_state_value(self.state) not in CROSS_GRAPH_LINK_LIFECYCLE_STATES:
+            raise ValueError(f"Unsupported cross-graph lifecycle state: {self.state}")
+        _required_text(self.provenance_evidence_id, "provenance_evidence_id")
+
+    @property
+    def id(self) -> str:
+        return cross_graph_link_lifecycle_id(self.claim_id, self.revision)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"claim_id": self.claim_id, "id": self.id, "provenance_evidence_id": self.provenance_evidence_id, "revision": self.revision, "state": _lifecycle_state_value(self.state)}
+
+
+@dataclass(frozen=True)
+class TrustedCrossGraphLink:
+    claim_id: str
+    subject_id: str
+    relation_kind: str
+    target: CodeLocator
+    supporting_evidence_ids: tuple[str, ...]
+    supporting_provenance_evidence_ids: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"claim_id": self.claim_id, "relation_kind": self.relation_kind, "subject_id": self.subject_id, "supporting_evidence_ids": list(self.supporting_evidence_ids), "supporting_provenance_evidence_ids": list(self.supporting_provenance_evidence_ids), "target": self.target.as_dict()}
+
+
+def _lifecycle_state_value(state: CrossGraphLinkLifecycleState | str) -> str:
+    return state.value if isinstance(state, CrossGraphLinkLifecycleState) else state
+
+
 @dataclass(frozen=True)
 class ConfluencePageRef:
     page_id: str
@@ -208,6 +354,14 @@ class GraphSnapshot:
     nodes: tuple[Node, ...] = ()
     edges: tuple[Edge, ...] = ()
     evidence: tuple[Evidence, ...] = ()
+    cross_graph_link_claims: tuple[CrossGraphLinkClaim, ...] = ()
+    cross_graph_link_evidence: tuple[CrossGraphLinkEvidence, ...] = ()
+    cross_graph_link_lifecycle: tuple[CrossGraphLinkLifecycle, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cross_graph_link_claims", tuple(sorted(self.cross_graph_link_claims, key=lambda item: item.id)))
+        object.__setattr__(self, "cross_graph_link_evidence", tuple(sorted(self.cross_graph_link_evidence, key=lambda item: item.id)))
+        object.__setattr__(self, "cross_graph_link_lifecycle", tuple(sorted(self.cross_graph_link_lifecycle, key=lambda item: (item.claim_id, item.revision))))
 
     @property
     def node_count(self) -> int:
@@ -221,12 +375,53 @@ class GraphSnapshot:
     def evidence_count(self) -> int:
         return len(self.evidence)
 
+    @property
+    def cross_graph_link_claim_count(self) -> int:
+        return len(self.cross_graph_link_claims)
+
+    @property
+    def cross_graph_link_evidence_count(self) -> int:
+        return len(self.cross_graph_link_evidence)
+
+    @property
+    def cross_graph_link_lifecycle_count(self) -> int:
+        return len(self.cross_graph_link_lifecycle)
+
+    @property
+    def trusted_cross_graph_links(self) -> tuple[TrustedCrossGraphLink, ...]:
+        lifecycles: dict[str, CrossGraphLinkLifecycle] = {}
+        invalid_claims: set[str] = set()
+        for entry in self.cross_graph_link_lifecycle:
+            previous = lifecycles.get(entry.claim_id)
+            if previous and previous.revision == entry.revision and previous.as_dict() != entry.as_dict():
+                invalid_claims.add(entry.claim_id)
+            elif previous is None or entry.revision > previous.revision:
+                lifecycles[entry.claim_id] = entry
+        evidence_by_claim: dict[str, list[CrossGraphLinkEvidence]] = {}
+        for observation in self.cross_graph_link_evidence:
+            evidence_by_claim.setdefault(observation.claim_id, []).append(observation)
+        return tuple(
+            TrustedCrossGraphLink(claim.id, claim.subject_id, claim.relation_kind, claim.target,
+                tuple(item.id for item in evidence_by_claim.get(claim.id, ())),
+                tuple(sorted({item.provenance_evidence_id for item in evidence_by_claim.get(claim.id, ())})))
+            for claim in self.cross_graph_link_claims
+            if claim.id not in invalid_claims
+            and lifecycles.get(claim.id) is not None
+            and _lifecycle_state_value(lifecycles[claim.id].state) == CrossGraphLinkLifecycleState.TRUSTED.value
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "edge_count": self.edge_count,
             "edges": [_serialize_value(edge) for edge in self.edges],
             "evidence": [_serialize_value(item) for item in self.evidence],
             "evidence_count": self.evidence_count,
+            "cross_graph_link_claim_count": self.cross_graph_link_claim_count,
+            "cross_graph_link_claims": [_serialize_value(item) for item in self.cross_graph_link_claims],
+            "cross_graph_link_evidence_count": self.cross_graph_link_evidence_count,
+            "cross_graph_link_evidence": [_serialize_value(item) for item in self.cross_graph_link_evidence],
+            "cross_graph_link_lifecycle_count": self.cross_graph_link_lifecycle_count,
+            "cross_graph_link_lifecycle": [_serialize_value(item) for item in self.cross_graph_link_lifecycle],
             "node_count": self.node_count,
             "nodes": [_serialize_value(node) for node in self.nodes],
         }
@@ -238,7 +433,55 @@ class GraphSnapshot:
         nodes = _merge_records(self.nodes, other.nodes)
         edges = _merge_records(self.edges, other.edges)
         evidence = _merge_records(self.evidence, other.evidence)
-        return GraphSnapshot(nodes=nodes, edges=edges, evidence=evidence)
+        claims = _merge_records(self.cross_graph_link_claims, other.cross_graph_link_claims)
+        observations = _merge_records(self.cross_graph_link_evidence, other.cross_graph_link_evidence)
+        lifecycle = _merge_records(self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle)
+        _validate_cross_graph_claim_references(
+            nodes, evidence, claims, observations, lifecycle
+        )
+        return GraphSnapshot(nodes, edges, evidence, claims, observations, lifecycle)
+
+
+def _validate_cross_graph_claim_references(
+    nodes: tuple[Node, ...],
+    evidence: tuple[Evidence, ...],
+    claims: tuple[CrossGraphLinkClaim, ...],
+    observations: tuple[CrossGraphLinkEvidence, ...],
+    lifecycle: tuple[CrossGraphLinkLifecycle, ...],
+) -> None:
+    """Reject merged cross-graph records with dangling claim or provenance references."""
+
+    node_ids = {node.id for node in nodes}
+    claim_ids = {claim.id for claim in claims}
+    evidence_ids = {item.id for item in evidence}
+    for claim in sorted(claims, key=lambda item: item.id):
+        if claim.subject_id not in node_ids:
+            raise ValueError(
+                "Cross-graph claim subject_id does not reference an existing node: "
+                f"{claim.subject_id}"
+            )
+    for observation in sorted(observations, key=lambda item: item.id):
+        if observation.claim_id not in claim_ids:
+            raise ValueError(
+                "Cross-graph evidence references an absent claim: "
+                f"{observation.claim_id}"
+            )
+        if observation.provenance_evidence_id not in evidence_ids:
+            raise ValueError(
+                "Cross-graph evidence references absent provenance evidence: "
+                f"{observation.provenance_evidence_id}"
+            )
+    for entry in sorted(lifecycle, key=lambda item: item.id):
+        if entry.claim_id not in claim_ids:
+            raise ValueError(
+                "Cross-graph lifecycle references an absent claim: "
+                f"{entry.claim_id}"
+            )
+        if entry.provenance_evidence_id not in evidence_ids:
+            raise ValueError(
+                "Cross-graph lifecycle references absent provenance evidence: "
+                f"{entry.provenance_evidence_id}"
+            )
 
 
 def _merge_records(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:
