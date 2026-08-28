@@ -14,6 +14,11 @@ from engineering_kg.ingest.openspec import (
     extract_openspec_graph,
     validate_openspec_store_source,
 )
+from engineering_kg.ingest.pr_code_candidates import (
+    MergedPrChangeSet,
+    PrCodeCandidateExtractionResult,
+    extract_pr_code_candidates,
+)
 from engineering_kg.ontology import GraphSnapshot
 from engineering_kg.openlore import OpenLoreSourceValidationResult, validate_workspace_openlore_source
 from engineering_kg.persistence import (
@@ -43,6 +48,7 @@ class PipelineResult:
     graph_derivation: GraphDerivationResult | None = None
     graph_integrity_validation: GraphValidationResult | None = None
     ontology_migration: OntologyMigrationResult | None = None
+    pr_code_candidate_extraction: PrCodeCandidateExtractionResult | None = None
 
     @property
     def configured_stage_count(self) -> int:
@@ -89,6 +95,10 @@ class PipelineResult:
             data.pop("ontology_migration")
         else:
             data["ontology_migration"] = self.ontology_migration.as_dict()
+        if self.pr_code_candidate_extraction is None:
+            data.pop("pr_code_candidate_extraction")
+        else:
+            data["pr_code_candidate_extraction"] = {"metadata": self.pr_code_candidate_extraction.metadata.as_dict()}
         return data
 
 
@@ -97,6 +107,8 @@ def run_pipeline(
     persistence_path: str | Path | None = None,
     openspec_stores: tuple[RegisteredOpenSpecStore, ...] | None = None,
     openspec_store_id: str | None = None,
+    pr_change_sets: tuple[MergedPrChangeSet, ...] | None = None,
+    engineering_change_subject_graph: GraphSnapshot | None = None,
 ) -> PipelineResult:
     """Start the MVP pipeline, optionally persisting a graph snapshot."""
 
@@ -113,6 +125,10 @@ def run_pipeline(
         graph_derivation = None
         graph_integrity_validation = None
         ontology_migration = None
+        pr_code_candidate_extraction = None
+        _validate_candidate_stage_order(
+            configured_stages, pr_change_sets
+        )
         if "workspace-registry" in configured_stages:
             executed_stages.append("workspace-registry")
             graph = registry.to_graph_snapshot()
@@ -135,6 +151,18 @@ def run_pipeline(
         if "workspace-openlore-source" in configured_stages:
             openlore_source = validate_workspace_openlore_source(registry)
             executed_stages.append("workspace-openlore-source")
+        if "engineering-change-subject-input" in configured_stages:
+            if engineering_change_subject_graph is None:
+                raise ValueError(
+                    "engineering-change-subject-input requires engineering_change_subject_graph input"
+                )
+            graph = graph.merged_with(engineering_change_subject_graph)
+            executed_stages.append("engineering-change-subject-input")
+        if "pr-code-candidate-extraction" in configured_stages:
+            _validate_candidate_subject_availability(pr_change_sets or (), graph)
+            pr_code_candidate_extraction = extract_pr_code_candidates(pr_change_sets or (), graph)
+            graph = graph.merged_with(pr_code_candidate_extraction.graph)
+            executed_stages.append("pr-code-candidate-extraction")
         if persistence_path is not None and "ladybugdb-persistence" in configured_stages:
             store = initialize_ladybugdb_store(persistence_path)
             executed_stages.append("ontology-migration")
@@ -149,6 +177,7 @@ def run_pipeline(
                     openlore_source=openlore_source,
                     openspec_store_source=openspec_store_source,
                     openspec_graph_extraction=openspec_graph_extraction,
+                    pr_code_candidate_extraction=pr_code_candidate_extraction,
                     ontology_migration=OntologyMigrationResult(
                         graph,
                         status="failed",
@@ -182,6 +211,7 @@ def run_pipeline(
             graph_derivation=graph_derivation,
             graph_integrity_validation=graph_integrity_validation,
             ontology_migration=ontology_migration,
+            pr_code_candidate_extraction=pr_code_candidate_extraction,
         )
 
     if persistence_path is not None:
@@ -223,3 +253,52 @@ def _configured_stages(
     if persistence_path is not None and "ontology-migration" not in stages:
         stages.insert(stages.index("ladybugdb-persistence"), "ontology-migration")
     return tuple(stages)
+
+
+def _validate_candidate_stage_order(
+    stages: tuple[str, ...],
+    change_sets: tuple[MergedPrChangeSet, ...] | None,
+) -> None:
+    if "pr-code-candidate-extraction" not in stages:
+        return
+    if change_sets is None:
+        raise ValueError("pr-code-candidate-extraction requires normalized pr_change_sets input")
+    candidate_index = stages.index("pr-code-candidate-extraction")
+    subject_input_stage = "engineering-change-subject-input"
+    if (
+        subject_input_stage in stages
+        and candidate_index < stages.index(subject_input_stage)
+    ):
+        raise ValueError(
+            "pr-code-candidate-extraction must run after engineering-change-subject-input"
+        )
+    graph_producing_stages = {
+        "workspace-registry",
+        "openspec-graph-extraction",
+        "engineering-change-subject-input",
+    }
+    if not any(stage in graph_producing_stages for stage in stages[:candidate_index]):
+        raise ValueError("pr-code-candidate-extraction requires a prior graph-producing stage")
+    for later in ("graph-derivation", "graph-integrity-validation"):
+        if later in stages and candidate_index > stages.index(later):
+            raise ValueError(f"pr-code-candidate-extraction must run before {later}")
+
+
+def _validate_candidate_subject_availability(
+    change_sets: tuple[MergedPrChangeSet, ...], graph: GraphSnapshot
+) -> None:
+    """Require every explicit candidate subject to exist in the graph at this stage."""
+
+    available_subject_ids = {node.id for node in graph.nodes}
+    missing_subject_ids = sorted(
+        {
+            change_set.association.engineering_change_subject_id
+            for change_set in change_sets
+            if change_set.association.engineering_change_subject_id not in available_subject_ids
+        }
+    )
+    if missing_subject_ids:
+        raise ValueError(
+            "pr-code-candidate-extraction requires available prior graph subjects: "
+            + ", ".join(missing_subject_ids)
+        )
