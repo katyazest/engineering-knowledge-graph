@@ -9,7 +9,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.mcp.factmcp_server import register_query_tools
 from engineering_kg.query import EngineeringKgQuery
-from test_local_ekg_query_api import _graph
+from tests.test_local_ekg_query_api import _graph
 
 
 class _Server:
