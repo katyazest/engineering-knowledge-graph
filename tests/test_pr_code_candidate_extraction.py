@@ -17,7 +17,14 @@ from engineering_kg.ingest.pr_code_candidates import (
     extract_pr_code_candidates,
     normalize_merged_pr_change_set,
 )
-from engineering_kg.ontology import CrossGraphLinkLifecycle, Evidence, GraphSnapshot, Node, NodeKind
+from engineering_kg.ontology import (
+    CrossGraphLinkLifecycle,
+    Evidence,
+    GraphSnapshot,
+    Node,
+    NodeKind,
+    SourceArtifactLocator,
+)
 from engineering_kg.persistence import initialize_ladybugdb_store
 from engineering_kg.validation import validate_graph_integrity
 
@@ -427,10 +434,17 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         self.assertEqual(
             result.graph.cross_graph_link_evidence[0].observation_id, mapping_id
         )
+        locator = result.graph.evidence[0].locator
+        self.assertIsInstance(locator, SourceArtifactLocator)
+        self.assertEqual(locator.source_artifact_identity.source_type, "graphify")
+        self.assertEqual(locator.source_artifact_identity.source_identity, "payment-service")
+        self.assertEqual(locator.source_artifact_identity.artifact_type, "pull-request-mapping")
+        self.assertEqual(locator.source_artifact_identity.revision_or_version, "a" * 40)
         self.assertEqual(
-            result.graph.evidence[0].locator,
+            locator.source_artifact_identity.stable_locator,
             f"pr-change-set:{normalized.id}:mapping:{mapping_id}",
         )
+        self.assertEqual(locator.navigation_detail["source_mapping_id"], mapping_id)
         self.assertEqual(
             result.graph.evidence[0].properties["source_mapping_id"], mapping_id
         )
@@ -453,6 +467,11 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             readback = store.write_snapshot(graph)
             self.assertEqual(readback.as_json(), graph.as_json())
             self.assertIn(opaque_id, readback.as_json())
+            locator = readback.evidence[0].locator
+            self.assertIsInstance(locator, SourceArtifactLocator)
+            self.assertEqual(locator.source_artifact_identity.source_type, "graphify")
+            self.assertNotIn("source_code", readback.as_json())
+            self.assertNotIn("provider_payload", readback.as_json())
             self.assertEqual(store.write_snapshot(graph).as_json(), graph.as_json())
 
 

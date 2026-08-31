@@ -9,7 +9,9 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.ontology import (
     Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, OpenSpecLocator,
+    SourceArtifactIdentity, SourceArtifactLocator,
     openspec_requirement_id, openspec_scenario_id, openspec_specification_id,
+    stable_id,
 )
 
 
@@ -45,6 +47,20 @@ class CanonicalOntologyTest(unittest.TestCase):
     def test_openspec_evidence_excludes_content(self) -> None:
         evidence = Evidence("e", "openspec", OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-requirement", "durable:payments", "Payment", 4))
         self.assertNotIn("content", evidence.as_dict()["locator"])
+
+    def test_equivalent_external_evidence_coalesces_and_conflicts_are_order_independent(self) -> None:
+        identity = SourceArtifactIdentity("jira", "ENG", "issue", "42", "issues/ENG-42")
+        evidence = Evidence(stable_id("evidence", identity.id), "jira", SourceArtifactLocator(identity))
+        self.assertEqual(
+            GraphSnapshot(evidence=(evidence,)).merged_with(GraphSnapshot(evidence=(evidence,))).evidence,
+            (evidence,),
+        )
+        conflicting = Evidence(
+            evidence.id, "jira", SourceArtifactLocator(identity, {"heading_name": "Conflicting"})
+        )
+        for first, second in ((evidence, conflicting), (conflicting, evidence)):
+            with self.assertRaisesRegex(ValueError, "Conflicting graph record values"):
+                GraphSnapshot(evidence=(first,)).merged_with(GraphSnapshot(evidence=(second,)))
 
 
 if __name__ == "__main__":

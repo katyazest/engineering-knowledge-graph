@@ -7,7 +7,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, openspec_specification_id
+from engineering_kg.ontology import (
+    Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, SourceArtifactIdentity,
+    SourceArtifactLocator, openspec_specification_id, stable_id,
+)
 from engineering_kg.validation import validate_graph_integrity
 
 
@@ -16,7 +19,10 @@ class GraphIntegrityValidationTest(unittest.TestCase):
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
         spec = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})
         edge = Edge("assertion", EdgeKind.ASSERTS, change.id, spec.id, evidence_ids=("e",))
-        self.assertEqual(validate_graph_integrity(GraphSnapshot((change, spec), (edge,), (Evidence("e", "openspec", "fixture"),))).status, "valid")
+        identity = SourceArtifactIdentity("openspec", "requirements", "openspec-spec", "a" * 40, "openspec/specs/payments/spec.md")
+        evidence = Evidence(stable_id("evidence", identity.id), "openspec", SourceArtifactLocator(identity))
+        edge = Edge("assertion", EdgeKind.ASSERTS, change.id, spec.id, evidence_ids=(evidence.id,))
+        self.assertEqual(validate_graph_integrity(GraphSnapshot((change, spec), (edge,), (evidence,))).status, "valid")
 
     def test_retired_vocabulary_is_invalid(self) -> None:
         legacy = Node("legacy", "openspec-spec", "Payments")
@@ -48,11 +54,16 @@ class GraphIntegrityValidationTest(unittest.TestCase):
         graph = GraphSnapshot(
             nodes=(first, second),
             evidence=(
-                Evidence("first-evidence", "openspec", "first"),
-                Evidence("second-evidence", "openspec", "second"),
+                Evidence("first-evidence", "fixture", "first"),
+                Evidence("second-evidence", "fixture", "second"),
             ),
         )
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
+
+    def test_external_evidence_without_identity_is_invalid_but_generated_evidence_is_allowed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid-source-artifact-identity"):
+            GraphSnapshot(evidence=(Evidence("external", "confluence", "123"),))
+        self.assertEqual(validate_graph_integrity(GraphSnapshot(evidence=(Evidence("generated", "openlore", "derived"),))).status, "valid")
 
     def test_canonical_node_id_must_match_natural_key(self) -> None:
         node = Node("wrong", NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})

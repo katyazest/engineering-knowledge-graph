@@ -48,6 +48,16 @@ LadybugDB stores only:
 
 Details are resolved through OpenLore MCP.
 
+## Source-artifact identity
+Every authoritative source artifact uses the common five-field identity:
+`source_type`, `source_identity`, `artifact_type`, `revision_or_version`, and
+repository-relative `stable_locator`. For OpenSpec, the version is the resolved
+Git `HEAD` commit of the validated store repository; dirty worktrees follow the
+configured warning policy and do not become a content-derived version. Headings
+and line ranges are navigation detail, not identity. See
+[`source-artifact-identity.md`](source-artifact-identity.md) for the complete
+contract and legacy migration diagnostic.
+
 ## Pipeline
 Workspace Registry → Workspace OpenLore → OpenSpec Store → Jira MCP → Bitbucket MCP → Normalize → LadybugDB-compatible local store → Derive → Validate → MCP queries
 

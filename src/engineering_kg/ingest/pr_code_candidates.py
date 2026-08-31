@@ -16,6 +16,8 @@ from engineering_kg.ontology import (
     CrossGraphLinkLifecycleState,
     Evidence,
     GraphSnapshot,
+    SourceArtifactIdentity,
+    SourceArtifactLocator,
     stable_id,
 )
 
@@ -546,13 +548,25 @@ def _change_set_conflict_provenance(change_set: MergedPrChangeSet) -> Evidence:
 def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMapping) -> Evidence:
     """Return payload-safe provenance for one admissible source mapping."""
 
-    provenance_id = stable_id(
-        "evidence", STRATEGY_ID, change_set.association.id, change_set.id, mapping.id
+    artifact_identity = SourceArtifactIdentity(
+        source_type="graphify",
+        source_identity=change_set.repository,
+        artifact_type="pull-request-mapping",
+        revision_or_version=change_set.merged_revision,
+        stable_locator=f"pr-change-set:{change_set.id}:mapping:{mapping.id}",
     )
+    provenance_id = stable_id("evidence", artifact_identity.id)
     return Evidence(
         provenance_id,
         STRATEGY_ID,
-        f"pr-change-set:{change_set.id}:mapping:{mapping.id}",
+        SourceArtifactLocator(
+            artifact_identity,
+            {
+                "association_id": change_set.association.id,
+                "pull_request_id": change_set.pull_request_id,
+                "source_mapping_id": mapping.id,
+            },
+        ),
         {
             "association_id": change_set.association.id,
             "merged_revision": change_set.merged_revision,

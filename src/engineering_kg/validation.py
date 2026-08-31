@@ -17,9 +17,13 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    OpenSpecLocator,
+    SourceArtifactLocator,
+    source_artifact_identity_error,
     openspec_requirement_id,
     openspec_scenario_id,
     openspec_specification_id,
+    stable_id,
 )
 
 
@@ -118,6 +122,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
     diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
+    diagnostics.extend(_source_artifact_identity_diagnostics(snapshot))
 
     sorted_diagnostics = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     severity_counts = Counter(item.severity for item in sorted_diagnostics)
@@ -137,6 +142,45 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
         },
     )
     return GraphValidationResult(status=status, metadata=metadata)
+
+
+def _source_artifact_identity_diagnostics(snapshot: GraphSnapshot) -> list[GraphValidationDiagnostic]:
+    """Verify explicit provenance IDs without treating navigation detail as identity."""
+
+    diagnostics: list[GraphValidationDiagnostic] = []
+    for evidence in snapshot.evidence:
+        locator = evidence.locator
+        missing_identity_error = source_artifact_identity_error(evidence)
+        if missing_identity_error:
+            diagnostics.append(
+                GraphValidationDiagnostic(
+                    "error", "source-artifact-identity-missing", evidence.id,
+                    missing_identity_error + ".",
+                )
+            )
+            continue
+        if isinstance(locator, SourceArtifactLocator):
+            expected = stable_id("evidence", locator.source_artifact_identity.id)
+        elif isinstance(locator, OpenSpecLocator):
+            if locator.source_artifact_identity is None:
+                diagnostics.append(
+                    GraphValidationDiagnostic(
+                        "error", "source-artifact-identity-missing", evidence.id,
+                        "OpenSpec evidence lacks an explicit source-artifact identity.",
+                    )
+                )
+                continue
+            expected = stable_id("evidence", locator.source_artifact_identity.id, locator.openspec_identity)
+        else:
+            continue
+        if evidence.id != expected:
+            diagnostics.append(
+                GraphValidationDiagnostic(
+                    "error", "source-artifact-evidence-identity", evidence.id,
+                    "Evidence ID does not match its source-artifact identity and retained locator detail.",
+                )
+            )
+    return diagnostics
 
 
 def _edge_endpoint_diagnostics(
