@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,12 +17,17 @@ from engineering_kg.ingest.openspec import (
 )
 from engineering_kg.ontology import EdgeKind, NodeKind
 from engineering_kg.project import load_workspace_registry
+from engineering_kg.persistence import initialize_ladybugdb_store
 from engineering_kg.validation import validate_graph_integrity
 
 ROOT = REPO_ROOT / "tests/fixtures/non-git-workspace/openspec/requirements_repo"
 
 
 class OpenSpecGraphExtractionTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_git_repository(ROOT)
+
     def test_extracts_canonical_facts_and_coalesces_source_evidence(self) -> None:
         graph = _extract().graph
         specs = [node for node in graph.nodes if node.kind == NodeKind.SPECIFICATION]
@@ -36,6 +42,38 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
         first = _extract().as_dict()
         self.assertEqual(first, _extract().as_dict())
         self.assertTrue(all("content" not in str(item) for item in first["graph"]["evidence"]))
+        self.assertRegex(first["metadata"]["revision_or_version"], r"^[0-9a-f]{40}$")
+        for item in first["graph"]["evidence"]:
+            identity = item["locator"].get("source_artifact_identity")
+            self.assertIsNotNone(identity)
+            self.assertNotIn(str(ROOT.resolve()), str(identity))
+
+    def test_missing_revision_rejects_before_graph_output(self) -> None:
+        source = _extract_source()
+        source = OpenSpecStoreSourceValidationResult(
+            **{**source.__dict__, "revision_or_version": ""}
+        )
+        with self.assertRaisesRegex(ValueError, "invalid-source-artifact-identity"):
+            extract_openspec_graph(source)
+
+    def test_revision_qualified_extraction_persists_idempotently(self) -> None:
+        source = _extract_source()
+        first = extract_openspec_graph(source).graph
+        changed_source = OpenSpecStoreSourceValidationResult(
+            **{**source.__dict__, "revision_or_version": "b" * 40}
+        )
+        changed = extract_openspec_graph(changed_source).graph
+        self.assertEqual(
+            [node.id for node in first.nodes], [node.id for node in changed.nodes]
+        )
+        self.assertNotEqual(
+            [item.id for item in first.evidence], [item.id for item in changed.evidence]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store = initialize_ladybugdb_store(Path(temporary) / "graph")
+            persisted_first = store.write_snapshot(first).as_json()
+            persisted_second = store.write_snapshot(first).as_json()
+        self.assertEqual(persisted_first, persisted_second)
 
     def test_unresolved_related_spec_is_a_validation_warning(self) -> None:
         validation = validate_graph_integrity(_extract().graph)
@@ -61,6 +99,7 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
                 openspec_root_path=root / "openspec",
                 specs_path=root / "openspec/specs",
                 changes_path=root / "openspec/changes",
+                revision_or_version="a" * 40,
             )
             graph = extract_openspec_graph(source).graph
         specification = next(node for node in graph.nodes if node.kind == NodeKind.SPECIFICATION)
@@ -71,9 +110,23 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
 
 
 def _extract():
+    return extract_openspec_graph(_extract_source())
+
+
+def _extract_source():
     registry = load_workspace_registry(ROOT / "repo-index-openspec-graph-stage.yaml")
-    source = validate_openspec_store_source(registry, registered_stores=(RegisteredOpenSpecStore("requirements-store", ROOT),))
-    return extract_openspec_graph(source)
+    return validate_openspec_store_source(registry, registered_stores=(RegisteredOpenSpecStore("requirements-store", ROOT),))
+
+
+def _ensure_git_repository(path: Path) -> None:
+    if (path / ".git").exists():
+        return
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-m", "fixture"],
+        check=True, capture_output=True,
+    )
 
 
 if __name__ == "__main__":

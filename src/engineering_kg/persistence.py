@@ -26,6 +26,10 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     OpenSpecLocator,
+    SourceArtifactIdentity,
+    SourceArtifactLocator,
+    evidence_requires_source_artifact_identity,
+    source_artifact_identity_error,
     EdgeKind,
     NodeKind,
     openspec_requirement_id,
@@ -166,8 +170,7 @@ class LadybugDbStore:
 
         try:
             data = self._read_raw()
-            snapshot = _snapshot_from_data(data)
-            result = migrate_graph_snapshot(snapshot)
+            result = migrate_graph_snapshot(_snapshot_from_data(data, allow_legacy_evidence=True))
             if result.migrated:
                 _validate_snapshot(result.snapshot)
                 validation = validate_graph_integrity(result.snapshot)
@@ -199,10 +202,15 @@ class LadybugDbStore:
         os.replace(temporary, self._graph_file)
 
     def _migrate_raw_if_needed(self, data: dict[str, Any]) -> dict[str, Any]:
-        result = self.migrate_persisted_snapshot()
+        result = migrate_graph_snapshot(_snapshot_from_data(data, allow_legacy_evidence=True))
         if not result.migrated:
             return data
-        return _merge_snapshot(_empty_graph_data(), result.snapshot)
+        _validate_snapshot(result.snapshot)
+        if self._graph_file.exists():
+            shutil.copy2(self._graph_file, self.path / MIGRATION_BACKUP_FILE_NAME)
+        migrated = _merge_snapshot(_empty_graph_data(), result.snapshot)
+        self._write_raw(migrated)
+        return migrated
 
 
 def initialize_ladybugdb_store(path: str | Path) -> LadybugDbStore:
@@ -225,6 +233,8 @@ def read_graph_snapshot(path: str | Path) -> GraphSnapshot:
 
 def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
     """Convert retired OpenSpec domain records to the canonical ontology."""
+
+    snapshot, migrated_evidence = _migrate_legacy_evidence(snapshot)
 
     node_ids: dict[str, str] = {}
     nodes: list[Node] = []
@@ -332,7 +342,102 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
         migrated = GraphSnapshot().merged_with(migrated)
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
-    return OntologyMigrationResult(migrated, migrated_nodes, migrated_edges)
+    return OntologyMigrationResult(migrated, migrated_nodes, migrated_edges + migrated_evidence)
+
+
+def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, int]:
+    """Upgrade legacy authoritative records that retain all five identity fields.
+
+    This deliberately does not use a display label, an absolute path, or the
+    filesystem to fill missing provenance.  Evidence references are rewritten
+    atomically with the evidence ID; canonical node and edge IDs are retained.
+    OpenSpec object detail remains part of its evidence ID, while all other
+    authoritative sources use the common identity-only evidence ID.
+    """
+
+    evidence_ids: dict[str, str] = {}
+    evidence_by_id: dict[str, Evidence] = {}
+    migrated = 0
+    for item in snapshot.evidence:
+        locator = item.locator
+        if isinstance(locator, OpenSpecLocator) and locator.source_artifact_identity is not None:
+            _coalesce_migrated_evidence(evidence_by_id, item)
+            continue
+        if isinstance(locator, SourceArtifactLocator):
+            _coalesce_migrated_evidence(evidence_by_id, item)
+            continue
+        if not evidence_requires_source_artifact_identity(item):
+            _coalesce_migrated_evidence(evidence_by_id, item)
+            continue
+        fields = item.properties.get("source_artifact_identity")
+        if not isinstance(fields, dict):
+            raise PersistenceIntegrityError(
+                "legacy-source-artifact-identity: authoritative evidence lacks sufficient authoritative identity fields"
+            )
+        try:
+            identity = SourceArtifactIdentity(
+                _expect_string(fields.get("source_type"), "legacy source_type"),
+                _expect_string(fields.get("source_identity"), "legacy source_identity"),
+                _expect_string(fields.get("artifact_type"), "legacy artifact_type"),
+                _expect_string(fields.get("revision_or_version"), "legacy revision_or_version"),
+                _expect_string(fields.get("stable_locator"), "legacy stable_locator"),
+            )
+        except (PersistenceIntegrityError, ValueError) as exc:
+            raise PersistenceIntegrityError(
+                "legacy-source-artifact-identity: authoritative evidence lacks sufficient authoritative identity fields"
+            ) from exc
+        if isinstance(locator, OpenSpecLocator):
+            if identity.artifact_type != locator.artifact_type or identity.stable_locator != locator.relative_file_path:
+                raise PersistenceIntegrityError(
+                    "legacy-source-artifact-identity: retained identity conflicts with OpenSpec locator"
+                )
+            migrated_locator = OpenSpecLocator(
+                locator.relative_file_path, locator.artifact_type,
+                locator.openspec_identity, locator.heading_name,
+                locator.line_start, locator.line_end, identity,
+            )
+            new_id = stable_id("evidence", identity.id, locator.openspec_identity)
+        else:
+            migrated_locator = SourceArtifactLocator(identity)
+            new_id = stable_id("evidence", identity.id)
+        evidence_ids[item.id] = new_id
+        properties = dict(item.properties)
+        properties.pop("source_artifact_identity")
+        _coalesce_migrated_evidence(evidence_by_id, Evidence(
+            new_id, item.source, migrated_locator, properties,
+        ))
+        migrated += 1
+    if not migrated:
+        return snapshot, 0
+    rewrite = lambda ids: tuple(sorted({evidence_ids.get(item, item) for item in ids}))
+    return GraphSnapshot(
+        nodes=tuple(Node(item.id, item.kind, item.name, item.properties, rewrite(item.evidence_ids)) for item in snapshot.nodes),
+        edges=tuple(Edge(item.id, item.kind, item.source_id, item.target_id, item.properties,
+                         rewrite(item.evidence_ids), item.confidence) for item in snapshot.edges),
+        evidence=tuple(evidence_by_id[item_id] for item_id in sorted(evidence_by_id)),
+        cross_graph_link_claims=snapshot.cross_graph_link_claims,
+        cross_graph_link_evidence=tuple(CrossGraphLinkEvidence(
+            item.claim_id, item.strategy_id, item.observation_id,
+            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
+        ) for item in snapshot.cross_graph_link_evidence),
+        cross_graph_link_lifecycle=tuple(CrossGraphLinkLifecycle(
+            item.claim_id, item.revision, item.state,
+            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
+        ) for item in snapshot.cross_graph_link_lifecycle),
+    ), migrated
+
+
+def _coalesce_migrated_evidence(
+    evidence_by_id: dict[str, Evidence], item: Evidence
+) -> None:
+    """Retain one equivalent migrated record or reject conflicting provenance."""
+
+    existing = evidence_by_id.get(item.id)
+    if existing is None:
+        evidence_by_id[item.id] = item
+        return
+    if existing.as_dict() != item.as_dict():
+        raise PersistenceIntegrityError("legacy-source-artifact-identity: conflicting migrated evidence")
 
 
 def _repository_for_legacy_requirement(
@@ -484,7 +589,7 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
     return merged
 
 
-def _snapshot_from_data(data: dict[str, Any]) -> GraphSnapshot:
+def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = False) -> GraphSnapshot:
     nodes = tuple(
         _node_from_dict(item)
         for item in _ordered_records(
@@ -500,7 +605,7 @@ def _snapshot_from_data(data: dict[str, Any]) -> GraphSnapshot:
         )
     )
     evidence = tuple(
-        _evidence_from_dict(item)
+        _evidence_from_dict(item, allow_legacy_evidence)
         for item in _ordered_records(
             _expect_mapping(data.get("evidence", {}), "evidence"),
             _expect_string_tuple(data.get("evidence_order", []), "evidence_order"),
@@ -527,8 +632,12 @@ def _snapshot_from_data(data: dict[str, Any]) -> GraphSnapshot:
             _expect_string_tuple(data.get("cross_graph_link_lifecycle_order", []), "cross_graph_link_lifecycle_order"),
         )
     )
-    snapshot = GraphSnapshot(nodes, edges, evidence, claims, observations, lifecycle)
-    _validate_snapshot(snapshot)
+    snapshot = GraphSnapshot(
+        nodes, edges, evidence, claims, observations, lifecycle,
+        allow_legacy_evidence=allow_legacy_evidence,
+    )
+    if not allow_legacy_evidence:
+        _validate_snapshot(snapshot)
     return snapshot
 
 
@@ -571,13 +680,21 @@ def _edge_from_dict(data: dict[str, Any]) -> Edge:
     )
 
 
-def _evidence_from_dict(data: dict[str, Any]) -> Evidence:
-    return Evidence(
-        id=_expect_string(data.get("id"), "evidence.id"),
-        source=_expect_string(data.get("source"), "evidence.source"),
-        locator=_locator_from_value(data.get("locator")),
-        properties=dict(_expect_mapping(data.get("properties", {}), "evidence.properties")),
-    )
+def _evidence_from_dict(data: dict[str, Any], allow_legacy_evidence: bool = False) -> Evidence:
+    try:
+        record = Evidence(
+            id=_expect_string(data.get("id"), "evidence.id"),
+            source=_expect_string(data.get("source"), "evidence.source"),
+            locator=_locator_from_value(data.get("locator")),
+            properties=dict(_expect_mapping(data.get("properties", {}), "evidence.properties")),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    if not allow_legacy_evidence and (error := source_artifact_identity_error(record)):
+        raise PersistenceIntegrityError(
+            f"invalid-source-artifact-identity: {error}"
+        )
+    return record
 
 
 def _cross_graph_link_claim_from_dict(data: dict[str, Any]) -> CrossGraphLinkClaim:
@@ -630,7 +747,9 @@ def _expect_record_id(data: dict[str, Any], expected: str, context: str) -> None
         raise PersistenceIntegrityError(f"{context}.id does not match its stable identity")
 
 
-def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef | OpenSpecLocator:
+def _locator_from_value(
+    value: Any,
+) -> str | CodeLocator | ConfluencePageRef | OpenSpecLocator | SourceArtifactLocator:
     if isinstance(value, str):
         return value
     data = _expect_mapping(value, "evidence.locator")
@@ -644,32 +763,81 @@ def _locator_from_value(value: Any) -> str | CodeLocator | ConfluencePageRef | O
         )
     if keys == {"page_id"}:
         return ConfluencePageRef(page_id=_expect_string(data["page_id"], "locator.page_id"))
+    if keys == {"navigation_detail", "source_artifact_identity"}:
+        try:
+            identity = _source_artifact_identity_from_mapping(data["source_artifact_identity"])
+            locator = SourceArtifactLocator(
+                identity,
+                dict(_expect_mapping(data["navigation_detail"], "locator.navigation_detail")),
+            )
+        except ValueError as exc:
+            raise PersistenceIntegrityError(str(exc)) from exc
+        return locator
     if {"artifact_type", "openspec_identity", "relative_file_path"}.issubset(keys):
+        allowed_keys = {
+            "artifact_type", "heading_name", "line_end", "line_start",
+            "openspec_identity", "relative_file_path", "source_artifact_identity",
+        }
+        _expect_allowed_locator_keys(keys, allowed_keys)
+        identity_value = data.get("source_artifact_identity")
+        identity = None
+        if identity_value is not None:
+            try:
+                identity = _source_artifact_identity_from_mapping(identity_value)
+            except ValueError as exc:
+                raise PersistenceIntegrityError(str(exc)) from exc
         return OpenSpecLocator(
-            relative_file_path=_expect_string(
-                data["relative_file_path"], "locator.relative_file_path"
-            ),
+            relative_file_path=_expect_string(data["relative_file_path"], "locator.relative_file_path"),
             artifact_type=_expect_string(data["artifact_type"], "locator.artifact_type"),
-            openspec_identity=_expect_string(
-                data["openspec_identity"], "locator.openspec_identity"
-            ),
-            heading_name=_expect_optional_string(data.get("heading_name", ""), "locator.heading_name")
-            or "",
+            openspec_identity=_expect_string(data["openspec_identity"], "locator.openspec_identity"),
+            heading_name=_expect_optional_string(data.get("heading_name", ""), "locator.heading_name") or "",
             line_start=_expect_optional_int(data.get("line_start"), "locator.line_start"),
             line_end=_expect_optional_int(data.get("line_end"), "locator.line_end"),
+            source_artifact_identity=identity,
         )
     raise PersistenceIntegrityError(f"Unsupported evidence locator shape: {sorted(keys)}")
+
+
+def _source_artifact_identity_from_mapping(value: Any) -> SourceArtifactIdentity:
+    """Deserialize the complete persisted identity without dropping unknown fields."""
+
+    identity_data = _expect_mapping(value, "locator.source_artifact_identity")
+    _expect_allowed_locator_keys(
+        set(identity_data),
+        {"artifact_type", "id", "revision_or_version", "source_identity", "source_type", "stable_locator"},
+        "locator.source_artifact_identity",
+    )
+    identity = SourceArtifactIdentity(
+        _expect_string(identity_data.get("source_type"), "source_artifact_identity.source_type"),
+        _expect_string(identity_data.get("source_identity"), "source_artifact_identity.source_identity"),
+        _expect_string(identity_data.get("artifact_type"), "source_artifact_identity.artifact_type"),
+        _expect_string(identity_data.get("revision_or_version"), "source_artifact_identity.revision_or_version"),
+        _expect_string(identity_data.get("stable_locator"), "source_artifact_identity.stable_locator"),
+    )
+    _expect_record_id(identity_data, identity.id, "source_artifact_identity")
+    return identity
+
+
+def _expect_allowed_locator_keys(
+    keys: set[str], allowed_keys: set[str], context: str = "locator",
+) -> None:
+    unknown_keys = sorted(keys - allowed_keys)
+    if unknown_keys:
+        raise PersistenceIntegrityError(
+            f"invalid-source-artifact-identity: {context}.{unknown_keys[0]} is not allowed"
+        )
 
 
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
     _reject_forbidden_fields(snapshot.as_dict())
     validation = validate_graph_integrity(snapshot)
-    cross_graph_errors = [
+    errors = [
         item for item in validation.metadata.diagnostics
-        if item.rule_id.startswith("cross-graph-") and item.severity == "error"
+        if item.severity == "error"
+        and (item.rule_id.startswith("cross-graph-") or item.rule_id.startswith("source-artifact-"))
     ]
-    if cross_graph_errors:
-        raise PersistenceIntegrityError(cross_graph_errors[0].message)
+    if errors:
+        raise PersistenceIntegrityError(errors[0].message)
 
 
 def _reject_forbidden_fields(value: Any, path: str = "graph") -> None:

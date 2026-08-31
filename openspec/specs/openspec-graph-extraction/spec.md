@@ -1,9 +1,7 @@
 ## Purpose
 
 The `openspec-graph-extraction` capability extracts OpenSpec changes, specifications, requirements, and scenarios from the validated OpenSpec store into canonical Engineering KG graph facts with deterministic IDs and source evidence.
-
 ## Requirements
-
 ### Requirement: OpenSpec graph extraction reads from validated store source
 The system SHALL extract OpenSpec graph facts only from the OpenSpec root resolved by the validated OpenSpec store source.
 
@@ -114,3 +112,17 @@ The system SHALL coalesce compatible OpenSpec assertions of one canonical identi
 - **WHEN** extraction runs repeatedly against unchanged durable and change-scoped OpenSpec files
 - **THEN** it returns the same canonical node IDs, relationship IDs, evidence IDs, ordering, and extraction metadata
 - **THEN** it does not duplicate canonical facts or discard existing source evidence
+
+### Requirement: OpenSpec extraction supplies authoritative artifact identity before canonical fact construction
+The system SHALL construct and validate explicit OpenSpec source-artifact identity from the validated store source and repository-relative artifact locator before emitting canonical facts or evidence. It SHALL use the validated store repository's resolved Git `HEAD` commit as the OpenSpec artifact `revision_or_version` and SHALL reject extraction when that context cannot supply a required identity component, rather than substituting a change display name or local absolute path. Canonical specification, requirement, scenario, change, node, and edge identifiers SHALL remain source-independent and unchanged by this provenance identity.
+
+#### Scenario: Validated OpenSpec context produces stable provenance
+- **WHEN** extraction runs against the same validated OpenSpec source contents and authoritative source context from different local checkout locations
+- **THEN** it produces the same canonical fact IDs, source-artifact IDs, evidence IDs, counts, and serialized metadata
+- **THEN** repository-relative source locators remain available for source navigation without becoming canonical identity
+
+#### Scenario: Required OpenSpec identity context is unavailable
+- **WHEN** validated OpenSpec source context lacks a required authoritative repository/store identity or resolved Git `HEAD` commit
+- **THEN** extraction fails with a deterministic source-artifact-identity diagnostic before producing graph facts
+- **THEN** it does not fall back to a display name, current working directory, or absolute source path
+

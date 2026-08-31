@@ -67,7 +67,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
                 "edge_order": [],
                 "edges": {},
                 "evidence_order": ["evidence"],
-                "evidence": {"evidence": Evidence("evidence", "openspec", "fixture").as_dict()},
+                "evidence": {"evidence": Evidence("evidence", "fixture", "fixture").as_dict()},
             })
             result = run_pipeline(
                 ROOT / "repo-index-graph-derivation-validation-stage.yaml",

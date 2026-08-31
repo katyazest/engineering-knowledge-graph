@@ -1,0 +1,63 @@
+## ADDED Requirements
+
+### Requirement: Authoritative source artifacts have an explicit deterministic identity
+The system SHALL represent every authoritative source artifact admitted into extraction, adapter-normalized output, graph evidence, or persistence with a source-artifact identity containing non-empty `source_type`, `source_identity`, `artifact_type`, `revision_or_version`, and `stable_locator` fields. The stable source-artifact ID SHALL be derived only from those five fields using deterministic, field-delimited serialization. Display names, local absolute paths, process working directory, line ranges, heading names, timestamps, and source content SHALL NOT participate in that ID.
+
+#### Scenario: Equivalent authoritative artifact has one identity across boundaries
+- **WHEN** an extractor or adapter supplies equivalent values for all five source-artifact identity fields in separate runs or pipeline boundaries
+- **THEN** each normalized record and persisted evidence record uses the same source-artifact ID
+- **THEN** the graph retains one compatible source-artifact/evidence identity with deterministically ordered references
+
+#### Scenario: Distinct identity component prevents conflation
+- **WHEN** two admitted artifacts differ in source type, source identity, artifact type, revision/version, or stable locator
+- **THEN** they receive different source-artifact IDs
+- **THEN** the system does not deduplicate them solely because they have the same display name or local path suffix
+
+### Requirement: Source-artifact identity admission is complete and payload-safe
+The system SHALL reject an artifact record before graph emission or persistence when any required source-artifact identity field is missing, blank, malformed for its declared field, or contains source payload content, credentials, tokens, or an external navigation URL. Rejection SHALL produce a deterministic validation outcome naming the invalid field or condition and SHALL emit no partial authoritative-artifact record or evidence for that input.
+
+#### Scenario: Complete identity is admitted without source content
+- **WHEN** a normalized artifact supplies all required identity fields using payload-safe identifier and locator values
+- **THEN** the system admits the artifact and retains only the identity fields and allowed provenance metadata
+- **THEN** it does not retain the source body or provider response payload
+
+#### Scenario: Incomplete or unsafe identity is rejected
+- **WHEN** a normalized artifact has a blank revision/version, an incidental absolute path as its stable locator, a display name substituted for source identity, or a payload, credential, token, or navigation URL in an identity field
+- **THEN** the system returns or raises a deterministic invalid-source-artifact-identity outcome
+- **THEN** no node, edge, evidence, or persisted record is emitted for that invalid artifact
+
+### Requirement: Source-artifact conflicts and persisted compatibility are deterministic
+The system SHALL coalesce identical source-artifact records during graph merge and persistence readback, and SHALL reject records with the same stable source-artifact ID and conflicting retained identity or provenance values. It SHALL read existing persisted evidence that lacks explicit source-artifact identity without silently fabricating identity from a display name or incidental path; it SHALL either deterministically migrate it from sufficient retained authoritative fields or report a deterministic migration/compatibility diagnostic before accepting the snapshot.
+
+#### Scenario: Identical artifacts remain idempotent through persistence
+- **WHEN** the same valid source artifact is extracted and persisted more than once
+- **THEN** readback contains one compatible source-artifact/evidence record and stable serialized ordering
+- **THEN** repeated persistence produces the same graph identity and counts
+
+#### Scenario: Identity collision is rejected
+- **WHEN** two records have the same source-artifact ID but different retained identity or provenance values
+- **THEN** merge or persistence readback fails with a deterministic conflict diagnostic
+- **THEN** it does not select one record based on ingestion order
+
+#### Scenario: Legacy evidence cannot be identified safely
+- **WHEN** a persisted legacy evidence record lacks explicit source-artifact identity and does not retain sufficient authoritative fields for deterministic migration
+- **THEN** readback reports a deterministic compatibility diagnostic or fails with a deterministic integrity error
+- **THEN** it does not derive identity from a display name, absolute path, or current filesystem layout
+
+### Requirement: Source-artifact identity verification matrix bounds admission testing
+The change SHALL verify the following matrix at reusable model, adapter/extractor, merge, and persistence boundaries. Cases outside this matrix are change candidates unless they violate another requirement or baseline contract.
+
+| Input class | Expected behavior | Compatibility anchor |
+| --- | --- | --- |
+| Five complete payload-safe authoritative fields | Admit; derive stable identity; retain fields | Explicit source-artifact identity |
+| Repeated equivalent artifact | Coalesce deterministically | Idempotent persistence |
+| Different source type, source identity, artifact type, revision/version, or locator | Keep distinct | Explicit source-artifact identity |
+| Blank/missing required field, display-name identity, incidental absolute path, payload/credential/token/navigation URL | Reject before graph emission | Payload-safe admission |
+| Same derived ID with conflicting retained values | Reject deterministically | Conflict handling |
+| Legacy evidence with sufficient retained authoritative fields | Deterministically migrate and preserve canonical IDs | Persisted compatibility |
+| Legacy evidence without sufficient authoritative fields | Diagnostic/fail; do not invent identity | Persisted compatibility |
+
+#### Scenario: Verification matrix is exercised
+- **WHEN** automated tests exercise each input class in the source-artifact identity verification matrix
+- **THEN** each case produces the matrix's specified admission, deduplication, migration, or rejection outcome
+- **THEN** tests verify that canonical node and edge IDs remain unchanged by source-artifact provenance identity

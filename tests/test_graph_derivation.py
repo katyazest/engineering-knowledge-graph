@@ -16,7 +16,7 @@ class GraphDerivationTest(unittest.TestCase):
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
         specification = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})
         assertion = Edge("assertion", EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=("e",))
-        graph = GraphSnapshot((change, specification), (assertion,), (Evidence("e", "openspec", "fixture"),))
+        graph = GraphSnapshot((change, specification), (assertion,), (Evidence("e", "fixture", "fixture"),))
         result = derive_graph_relationships(graph)
         derived = [edge for edge in result.graph.edges if edge.kind == EdgeKind.TRACES_TO]
         self.assertEqual(len(derived), 1)

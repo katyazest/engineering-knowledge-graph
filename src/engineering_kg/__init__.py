@@ -13,6 +13,8 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    NormalizedSourceArtifact,
+    SourceArtifactIdentity,
     stable_id,
 )
 from engineering_kg.openlore import (
@@ -60,6 +62,7 @@ __all__ = [
     "LadybugDbStore",
     "Node",
     "NodeKind",
+    "NormalizedSourceArtifact",
     "OpenLoreRepositoryReference",
     "OpenLoreSourceValidationError",
     "OpenLoreSourceValidationResult",
@@ -71,6 +74,7 @@ __all__ = [
     "PipelineResult",
     "QueryNodeResult",
     "TraceabilityResult",
+    "SourceArtifactIdentity",
     "initialize_ladybugdb_store",
     "persist_graph_snapshot",
     "read_graph_snapshot",

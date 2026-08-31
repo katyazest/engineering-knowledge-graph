@@ -19,6 +19,7 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     OpenSpecLocator,
+    SourceArtifactIdentity,
     openspec_requirement_id,
     openspec_scenario_id,
     openspec_specification_id,
@@ -62,6 +63,7 @@ class OpenSpecStoreSourceValidationResult:
     specs_path: Path
     changes_path: Path
     store_id: str = ""
+    revision_or_version: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -73,6 +75,7 @@ class OpenSpecStoreSourceValidationResult:
             "selection_source": self.selection_source,
             "specs_path": str(self.specs_path),
             "status": self.status,
+            "revision_or_version": self.revision_or_version,
         }
         if self.store_id:
             data["store_id"] = self.store_id
@@ -92,6 +95,7 @@ class OpenSpecExtractionMetadata:
     requirement_count: int
     scenario_count: int
     artifact_count: int
+    revision_or_version: str = ""
     unresolved_related_spec_references: tuple[dict[str, str], ...] = ()
     graph_counts: dict[str, int] = field(default_factory=dict)
 
@@ -105,6 +109,7 @@ class OpenSpecExtractionMetadata:
             "repository_id": self.repository_id,
             "requirement_count": self.requirement_count,
             "scenario_count": self.scenario_count,
+            "revision_or_version": self.revision_or_version,
             "status": self.status,
             "store_id": self.store_id,
             "unresolved_related_spec_references": [
@@ -221,6 +226,10 @@ def extract_openspec_graph(
         raise OpenSpecGraphExtractionError("OpenSpec store source must be valid before extraction")
     if not store_source.specs_path.is_dir() or not store_source.changes_path.is_dir():
         raise OpenSpecGraphExtractionError("Validated OpenSpec specs and changes paths must exist")
+    if not store_source.revision_or_version:
+        raise OpenSpecGraphExtractionError(
+            "invalid-source-artifact-identity: OpenSpec revision_or_version is unavailable"
+        )
 
     nodes: list[Node] = []
     edges: list[Edge] = []
@@ -273,6 +282,7 @@ def extract_openspec_graph(
         requirement_count=sum(len(spec.requirements) for spec in durable_specs),
         scenario_count=sum(len(spec.scenarios) for spec in durable_specs),
         artifact_count=artifact_count,
+        revision_or_version=store_source.revision_or_version,
         unresolved_related_spec_references=tuple(unresolved),
         graph_counts={
             "edge_count": graph.edge_count,
@@ -398,7 +408,38 @@ def _validate_selected_store(
         openspec_root_path=openspec_root,
         specs_path=specs_path,
         changes_path=changes_path,
+        revision_or_version=_git_head(resolved_store_path),
     )
+
+
+def _git_head(repository_path: Path) -> str:
+    """Resolve the authoritative repository revision without reading source content."""
+
+    try:
+        root = subprocess.run(
+            ["git", "-C", str(repository_path), "rev-parse", "--show-toplevel"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        if Path(root).resolve() != repository_path.resolve():
+            raise OpenSpecStoreSourceValidationError(
+                "invalid-source-artifact-identity: OpenSpec Git HEAD is unavailable"
+            )
+        completed = subprocess.run(
+            ["git", "-C", str(repository_path), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise OpenSpecStoreSourceValidationError(
+            "invalid-source-artifact-identity: OpenSpec Git HEAD is unavailable"
+        ) from exc
+    revision = completed.stdout.strip()
+    if not revision:
+        raise OpenSpecStoreSourceValidationError(
+            "invalid-source-artifact-identity: OpenSpec Git HEAD is unavailable"
+        )
+    return revision
 
 
 def _store_id(item: dict[str, Any], index: int) -> str:
@@ -498,7 +539,7 @@ def _parse_spec_file(
         for key in ("repo", "created", "updated", "title", "related")
         if (value := frontmatter.get(key)) is not None
     }
-    evidence_id = stable_id("evidence", "openspec", relative_path, openspec_identity)
+    evidence_id = _evidence_id(store_source, relative_path, "openspec-spec", openspec_identity)
     spec_node = Node(
         id=openspec_specification_id(store_source.repository_id, capability),
         kind=NodeKind.SPECIFICATION,
@@ -510,6 +551,7 @@ def _parse_spec_file(
         evidence_ids=(evidence_id,),
     )
     spec_evidence = _evidence(
+        store_source,
         evidence_id,
         relative_path,
         "openspec-spec",
@@ -530,8 +572,8 @@ def _parse_spec_file(
         if requirement_match:
             requirement_name = requirement_match.group(1).strip()
             requirement_identity = f"{openspec_identity}:requirement:{requirement_name}"
-            requirement_evidence_id = stable_id(
-                "evidence", "openspec", relative_path, requirement_identity
+            requirement_evidence_id = _evidence_id(
+                store_source, relative_path, "openspec-requirement", requirement_identity
             )
             current_requirement = Node(
                 id=openspec_requirement_id(spec_node.id, requirement_name),
@@ -547,6 +589,7 @@ def _parse_spec_file(
             requirement_nodes.append(current_requirement)
             evidence_items.append(
                 _evidence(
+                    store_source,
                     requirement_evidence_id,
                     relative_path,
                     "openspec-requirement",
@@ -571,8 +614,8 @@ def _parse_spec_file(
         if scenario_match and current_requirement is not None:
             scenario_name = scenario_match.group(1).strip()
             scenario_identity = f"{requirement_identity}:scenario:{scenario_name}"
-            scenario_evidence_id = stable_id(
-                "evidence", "openspec", relative_path, scenario_identity
+            scenario_evidence_id = _evidence_id(
+                store_source, relative_path, "openspec-scenario", scenario_identity
             )
             scenario_node = Node(
                 id=openspec_scenario_id(current_requirement.id, scenario_name),
@@ -588,6 +631,7 @@ def _parse_spec_file(
             scenario_nodes.append(scenario_node)
             evidence_items.append(
                 _evidence(
+                    store_source,
                     scenario_evidence_id,
                     relative_path,
                     "openspec-scenario",
@@ -674,7 +718,7 @@ def _change_node(
     kind = NodeKind.OPENSPEC_ARCHIVED_CHANGE if archived else NodeKind.OPENSPEC_ACTIVE_CHANGE
     artifact_type = "openspec-archived-change" if archived else "openspec-active-change"
     relative_path = _relative_path(store_source.repository_path, change_dir)
-    evidence_id = stable_id("evidence", "openspec", relative_path, change_dir.name)
+    evidence_id = _evidence_id(store_source, relative_path, artifact_type, change_dir.name)
     node = Node(
         id=stable_id("node", kind, change_dir.name),
         kind=kind,
@@ -686,7 +730,7 @@ def _change_node(
         },
         evidence_ids=(evidence_id,),
     )
-    return node, _evidence(evidence_id, relative_path, artifact_type, change_dir.name)
+    return node, _evidence(store_source, evidence_id, relative_path, artifact_type, change_dir.name)
 
 
 def _change_artifacts(
@@ -704,7 +748,7 @@ def _change_artifacts(
             continue
         relative_path = _relative_path(store_source.repository_path, path)
         identity = f"{scope}:{change_dir.name}:artifact:{artifact_name}"
-        evidence_id = stable_id("evidence", "openspec", relative_path, identity)
+        evidence_id = _evidence_id(store_source, relative_path, "openspec-artifact", identity)
         node = Node(
             id=stable_id("node", NodeKind.OPENSPEC_ARTIFACT, identity),
             kind=NodeKind.OPENSPEC_ARTIFACT,
@@ -717,7 +761,7 @@ def _change_artifacts(
             evidence_ids=(evidence_id,),
         )
         nodes.append(node)
-        evidence.append(_evidence(evidence_id, relative_path, "openspec-artifact", identity))
+        evidence.append(_evidence(store_source, evidence_id, relative_path, "openspec-artifact", identity))
         edges.append(
             _edge(
                 EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT,
@@ -789,6 +833,7 @@ def _edge(
 
 
 def _evidence(
+    store_source: OpenSpecStoreSourceValidationResult,
     evidence_id: str,
     relative_path: str,
     artifact_type: str,
@@ -806,9 +851,29 @@ def _evidence(
             openspec_identity=openspec_identity,
             heading_name=heading_name,
             line_start=line_start,
+            source_artifact_identity=SourceArtifactIdentity(
+                source_type="openspec",
+                source_identity=store_source.repository_id,
+                artifact_type=artifact_type,
+                revision_or_version=store_source.revision_or_version,
+                stable_locator=relative_path,
+            ),
         ),
         properties=properties or {},
     )
+
+
+def _evidence_id(
+    store_source: OpenSpecStoreSourceValidationResult,
+    relative_path: str,
+    artifact_type: str,
+    openspec_identity: str,
+) -> str:
+    identity = SourceArtifactIdentity(
+        "openspec", store_source.repository_id, artifact_type,
+        store_source.revision_or_version, relative_path,
+    )
+    return stable_id("evidence", identity.id, openspec_identity)
 
 
 def _snapshot(nodes: list[Node], edges: list[Edge], evidence: list[Evidence]) -> GraphSnapshot:

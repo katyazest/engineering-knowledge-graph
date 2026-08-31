@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,10 @@ from engineering_kg.project import load_workspace_registry
 
 
 class OpenSpecStoreSourceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_git_repository(NON_GIT_REQUIREMENTS)
+
     def test_no_registered_stores_falls_back_to_requirements_repository(self) -> None:
         registry = _registry()
 
@@ -37,6 +42,7 @@ class OpenSpecStoreSourceTest(unittest.TestCase):
         self.assertEqual(result["openspec_root_path"], str((NON_GIT_REQUIREMENTS / "openspec").resolve()))
         self.assertEqual(result["specs_path"], str((NON_GIT_REQUIREMENTS / "openspec/specs").resolve()))
         self.assertEqual(result["changes_path"], str((NON_GIT_REQUIREMENTS / "openspec/changes").resolve()))
+        self.assertRegex(result["revision_or_version"], r"^[0-9a-f]{40}$")
         self.assertNotIn("store_id", result)
 
     def test_one_registered_store_matching_requirements_repository_is_selected(self) -> None:
@@ -224,6 +230,17 @@ repositories:
         encoding="utf-8",
     )
     return registry_path
+
+
+def _ensure_git_repository(path: Path) -> None:
+    if (path / ".git").exists():
+        return
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-m", "fixture"],
+        check=True, capture_output=True,
+    )
 
 
 if __name__ == "__main__":

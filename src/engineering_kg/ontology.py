@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -127,6 +128,182 @@ def _required_text(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/])")
+_UNSAFE_IDENTITY_RE = re.compile(
+    r"(?:\b(?:body|content|payload|credential(?:s)?|password(?:s)?|secret(?:s)?|token(?:s)?|authorization|bearer)\b|"
+    r"(?:api|access)[_-]?key|(?:https?|ftp|file|mailto|data|javascript|ssh|git):)",
+    re.IGNORECASE,
+)
+_UNSAFE_NAVIGATION_KEY_RE = re.compile(
+    r"(?:body|content|payload|credential|password|secret|token|url)", re.IGNORECASE
+)
+_NAVIGATION_DETAIL_SCHEMA = {
+    "association_id": str,
+    "heading_name": str,
+    "line_end": int,
+    "line_start": int,
+    "pull_request_id": str,
+    "section": str,
+    "source_mapping_id": str,
+}
+_SOURCE_ARTIFACT_EVIDENCE_METADATA_SCHEMA = {
+    "association_id": str,
+    "merged_revision": str,
+    "pull_request_id": str,
+    "related": tuple,
+    "repository": str,
+    "specification_id": str,
+    "source_mapping_id": str,
+}
+_MAX_NAVIGATION_TEXT_LENGTH = 512
+_MAX_NAVIGATION_LINE_NUMBER = 10_000_000
+
+
+def _identity_text(value: object, field_name: str) -> str:
+    """Validate one payload-safe source-artifact identity component."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"invalid-source-artifact-identity: {field_name} must be non-empty")
+    if value != value.strip() or "\n" in value or "\r" in value or len(value) > 512:
+        raise ValueError(f"invalid-source-artifact-identity: {field_name} is malformed")
+    if _UNSAFE_IDENTITY_RE.search(value):
+        raise ValueError(f"invalid-source-artifact-identity: {field_name} contains unsafe content")
+    if _ABSOLUTE_PATH_RE.match(value):
+        raise ValueError(
+            f"invalid-source-artifact-identity: {field_name} must not be an absolute path"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class SourceArtifactIdentity:
+    """Immutable, source-agnostic identity for one authoritative artifact."""
+
+    source_type: str
+    source_identity: str
+    artifact_type: str
+    revision_or_version: str
+    stable_locator: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "source_type", "source_identity", "artifact_type", "revision_or_version", "stable_locator"
+        ):
+            _identity_text(getattr(self, field_name), field_name)
+        if (
+            _ABSOLUTE_PATH_RE.match(self.stable_locator)
+            or "\\" in self.stable_locator
+            or ".." in self.stable_locator.split("/")
+        ):
+            raise ValueError("invalid-source-artifact-identity: stable_locator must be repository-relative")
+        if any(char.isspace() for char in self.source_identity):
+            raise ValueError("invalid-source-artifact-identity: source_identity must not be a display name")
+
+    @property
+    def id(self) -> str:
+        # JSON preserves field boundaries even when a component contains a delimiter.
+        raw = json.dumps(
+            [self.source_type, self.source_identity, self.artifact_type,
+             self.revision_or_version, self.stable_locator],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return f"source-artifact:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "artifact_type": self.artifact_type,
+            "id": self.id,
+            "revision_or_version": self.revision_or_version,
+            "source_identity": self.source_identity,
+            "source_type": self.source_type,
+            "stable_locator": self.stable_locator,
+        }
+
+
+@dataclass(frozen=True)
+class NormalizedSourceArtifact:
+    """Provider-neutral adapter output admitted before graph construction."""
+
+    identity: SourceArtifactIdentity
+    navigation_detail: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_navigation_detail(self.navigation_detail)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "identity": self.identity.as_dict(),
+            "navigation_detail": _serialize_value(self.navigation_detail),
+        }
+
+
+@dataclass(frozen=True)
+class SourceArtifactLocator:
+    """Payload-safe evidence locator for a normalized authoritative artifact."""
+
+    source_artifact_identity: SourceArtifactIdentity
+    navigation_detail: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_artifact_identity, SourceArtifactIdentity):
+            raise ValueError("source_artifact_identity must be a SourceArtifactIdentity")
+        _validate_navigation_detail(self.navigation_detail)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "navigation_detail": _serialize_value(self.navigation_detail),
+            "source_artifact_identity": self.source_artifact_identity.as_dict(),
+        }
+
+
+def _validate_navigation_detail(value: object, path: str = "navigation_detail") -> None:
+    """Validate the finite payload-safe schema retained for source navigation."""
+
+    _validate_payload_safe_metadata(value, path, _NAVIGATION_DETAIL_SCHEMA)
+
+
+def _validate_payload_safe_metadata(
+    value: object, path: str, schema: dict[str, type],
+) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid-source-artifact-identity: {path} must be a mapping")
+    for key, nested in value.items():
+        field_path = f"{path}.{key}"
+        expected_type = schema.get(key) if isinstance(key, str) else None
+        if expected_type is None or _UNSAFE_NAVIGATION_KEY_RE.search(key):
+            raise ValueError(f"invalid-source-artifact-identity: {field_path} is not allowed")
+        if expected_type is int:
+            if (
+                isinstance(nested, bool) or not isinstance(nested, int)
+                or not 1 <= nested <= _MAX_NAVIGATION_LINE_NUMBER
+            ):
+                raise ValueError(f"invalid-source-artifact-identity: {field_path} must be a positive integer")
+        elif expected_type is tuple:
+            # Tuples serialize as lists at the persistence boundary.
+            if not isinstance(nested, (tuple, list)) or len(nested) > 32:
+                raise ValueError(f"invalid-source-artifact-identity: {field_path} must be bounded references")
+            for index, item in enumerate(nested):
+                item_path = f"{field_path}[{index}]"
+                if (
+                    not isinstance(item, str) or not item or len(item) > _MAX_NAVIGATION_TEXT_LENGTH
+                    or item != item.strip() or "\n" in item or "\r" in item
+                    or _UNSAFE_IDENTITY_RE.search(item)
+                ):
+                    raise ValueError(f"invalid-source-artifact-identity: {item_path} contains unsafe content")
+        elif not isinstance(nested, str) or not nested or len(nested) > _MAX_NAVIGATION_TEXT_LENGTH:
+            raise ValueError(f"invalid-source-artifact-identity: {field_path} must be bounded text")
+        elif nested != nested.strip() or "\n" in nested or "\r" in nested or _UNSAFE_IDENTITY_RE.search(nested):
+            raise ValueError(f"invalid-source-artifact-identity: {field_path} contains unsafe content")
+
+
+def _validate_source_artifact_evidence_metadata(value: object) -> None:
+    """Allow only bounded reference metadata alongside source-artifact evidence."""
+
+    _validate_payload_safe_metadata(
+        value, "evidence.properties", _SOURCE_ARTIFACT_EVIDENCE_METADATA_SCHEMA,
+    )
 
 
 def _validate_code_locator(locator: CodeLocator) -> None:
@@ -275,6 +452,25 @@ class OpenSpecLocator:
     heading_name: str = ""
     line_start: int | None = None
     line_end: int | None = None
+    source_artifact_identity: SourceArtifactIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_artifact_identity is not None:
+            if self.source_artifact_identity.artifact_type != self.artifact_type:
+                raise ValueError(
+                    "invalid-source-artifact-identity: OpenSpec locator artifact_type "
+                    "does not match source-artifact identity"
+                )
+            if self.source_artifact_identity.stable_locator != self.relative_file_path:
+                raise ValueError(
+                    "invalid-source-artifact-identity: OpenSpec locator relative_file_path "
+                    "does not match source-artifact identity stable_locator"
+                )
+            _validate_navigation_detail({
+                **({"heading_name": self.heading_name} if self.heading_name else {}),
+                **({"line_start": self.line_start} if self.line_start is not None else {}),
+                **({"line_end": self.line_end} if self.line_end is not None else {}),
+            })
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -288,6 +484,8 @@ class OpenSpecLocator:
             data["line_start"] = self.line_start
         if self.line_end is not None:
             data["line_end"] = self.line_end
+        if self.source_artifact_identity is not None:
+            data["source_artifact_identity"] = self.source_artifact_identity.as_dict()
         return data
 
 
@@ -295,8 +493,14 @@ class OpenSpecLocator:
 class Evidence:
     id: str
     source: str
-    locator: str | CodeLocator | ConfluencePageRef | OpenSpecLocator
+    locator: str | CodeLocator | ConfluencePageRef | OpenSpecLocator | SourceArtifactLocator
     properties: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.locator, SourceArtifactLocator):
+            _validate_source_artifact_evidence_metadata(self.properties)
+        elif isinstance(self.locator, OpenSpecLocator) and self.locator.source_artifact_identity:
+            _validate_source_artifact_evidence_metadata(self.properties)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -305,6 +509,41 @@ class Evidence:
             "properties": _serialize_value(self.properties),
             "source": self.source,
         }
+
+
+# These records describe local pipeline output or test fixtures rather than an
+# authoritative external artifact. Every other evidence source is treated as
+# authoritative and must carry the shared identity at graph boundaries.
+INTERNAL_OR_GENERATED_EVIDENCE_SOURCES = frozenset(
+    {"fixture", "openlore", "pr-code-candidate-extraction", "repo-index", "review"}
+)
+
+
+def evidence_requires_source_artifact_identity(evidence: Evidence) -> bool:
+    """Return whether evidence represents an authoritative external artifact."""
+
+    return evidence.source not in INTERNAL_OR_GENERATED_EVIDENCE_SOURCES
+
+
+def source_artifact_identity_error(evidence: Evidence) -> str | None:
+    """Return the deterministic identity-boundary failure for evidence, if any."""
+
+    locator = evidence.locator
+    if isinstance(locator, SourceArtifactLocator):
+        expected_id = stable_id("evidence", locator.source_artifact_identity.id)
+    elif isinstance(locator, OpenSpecLocator) and locator.source_artifact_identity is not None:
+        # OpenSpecLocator validates that the embedded identity agrees with its
+        # artifact type and repository-relative navigation path.
+        expected_id = stable_id(
+            "evidence", locator.source_artifact_identity.id, locator.openspec_identity
+        )
+    else:
+        if evidence_requires_source_artifact_identity(evidence):
+            return "authoritative external evidence lacks a complete explicit source-artifact identity"
+        return None
+    if evidence.id != expected_id:
+        return "evidence ID does not match its derived source-artifact identity"
+    return None
 
 
 @dataclass(frozen=True)
@@ -357,8 +596,14 @@ class GraphSnapshot:
     cross_graph_link_claims: tuple[CrossGraphLinkClaim, ...] = ()
     cross_graph_link_evidence: tuple[CrossGraphLinkEvidence, ...] = ()
     cross_graph_link_lifecycle: tuple[CrossGraphLinkLifecycle, ...] = ()
+    # Legacy persistence decoding explicitly opts in before guarded migration.
+    allow_legacy_evidence: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if not self.allow_legacy_evidence:
+            for item in self.evidence:
+                if error := source_artifact_identity_error(item):
+                    raise ValueError(f"invalid-source-artifact-identity: {error}: {item.id}")
         object.__setattr__(self, "cross_graph_link_claims", tuple(sorted(self.cross_graph_link_claims, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_evidence", tuple(sorted(self.cross_graph_link_evidence, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_lifecycle", tuple(sorted(self.cross_graph_link_lifecycle, key=lambda item: (item.claim_id, item.revision))))
@@ -433,6 +678,9 @@ class GraphSnapshot:
         nodes = _merge_records(self.nodes, other.nodes)
         edges = _merge_records(self.edges, other.edges)
         evidence = _merge_records(self.evidence, other.evidence)
+        for item in evidence:
+            if error := source_artifact_identity_error(item):
+                raise ValueError(f"invalid-source-artifact-identity: {error}: {item.id}")
         claims = _merge_records(self.cross_graph_link_claims, other.cross_graph_link_claims)
         observations = _merge_records(self.cross_graph_link_evidence, other.cross_graph_link_evidence)
         lifecycle = _merge_records(self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle)

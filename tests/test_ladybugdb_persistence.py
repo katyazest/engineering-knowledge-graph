@@ -23,6 +23,9 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    OpenSpecLocator,
+    SourceArtifactIdentity,
+    SourceArtifactLocator,
     stable_id,
 )
 from engineering_kg.persistence import (
@@ -48,15 +51,15 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store.write_snapshot(GraphSnapshot(nodes=(node("first"),), evidence=(Evidence("first", "openspec", "one"),)))
-            result = store.write_snapshot(GraphSnapshot(nodes=(node("second"),), evidence=(Evidence("second", "openspec", "two"),)))
+            store.write_snapshot(GraphSnapshot(nodes=(node("first"),), evidence=(Evidence("first", "fixture", "one"),)))
+            result = store.write_snapshot(GraphSnapshot(nodes=(node("second"),), evidence=(Evidence("second", "fixture", "two"),)))
         self.assertEqual(result.nodes[0].evidence_ids, ("first", "second"))
 
     def test_migrates_legacy_openspec_records_and_preserves_backup(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("spec-evidence",))
         legacy_requirement = Node("legacy-requirement", "openspec-requirement", "Payment is submitted", {"capability": "payments"}, ("requirement-evidence",))
         legacy_edge = Edge("legacy-edge", "openspec-spec-contains-requirement", legacy_spec.id, legacy_requirement.id, evidence_ids=("requirement-evidence",))
-        snapshot = GraphSnapshot((legacy_spec, legacy_requirement), (legacy_edge,), (Evidence("spec-evidence", "openspec", "spec.md"), Evidence("requirement-evidence", "openspec", "spec.md")))
+        snapshot = GraphSnapshot((legacy_spec, legacy_requirement), (legacy_edge,), (Evidence("spec-evidence", "fixture", "spec.md"), Evidence("requirement-evidence", "fixture", "spec.md")))
         migrated = migrate_graph_snapshot(snapshot)
         self.assertTrue(migrated.migrated)
         self.assertEqual({node.kind for node in migrated.snapshot.nodes}, {NodeKind.SPECIFICATION, NodeKind.REQUIREMENT})
@@ -66,16 +69,180 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             self.assertEqual(store.read_snapshot().node_count, 2)
             self.assertTrue((store.path / MIGRATION_BACKUP_FILE_NAME).is_file())
 
+    def test_migrates_sufficient_legacy_openspec_evidence_and_rewrites_references(self) -> None:
+        node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=("legacy-evidence",))
+        legacy = Evidence(
+            "legacy-evidence", "openspec",
+            OpenSpecLocator("openspec/changes/change/proposal.md", "openspec-artifact", "active-change:change"),
+            {"source_artifact_identity": {
+                "source_type": "openspec", "source_identity": "requirements",
+                "artifact_type": "openspec-artifact", "revision_or_version": "a" * 40,
+                "stable_locator": "openspec/changes/change/proposal.md",
+            }},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({"node_order": [node.id], "nodes": {node.id: node.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": [legacy.id], "evidence": {legacy.id: legacy.as_dict()}})
+            result = store.migrate_persisted_snapshot()
+        self.assertTrue(result.migrated)
+        self.assertEqual(result.snapshot.nodes[0].id, node.id)
+        self.assertNotEqual(result.snapshot.nodes[0].evidence_ids, node.evidence_ids)
+        self.assertIsNotNone(result.snapshot.evidence[0].locator.source_artifact_identity)
+
+    def test_migrates_sufficient_legacy_non_openspec_authoritative_evidence(self) -> None:
+        identity_fields = {
+            "source_type": "bitbucket", "source_identity": "payments",
+            "artifact_type": "pull-request", "revision_or_version": "abc123",
+            "stable_locator": "pull-requests/7",
+        }
+        node = Node("canonical-node", NodeKind.REPOSITORY, "payments", evidence_ids=("legacy",))
+        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=("legacy",))
+        legacy = Evidence("legacy", "bitbucket", "legacy-pr-7", {
+            "source_artifact_identity": identity_fields,
+        })
+
+        migrated = migrate_graph_snapshot(
+            GraphSnapshot((node,), (edge,), (legacy,), allow_legacy_evidence=True)
+        ).snapshot
+
+        identity = SourceArtifactIdentity(**identity_fields)
+        evidence = migrated.evidence[0]
+        self.assertEqual(evidence.id, stable_id("evidence", identity.id))
+        self.assertEqual(evidence.locator, SourceArtifactLocator(identity))
+        self.assertEqual(migrated.nodes[0].id, node.id)
+        self.assertEqual(migrated.edges[0].id, edge.id)
+        self.assertEqual(migrated.nodes[0].evidence_ids, (evidence.id,))
+        self.assertEqual(migrated.edges[0].evidence_ids, (evidence.id,))
+
+    def test_coalesces_equivalent_legacy_evidence_with_the_same_migrated_id(self) -> None:
+        identity_fields = {
+            "source_type": "openspec", "source_identity": "requirements",
+            "artifact_type": "openspec-artifact", "revision_or_version": "a" * 40,
+            "stable_locator": "openspec/changes/change/proposal.md",
+        }
+        first = Evidence(
+            "legacy-first", "openspec",
+            OpenSpecLocator("openspec/changes/change/proposal.md", "openspec-artifact", "active-change:change"),
+            {"source_artifact_identity": identity_fields},
+        )
+        second = Evidence(
+            "legacy-second", "openspec",
+            OpenSpecLocator("openspec/changes/change/proposal.md", "openspec-artifact", "active-change:change"),
+            {"source_artifact_identity": identity_fields},
+        )
+        node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=(first.id, second.id))
+        edge = Edge("edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=(second.id, first.id))
+
+        migrated = migrate_graph_snapshot(
+            GraphSnapshot((node,), (edge,), (second, first), allow_legacy_evidence=True)
+        ).snapshot
+        reverse_migrated = migrate_graph_snapshot(
+            GraphSnapshot((node,), (edge,), (first, second), allow_legacy_evidence=True)
+        ).snapshot
+
+        self.assertEqual(migrated.evidence_count, 1)
+        migrated_evidence_id = migrated.evidence[0].id
+        self.assertEqual(migrated.nodes[0].evidence_ids, (migrated_evidence_id,))
+        self.assertEqual(migrated.edges[0].evidence_ids, (migrated_evidence_id,))
+        self.assertEqual(migrated.as_json(), reverse_migrated.as_json())
+
+    def test_rejects_ambiguous_legacy_openspec_evidence_without_path_inference(self) -> None:
+        snapshot = GraphSnapshot(evidence=(
+            Evidence("legacy", "openspec", OpenSpecLocator("/tmp/spec.md", "openspec-spec", "durable:payments")),
+        ), allow_legacy_evidence=True)
+        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-source-artifact-identity"):
+            migrate_graph_snapshot(snapshot)
+
+    def test_readback_rejects_openspec_locator_identity_disagreement(self) -> None:
+        identity = SourceArtifactIdentity(
+            "openspec", "requirements", "openspec-spec", "a" * 40,
+            "openspec/specs/payments/spec.md",
+        )
+        raw_evidence = {
+            "id": stable_id("evidence", identity.id, "durable:payments"),
+            "source": "openspec",
+            "locator": {
+                "artifact_type": "openspec-change",
+                "openspec_identity": "durable:payments",
+                "relative_file_path": identity.stable_locator,
+                "source_artifact_identity": identity.as_dict(),
+            },
+            "properties": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({
+                "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
+                "evidence_order": [raw_evidence["id"]],
+                "evidence": {raw_evidence["id"]: raw_evidence},
+            })
+            with self.assertRaisesRegex(PersistenceIntegrityError, "artifact_type does not match"):
+                store.read_snapshot()
+
+    def test_readback_rejects_unknown_or_payload_fields_in_openspec_locator_mappings(self) -> None:
+        identity = SourceArtifactIdentity(
+            "openspec", "requirements", "openspec-spec", "a" * 40,
+            "openspec/specs/payments/spec.md",
+        )
+        evidence = Evidence(
+            stable_id("evidence", identity.id, "durable:payments"), "openspec",
+            OpenSpecLocator(
+                identity.stable_locator, identity.artifact_type, "durable:payments",
+                source_artifact_identity=identity,
+            ),
+        )
+        for mapping_name, field in (
+            ("locator", "content"),
+            ("locator", "provider_payload"),
+            ("source_artifact_identity", "content"),
+            ("source_artifact_identity", "provider_payload"),
+        ):
+            raw_evidence = evidence.as_dict()
+            target = raw_evidence["locator"]
+            if mapping_name == "source_artifact_identity":
+                target = target[mapping_name]
+            target[field] = "unretained source body"
+            with self.subTest(mapping=mapping_name, field=field), tempfile.TemporaryDirectory() as tmp:
+                store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+                store._write_raw({
+                    "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
+                    "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
+                })
+                with self.assertRaisesRegex(
+                    PersistenceIntegrityError,
+                    f"{mapping_name if mapping_name == 'locator' else f'locator.{mapping_name}'}\\.{field} is not allowed",
+                ):
+                    store.read_snapshot()
+
     def test_migration_rewrites_derived_traceability_input_ids_and_is_idempotent(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("e",))
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change")
         assertion = Edge("legacy-assertion", "openspec-change-touches-spec", change.id, legacy_spec.id, evidence_ids=("e",))
         trace = Edge("legacy-trace", "openspec-change-traces-to-spec", change.id, legacy_spec.id, {"derived": True, "input_edge_ids": (assertion.id,), "rule_id": "openspec-change-to-durable-spec"}, ("e",))
-        migrated = migrate_graph_snapshot(GraphSnapshot((change, legacy_spec), (assertion, trace), (Evidence("e", "openspec", "fixture"),)))
+        migrated = migrate_graph_snapshot(GraphSnapshot((change, legacy_spec), (assertion, trace), (Evidence("e", "fixture", "fixture"),)))
         migrated_assertion = next(edge for edge in migrated.snapshot.edges if edge.kind == EdgeKind.ASSERTS)
         migrated_trace = next(edge for edge in migrated.snapshot.edges if edge.kind == EdgeKind.TRACES_TO)
         self.assertEqual(migrated_trace.properties["input_edge_ids"], (migrated_assertion.id,))
         self.assertFalse(migrate_graph_snapshot(migrated.snapshot).migrated)
+
+    def test_legacy_evidence_migration_preserves_canonical_node_and_edge_ids(self) -> None:
+        identity_fields = {
+            "source_type": "openspec", "source_identity": "requirements",
+            "artifact_type": "openspec-spec", "revision_or_version": "a" * 40,
+            "stable_locator": "openspec/specs/payments/spec.md",
+        }
+        node = Node("canonical-node", NodeKind.REPOSITORY, "requirements", evidence_ids=("legacy",))
+        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=("legacy",))
+        legacy = Evidence(
+            "legacy", "openspec",
+            OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-spec", "durable:payments"),
+            {"source_artifact_identity": identity_fields},
+        )
+        migrated = migrate_graph_snapshot(
+            GraphSnapshot((node,), (edge,), (legacy,), allow_legacy_evidence=True)
+        ).snapshot
+        self.assertEqual(migrated.nodes[0].id, node.id)
+        self.assertEqual(migrated.edges[0].id, edge.id)
 
     def test_migrated_legacy_graph_matches_clean_canonical_rebuild(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("spec-evidence",))
@@ -90,7 +257,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 Edge("legacy-contains-scenario", "openspec-requirement-contains-scenario", legacy_requirement.id, legacy_scenario.id, evidence_ids=("scenario-evidence",)),
                 legacy_assertion,
             ),
-            tuple(Evidence(item, "openspec", "fixture") for item in ("spec-evidence", "requirement-evidence", "scenario-evidence", "change-evidence")),
+            tuple(Evidence(item, "fixture", "fixture") for item in ("spec-evidence", "requirement-evidence", "scenario-evidence", "change-evidence")),
         )
         migrated = migrate_graph_snapshot(legacy_graph).snapshot
         specification = next(node for node in migrated.nodes if node.kind == NodeKind.SPECIFICATION)
@@ -121,7 +288,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("e",))
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"node_order": [legacy_spec.id], "nodes": {legacy_spec.id: legacy_spec.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": ["e"], "evidence": {"e": Evidence("e", "openspec", "fixture").as_dict()}})
+            store._write_raw({"node_order": [legacy_spec.id], "nodes": {legacy_spec.id: legacy_spec.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": ["e"], "evidence": {"e": Evidence("e", "fixture", "fixture").as_dict()}})
             original = store._graph_file.read_text(encoding="utf-8")
             with mock.patch("engineering_kg.persistence.os.replace", side_effect=OSError("disk full")):
                 with self.assertRaises(PersistenceWriteError):
@@ -142,7 +309,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         snapshot = GraphSnapshot(
             (legacy_spec, repository),
             (assertion,),
-            (Evidence("e", "openspec", "fixture"),),
+            (Evidence("e", "fixture", "fixture"),),
         )
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
@@ -221,9 +388,13 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 ),
             ),
             Evidence(
-                id=stable_id("evidence", "confluence", "123456789"),
+                id=stable_id("evidence", SourceArtifactIdentity(
+                    "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+                ).id),
                 source="confluence",
-                locator=ConfluencePageRef(page_id="123456789"),
+                locator=SourceArtifactLocator(SourceArtifactIdentity(
+                    "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+                )),
             ),
         )
         graph = GraphSnapshot(nodes=(node,), edges=(edge,), evidence=evidence)
@@ -250,6 +421,68 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             with self.assertRaises(PersistenceIntegrityError):
                 store.write_snapshot(graph)
 
+    def test_persistence_readback_rejects_source_evidence_body_metadata(self) -> None:
+        identity = SourceArtifactIdentity(
+            "bitbucket", "payments", "pull-request", "abc", "pull-requests/7"
+        )
+        evidence = Evidence(
+            stable_id("evidence", identity.id), "bitbucket", SourceArtifactLocator(identity)
+        )
+        raw_evidence = evidence.as_dict()
+        raw_evidence["properties"] = {"provider_payload": "full provider response body"}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({
+                "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
+                "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
+            })
+            with self.assertRaisesRegex(PersistenceIntegrityError, "invalid-source-artifact-identity"):
+                store.read_snapshot()
+
+    def test_persistence_readback_rejects_payload_body_and_content_identity_values(self) -> None:
+        identity = SourceArtifactIdentity(
+            "bitbucket", "payments", "pull-request", "abc", "pull-requests/7"
+        )
+        evidence = Evidence(
+            stable_id("evidence", identity.id), "bitbucket", SourceArtifactLocator(identity)
+        )
+        for unsafe_value in ("provider payload", "full source body", "artifact content"):
+            for field in (
+                "source_type", "source_identity", "artifact_type", "revision_or_version", "stable_locator"
+            ):
+                raw_evidence = evidence.as_dict()
+                raw_evidence["locator"]["source_artifact_identity"][field] = unsafe_value
+                with self.subTest(field=field, value=unsafe_value), tempfile.TemporaryDirectory() as tmp:
+                    store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+                    store._write_raw({
+                        "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
+                        "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
+                    })
+                    with self.assertRaisesRegex(
+                        PersistenceIntegrityError, f"{field} contains unsafe content"
+                    ):
+                        store.read_snapshot()
+
+    def test_persistence_coalesces_equivalent_external_evidence_and_rejects_identityless_external_evidence(self) -> None:
+        identity = SourceArtifactIdentity("bitbucket", "payments", "pull-request", "abc", "pull-requests/7")
+        evidence = Evidence(stable_id("evidence", identity.id), "bitbucket", SourceArtifactLocator(identity))
+        conflicting = Evidence(
+            evidence.id, "bitbucket", SourceArtifactLocator(identity, {"pull_request_id": "other"})
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            first = store.write_snapshot(GraphSnapshot(evidence=(evidence,)))
+            second = store.write_snapshot(GraphSnapshot(evidence=(evidence,)))
+            self.assertEqual(second.as_dict(), first.as_dict())
+            with self.assertRaisesRegex(ValueError, "explicit source-artifact identity"):
+                store.write_snapshot(GraphSnapshot(evidence=(Evidence("external", "confluence", "123"),)))
+        for first, second in ((evidence, conflicting), (conflicting, evidence)):
+            with tempfile.TemporaryDirectory() as tmp:
+                store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+                store.write_snapshot(GraphSnapshot(evidence=(first,)))
+                with self.assertRaisesRegex(PersistenceIntegrityError, "Conflicting graph record values"):
+                    store.write_snapshot(GraphSnapshot(evidence=(second,)))
+
     def test_persisted_readback_excludes_code_and_external_payloads(self) -> None:
         graph = GraphSnapshot(
             evidence=(
@@ -264,9 +497,13 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                     ),
                 ),
                 Evidence(
-                    id=stable_id("evidence", "confluence", "123456789"),
+                    id=stable_id("evidence", SourceArtifactIdentity(
+                        "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+                    ).id),
                     source="confluence",
-                    locator=ConfluencePageRef(page_id="123456789"),
+                    locator=SourceArtifactLocator(SourceArtifactIdentity(
+                        "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+                    )),
                 ),
             )
         )
