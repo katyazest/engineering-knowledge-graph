@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from engineering_kg.ingest.source_artifact import normalize_source_artifact
 from engineering_kg.ontology import (
-    Evidence, GraphSnapshot, OpenSpecLocator, SourceArtifactIdentity, SourceArtifactLocator, stable_id,
+    Evidence, GraphSnapshot, OpenSpecLocator, ProvenanceRecord, SourceArtifactIdentity, SourceArtifactLocator, stable_id,
 )
 
 
@@ -121,10 +121,11 @@ class SourceArtifactIdentityTest(unittest.TestCase):
 
     def test_graph_merge_exercises_equivalent_distinct_and_conflicting_identity_cases(self) -> None:
         base = SourceArtifactIdentity(**self.fields)
-        equivalent = Evidence(stable_id("evidence", base.id), "openspec", SourceArtifactLocator(base))
+        provenance = _external_provenance(base)
+        equivalent = Evidence(stable_id("evidence", base.id), "openspec", SourceArtifactLocator(base), provenance_ids=(provenance.id,))
         self.assertEqual(
-            GraphSnapshot(evidence=(equivalent,)).merged_with(
-                GraphSnapshot(evidence=(equivalent,))
+            GraphSnapshot(evidence=(equivalent,), provenance=(provenance,)).merged_with(
+                GraphSnapshot(evidence=(equivalent,), provenance=(provenance,))
             ).evidence_count,
             1,
         )
@@ -138,21 +139,22 @@ class SourceArtifactIdentityTest(unittest.TestCase):
             fields = dict(self.fields)
             fields[field] = replacement
             distinct = SourceArtifactIdentity(**fields)
+            distinct_provenance = _external_provenance(distinct)
             record = Evidence(
-                stable_id("evidence", distinct.id), "openspec", SourceArtifactLocator(distinct)
+                stable_id("evidence", distinct.id), "openspec", SourceArtifactLocator(distinct), provenance_ids=(distinct_provenance.id,)
             )
             self.assertEqual(
-                GraphSnapshot(evidence=(equivalent,)).merged_with(
-                    GraphSnapshot(evidence=(record,))
+                GraphSnapshot(evidence=(equivalent,), provenance=(provenance,)).merged_with(
+                    GraphSnapshot(evidence=(record,), provenance=(distinct_provenance,))
                 ).evidence_count,
                 2,
             )
         conflicting = Evidence(
-            equivalent.id, "openspec", SourceArtifactLocator(base, {"section": "other"})
+            equivalent.id, "openspec", SourceArtifactLocator(base, {"section": "other"}), provenance_ids=(provenance.id,)
         )
         for first, second in ((equivalent, conflicting), (conflicting, equivalent)):
             with self.assertRaisesRegex(ValueError, "Conflicting graph record values"):
-                GraphSnapshot(evidence=(first,)).merged_with(GraphSnapshot(evidence=(second,)))
+                GraphSnapshot(evidence=(first,), provenance=(provenance,)).merged_with(GraphSnapshot(evidence=(second,), provenance=(provenance,)))
 
     def test_graph_merge_rejects_an_arbitrary_id_for_identity_evidence(self) -> None:
         identity = SourceArtifactIdentity(**self.fields)
@@ -180,3 +182,10 @@ class SourceArtifactIdentityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _external_provenance(identity: SourceArtifactIdentity) -> ProvenanceRecord:
+    return ProvenanceRecord(
+        "external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64,
+        "test-extractor", "1", identity,
+    )

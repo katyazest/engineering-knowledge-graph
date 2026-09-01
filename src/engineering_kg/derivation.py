@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import json
 from typing import Any
 
-from engineering_kg.ontology import Edge, EdgeKind, GraphSnapshot, Node, NodeKind, stable_id
+from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceKind, ProvenanceRecord, stable_id
 
 
 OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE = "openspec-change-to-durable-spec"
@@ -74,6 +76,10 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
     derived_edges: list[Edge] = []
     diagnostics: list[GraphDerivationDiagnostic] = []
     evidence_ids = {item.id for item in snapshot.evidence}
+    evidence_by_id = {item.id: item for item in snapshot.evidence}
+    provenance_ids = {item.id for item in snapshot.provenance}
+    derived_evidence: list[Evidence] = []
+    derived_provenance: list[ProvenanceRecord] = []
     seen_inputs: set[str] = set()
 
     for edge in sorted(snapshot.edges, key=lambda item: item.id):
@@ -127,6 +133,32 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
                 )
             )
             continue
+        input_provenance_ids = tuple(sorted({
+            provenance_id for evidence_id in edge.evidence_ids
+            for provenance_id in evidence_by_id[evidence_id].provenance_ids
+        }))
+        if not input_provenance_ids or any(item not in provenance_ids for item in input_provenance_ids):
+            diagnostics.append(GraphDerivationDiagnostic(
+                OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE, edge.id,
+                "Cannot derive OpenSpec traceability because asserted provenance is missing.", "warning",
+            ))
+            continue
+        input_representation = json.dumps(
+            {"input_edge_id": edge.id, "input_provenance_ids": input_provenance_ids},
+            sort_keys=True, separators=(",", ":"),
+        )
+        provenance = ProvenanceRecord(
+            ProvenanceKind.DERIVED,
+            max(item.observed_at for item in snapshot.provenance if item.id in input_provenance_ids), "sha256",
+            hashlib.sha256(input_representation.encode()).hexdigest(), "engineering-kg-derivation",
+            "1", None, OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE, input_provenance_ids,
+        )
+        provenance_evidence = Evidence(
+            stable_id("evidence", provenance.id), "fixture", f"derivation:{provenance.id}",
+            provenance_ids=(provenance.id,),
+        )
+        derived_provenance.append(provenance)
+        derived_evidence.append(provenance_evidence)
         derived_edges.append(
             Edge(
                 id=stable_id(
@@ -145,11 +177,18 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
                     "input_edge_ids": (edge.id,),
                     "rule_id": OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE,
                 },
-                evidence_ids=edge.evidence_ids,
+                evidence_ids=(provenance_evidence.id,),
             )
         )
 
-    derived_graph = GraphSnapshot(edges=tuple(sorted(derived_edges, key=lambda item: item.id)))
+    derived_graph = GraphSnapshot(
+        edges=tuple(sorted(derived_edges, key=lambda item: item.id)),
+        evidence=tuple(sorted(derived_evidence, key=lambda item: item.id)),
+        # Admission validates derived input references before a graph can be
+        # emitted. Retain the already-admitted inputs in this intermediate
+        # snapshot; merge coalesces them with the source snapshot below.
+        provenance=tuple(sorted((*snapshot.provenance, *derived_provenance), key=lambda item: item.id)),
+    )
     graph = snapshot.merged_with(derived_graph)
     diagnostics_tuple = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     metadata = GraphDerivationMetadata(

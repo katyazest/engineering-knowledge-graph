@@ -1,9 +1,7 @@
 ## Purpose
 
 The `graph-derivation` capability defines deterministic local derivation of Engineering KG relationships from canonical graph snapshots.
-
 ## Requirements
-
 ### Requirement: Graph derivation runs from canonical graph snapshots
 The system SHALL derive Engineering KG relationships from an existing canonical `GraphSnapshot` without reading source repositories, OpenLore indexes, OpenSpec files, external systems, generated documentation, or LadybugDB-native records directly.
 
@@ -67,3 +65,11 @@ The system SHALL return deterministic graph derivation metadata with status, der
 - **WHEN** graph derivation metadata is serialized
 - **THEN** the metadata includes derivation status, rule counts, derived edge counts, skipped input counts, unresolved input counts, and graph counts
 - **THEN** the metadata excludes full requirement bodies, full markdown artifact bodies, source code, OpenLore analysis details, generated graph records, credentials, tokens, and external API payloads
+
+### Requirement: Derived relationships preserve complete derivation provenance
+The system SHALL associate every derived relationship with first-class derived provenance that identifies the explicit derivation rule and the provenance identifiers of all admitted asserted/derived inputs used by that result. It SHALL not derive, omit, or rewrite an input's external observation metadata, and it SHALL reject derived output whose referenced input provenance is absent.
+
+#### Scenario: Traceability derivation retains its provenance chain
+- **WHEN** the OpenSpec change-to-specification derivation produces a traceability edge from evidenced asserted input
+- **THEN** the derived edge retains the rule identity and referenced input provenance identifiers
+- **THEN** the input evidence's source identity, revision, observation time, hash, and extractor metadata remain available through those references

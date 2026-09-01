@@ -26,8 +26,10 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     OpenSpecLocator,
+    ProvenanceRecord,
     SourceArtifactIdentity,
     SourceArtifactLocator,
+    ProvenanceKind,
     evidence_requires_source_artifact_identity,
     source_artifact_identity_error,
     EdgeKind,
@@ -338,6 +340,7 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
             cross_graph_link_claims=snapshot.cross_graph_link_claims,
             cross_graph_link_evidence=snapshot.cross_graph_link_evidence,
             cross_graph_link_lifecycle=snapshot.cross_graph_link_lifecycle,
+            provenance=snapshot.provenance,
         )
         migrated = GraphSnapshot().merged_with(migrated)
     except ValueError as exc:
@@ -357,6 +360,7 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, in
 
     evidence_ids: dict[str, str] = {}
     evidence_by_id: dict[str, Evidence] = {}
+    provenance: list[ProvenanceRecord] = list(snapshot.provenance)
     migrated = 0
     for item in snapshot.evidence:
         locator = item.locator
@@ -403,8 +407,24 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, in
         evidence_ids[item.id] = new_id
         properties = dict(item.properties)
         properties.pop("source_artifact_identity")
+        provenance_fields = properties.pop("provenance", None)
+        if not isinstance(provenance_fields, dict):
+            raise PersistenceIntegrityError("legacy-provenance: authoritative evidence lacks complete retained provenance fields")
+        try:
+            record = ProvenanceRecord(
+                ProvenanceKind.EXTERNAL,
+                _expect_string(provenance_fields.get("observed_at"), "legacy provenance.observed_at"),
+                _expect_string(provenance_fields.get("content_hash_algorithm"), "legacy provenance.content_hash_algorithm"),
+                _expect_string(provenance_fields.get("content_hash"), "legacy provenance.content_hash"),
+                _expect_string(provenance_fields.get("extractor_id"), "legacy provenance.extractor_id"),
+                _expect_string(provenance_fields.get("extractor_version"), "legacy provenance.extractor_version"),
+                identity,
+            )
+        except (PersistenceIntegrityError, ValueError) as exc:
+            raise PersistenceIntegrityError("legacy-provenance: authoritative evidence lacks complete retained provenance fields") from exc
+        provenance.append(record)
         _coalesce_migrated_evidence(evidence_by_id, Evidence(
-            new_id, item.source, migrated_locator, properties,
+            new_id, item.source, migrated_locator, properties, (record.id,),
         ))
         migrated += 1
     if not migrated:
@@ -424,6 +444,7 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, in
             item.claim_id, item.revision, item.state,
             evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
         ) for item in snapshot.cross_graph_link_lifecycle),
+        provenance=tuple(sorted({item.id: item for item in provenance}.values(), key=lambda item: item.id)),
     ), migrated
 
 
@@ -536,6 +557,8 @@ def _empty_graph_data() -> dict[str, dict[str, Any]]:
         "edges": {},
         "evidence": {},
         "evidence_order": [],
+        "provenance": {},
+        "provenance_order": [],
         "cross_graph_link_claims": {},
         "cross_graph_link_claim_order": [],
         "cross_graph_link_evidence": {},
@@ -557,6 +580,8 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
         "edges": {},
         "evidence": {},
         "evidence_order": [],
+        "provenance": {},
+        "provenance_order": [],
         "cross_graph_link_claims": {},
         "cross_graph_link_claim_order": [],
         "cross_graph_link_evidence": {},
@@ -576,6 +601,9 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
     for evidence in merged_snapshot.evidence:
         merged["evidence"][evidence.id] = evidence.as_dict()
         merged["evidence_order"].append(evidence.id)
+    for provenance in merged_snapshot.provenance:
+        merged["provenance"][provenance.id] = provenance.as_dict()
+        merged["provenance_order"].append(provenance.id)
     for claim in merged_snapshot.cross_graph_link_claims:
         merged["cross_graph_link_claims"][claim.id] = claim.as_dict()
         merged["cross_graph_link_claim_order"].append(claim.id)
@@ -611,6 +639,13 @@ def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = Fals
             _expect_string_tuple(data.get("evidence_order", []), "evidence_order"),
         )
     )
+    provenance = tuple(
+        _provenance_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("provenance", {}), "provenance"),
+            _expect_string_tuple(data.get("provenance_order", []), "provenance_order"),
+        )
+    )
     claims = tuple(
         _cross_graph_link_claim_from_dict(item)
         for item in _ordered_records(
@@ -633,7 +668,7 @@ def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = Fals
         )
     )
     snapshot = GraphSnapshot(
-        nodes, edges, evidence, claims, observations, lifecycle,
+        nodes, edges, evidence, claims, observations, lifecycle, provenance,
         allow_legacy_evidence=allow_legacy_evidence,
     )
     if not allow_legacy_evidence:
@@ -687,6 +722,7 @@ def _evidence_from_dict(data: dict[str, Any], allow_legacy_evidence: bool = Fals
             source=_expect_string(data.get("source"), "evidence.source"),
             locator=_locator_from_value(data.get("locator")),
             properties=dict(_expect_mapping(data.get("properties", {}), "evidence.properties")),
+            provenance_ids=tuple(_expect_string_tuple(data.get("provenance_ids", []), "evidence.provenance_ids")),
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -694,6 +730,28 @@ def _evidence_from_dict(data: dict[str, Any], allow_legacy_evidence: bool = Fals
         raise PersistenceIntegrityError(
             f"invalid-source-artifact-identity: {error}"
         )
+    return record
+
+
+def _provenance_from_dict(data: dict[str, Any]) -> ProvenanceRecord:
+    allowed = {"id", "kind", "observed_at", "content_hash_algorithm", "content_hash", "extractor_id", "extractor_version", "source_artifact_identity", "derivation_rule_id", "input_provenance_ids"}
+    _expect_allowed_locator_keys(set(data), allowed, "provenance")
+    identity_data = data.get("source_artifact_identity")
+    try:
+        record = ProvenanceRecord(
+            _expect_string(data.get("kind"), "provenance.kind"),
+            _expect_string(data.get("observed_at"), "provenance.observed_at"),
+            _expect_string(data.get("content_hash_algorithm"), "provenance.content_hash_algorithm"),
+            _expect_string(data.get("content_hash"), "provenance.content_hash"),
+            _expect_string(data.get("extractor_id"), "provenance.extractor_id"),
+            _expect_string(data.get("extractor_version"), "provenance.extractor_version"),
+            _source_artifact_identity_from_mapping(identity_data) if identity_data is not None else None,
+            _expect_optional_string(data.get("derivation_rule_id"), "provenance.derivation_rule_id"),
+            tuple(_expect_string_tuple(data.get("input_provenance_ids", []), "provenance.input_provenance_ids")),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "provenance")
     return record
 
 
@@ -831,11 +889,7 @@ def _expect_allowed_locator_keys(
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
     _reject_forbidden_fields(snapshot.as_dict())
     validation = validate_graph_integrity(snapshot)
-    errors = [
-        item for item in validation.metadata.diagnostics
-        if item.severity == "error"
-        and (item.rule_id.startswith("cross-graph-") or item.rule_id.startswith("source-artifact-"))
-    ]
+    errors = [item for item in validation.metadata.diagnostics if item.severity == "error"]
     if errors:
         raise PersistenceIntegrityError(errors[0].message)
 

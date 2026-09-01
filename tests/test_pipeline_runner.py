@@ -83,6 +83,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         change_set = MergedPrChangeSet(
             EngineeringChangePrAssociation("link-1", subject_id, "pr-1"), "pr-1", "payment-service", "a" * 40,
             (ChangedSymbolMapping("graphify:mapping-1", "src/payment.py", "resolved", "payments.submit"),),
+            observed_at="2026-09-01T12:00:00+00:00",
         )
         with tempfile.TemporaryDirectory() as temporary:
             registry = Path(temporary) / "registry.yaml"
@@ -105,6 +106,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             "payment-service",
             "a" * 40,
             (ChangedSymbolMapping("graphify:mapping-1", "src/payment.py", "resolved", "payments.submit"),),
+            observed_at="2026-09-01T12:00:00+00:00",
         )
         with tempfile.TemporaryDirectory() as temporary:
             registry = Path(temporary) / "registry.yaml"
@@ -137,6 +139,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             "payment-service",
             "a" * 40,
             (ChangedSymbolMapping("graphify:mapping-1", "src/payment.py", "resolved", "payments.submit"),),
+            observed_at="2026-09-01T12:00:00+00:00",
         )
         with tempfile.TemporaryDirectory() as temporary:
             registry = Path(temporary) / "registry.yaml"
@@ -168,6 +171,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             "payment-service",
             "a" * 40,
             (ChangedSymbolMapping("graphify:mapping-1", "src/payment.py", "resolved", "payments.submit"),),
+            observed_at="2026-09-01T12:00:00+00:00",
         )
         with tempfile.TemporaryDirectory() as temporary:
             registry = Path(temporary) / "registry.yaml"

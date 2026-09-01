@@ -1,9 +1,7 @@
 ## Purpose
 
 The `ladybugdb-persistence` capability defines the local adapter-compatible persistence boundary for canonical Engineering KG graph snapshots.
-
 ## Requirements
-
 ### Requirement: Local adapter-compatible LadybugDB store can be initialized
 The system SHALL provide a reusable local adapter-compatible LadybugDB persistence boundary that initializes an Engineering KG store at a configured local path without requiring network access, API keys, cloud services, OpenLore queries, Jira, Bitbucket, Confluence, external MCP servers, compilation, publishing, Docker, or generated documentation.
 
@@ -97,3 +95,14 @@ The system SHALL create a recoverable backup and atomically replace the persiste
 - **WHEN** an error occurs while writing a migrated graph
 - **THEN** persistence reports the write failure
 - **THEN** the prior graph file or its recoverable backup remains available for rollback
+
+### Requirement: Persistence preserves and safely migrates first-class provenance
+The system SHALL persist and read first-class provenance with deterministic serialization, association, ordering, and merge semantics. It SHALL retain no authoritative source content. For legacy persisted evidence, it SHALL migrate only when all required provenance fields can be recovered from retained authoritative metadata; otherwise it SHALL emit a deterministic compatibility diagnostic or integrity failure, preserve the prior store/backup, and SHALL NOT fabricate timestamps, hashes, extractor metadata, rules, or input provenance.
+
+#### Scenario: Complete legacy provenance migrates safely
+- **WHEN** persisted legacy evidence retains every required first-class provenance field
+- **THEN** persistence migrates it atomically, preserves canonical fact IDs, and returns deterministic payload-free readback
+
+#### Scenario: Incomplete legacy provenance fails safely
+- **WHEN** persisted legacy evidence lacks its observation time, content hash, extractor version, or required derivation information
+- **THEN** persistence reports deterministic compatibility/integrity failure and does not rewrite the graph as if provenance were complete

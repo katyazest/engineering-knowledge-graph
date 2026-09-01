@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from unittest import mock
@@ -24,6 +25,7 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     OpenSpecLocator,
+    ProvenanceRecord,
     SourceArtifactIdentity,
     SourceArtifactLocator,
     stable_id,
@@ -78,7 +80,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 "source_type": "openspec", "source_identity": "requirements",
                 "artifact_type": "openspec-artifact", "revision_or_version": "a" * 40,
                 "stable_locator": "openspec/changes/change/proposal.md",
-            }},
+            }, "provenance": _legacy_external_provenance()},
         )
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
@@ -99,6 +101,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=("legacy",))
         legacy = Evidence("legacy", "bitbucket", "legacy-pr-7", {
             "source_artifact_identity": identity_fields,
+            "provenance": _legacy_external_provenance(),
         })
 
         migrated = migrate_graph_snapshot(
@@ -114,6 +117,32 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         self.assertEqual(migrated.nodes[0].evidence_ids, (evidence.id,))
         self.assertEqual(migrated.edges[0].evidence_ids, (evidence.id,))
 
+    def test_complete_legacy_migration_retains_only_provenance_association_on_readback(self) -> None:
+        identity_fields = {
+            "source_type": "bitbucket", "source_identity": "payments",
+            "artifact_type": "pull-request", "revision_or_version": "abc123",
+            "stable_locator": "pull-requests/7",
+        }
+        legacy = Evidence("legacy", "bitbucket", "legacy-pr-7", {
+            "source_artifact_identity": identity_fields,
+            "provenance": _legacy_external_provenance(),
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({
+                "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
+                "evidence_order": [legacy.id], "evidence": {legacy.id: legacy.as_dict()},
+            })
+            readback = store.read_snapshot()
+            persisted = store._graph_file.read_text(encoding="utf-8")
+
+        self.assertEqual(readback.evidence[0].properties, {})
+        self.assertEqual(readback.evidence[0].provenance_ids, (readback.provenance[0].id,))
+        persisted_evidence = json.loads(persisted)["evidence"][readback.evidence[0].id]
+        self.assertEqual(persisted_evidence["properties"], {})
+        self.assertNotIn("provenance", persisted_evidence)
+        self.assertNotIn("legacy-pr-7", persisted)
+
     def test_coalesces_equivalent_legacy_evidence_with_the_same_migrated_id(self) -> None:
         identity_fields = {
             "source_type": "openspec", "source_identity": "requirements",
@@ -123,12 +152,12 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         first = Evidence(
             "legacy-first", "openspec",
             OpenSpecLocator("openspec/changes/change/proposal.md", "openspec-artifact", "active-change:change"),
-            {"source_artifact_identity": identity_fields},
+            {"source_artifact_identity": identity_fields, "provenance": _legacy_external_provenance()},
         )
         second = Evidence(
             "legacy-second", "openspec",
             OpenSpecLocator("openspec/changes/change/proposal.md", "openspec-artifact", "active-change:change"),
-            {"source_artifact_identity": identity_fields},
+            {"source_artifact_identity": identity_fields, "provenance": _legacy_external_provenance()},
         )
         node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=(first.id, second.id))
         edge = Edge("edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=(second.id, first.id))
@@ -152,6 +181,20 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         ), allow_legacy_evidence=True)
         with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-source-artifact-identity"):
             migrate_graph_snapshot(snapshot)
+
+    def test_rejects_legacy_evidence_without_retained_provenance(self) -> None:
+        identity_fields = {
+            "source_type": "openspec", "source_identity": "requirements",
+            "artifact_type": "openspec-spec", "revision_or_version": "a" * 40,
+            "stable_locator": "openspec/specs/payments/spec.md",
+        }
+        legacy = Evidence(
+            "legacy", "openspec",
+            OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-spec", "durable:payments"),
+            {"source_artifact_identity": identity_fields},
+        )
+        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-provenance"):
+            migrate_graph_snapshot(GraphSnapshot(evidence=(legacy,), allow_legacy_evidence=True))
 
     def test_readback_rejects_openspec_locator_identity_disagreement(self) -> None:
         identity = SourceArtifactIdentity(
@@ -236,7 +279,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         legacy = Evidence(
             "legacy", "openspec",
             OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-spec", "durable:payments"),
-            {"source_artifact_identity": identity_fields},
+            {"source_artifact_identity": identity_fields, "provenance": _legacy_external_provenance()},
         )
         migrated = migrate_graph_snapshot(
             GraphSnapshot((node,), (edge,), (legacy,), allow_legacy_evidence=True)
@@ -371,6 +414,10 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             source_id=node.id,
             target_id=node.id,
         )
+        confluence_identity = SourceArtifactIdentity(
+            "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+        )
+        confluence_provenance = _external_provenance(confluence_identity)
         evidence = (
             Evidence(
                 id=stable_id("evidence", "repo-index", "payment-service"),
@@ -388,16 +435,13 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 ),
             ),
             Evidence(
-                id=stable_id("evidence", SourceArtifactIdentity(
-                    "confluence", "engineering-wiki", "page", "123", "pages/123456789"
-                ).id),
+                id=stable_id("evidence", confluence_identity.id),
                 source="confluence",
-                locator=SourceArtifactLocator(SourceArtifactIdentity(
-                    "confluence", "engineering-wiki", "page", "123", "pages/123456789"
-                )),
+                locator=SourceArtifactLocator(confluence_identity),
+                provenance_ids=(confluence_provenance.id,),
             ),
         )
-        graph = GraphSnapshot(nodes=(node,), edges=(edge,), evidence=evidence)
+        graph = GraphSnapshot(nodes=(node,), edges=(edge,), evidence=evidence, provenance=(confluence_provenance,))
 
         with tempfile.TemporaryDirectory() as tmp:
             readback = initialize_ladybugdb_store(Path(tmp) / "ladybugdb").write_snapshot(graph)
@@ -465,25 +509,30 @@ class LadybugDbPersistenceTest(unittest.TestCase):
 
     def test_persistence_coalesces_equivalent_external_evidence_and_rejects_identityless_external_evidence(self) -> None:
         identity = SourceArtifactIdentity("bitbucket", "payments", "pull-request", "abc", "pull-requests/7")
-        evidence = Evidence(stable_id("evidence", identity.id), "bitbucket", SourceArtifactLocator(identity))
+        provenance = _external_provenance(identity)
+        evidence = Evidence(stable_id("evidence", identity.id), "bitbucket", SourceArtifactLocator(identity), provenance_ids=(provenance.id,))
         conflicting = Evidence(
-            evidence.id, "bitbucket", SourceArtifactLocator(identity, {"pull_request_id": "other"})
+            evidence.id, "bitbucket", SourceArtifactLocator(identity, {"pull_request_id": "other"}), provenance_ids=(provenance.id,)
         )
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            first = store.write_snapshot(GraphSnapshot(evidence=(evidence,)))
-            second = store.write_snapshot(GraphSnapshot(evidence=(evidence,)))
+            first = store.write_snapshot(GraphSnapshot(evidence=(evidence,), provenance=(provenance,)))
+            second = store.write_snapshot(GraphSnapshot(evidence=(evidence,), provenance=(provenance,)))
             self.assertEqual(second.as_dict(), first.as_dict())
             with self.assertRaisesRegex(ValueError, "explicit source-artifact identity"):
                 store.write_snapshot(GraphSnapshot(evidence=(Evidence("external", "confluence", "123"),)))
         for first, second in ((evidence, conflicting), (conflicting, evidence)):
             with tempfile.TemporaryDirectory() as tmp:
                 store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-                store.write_snapshot(GraphSnapshot(evidence=(first,)))
+                store.write_snapshot(GraphSnapshot(evidence=(first,), provenance=(provenance,)))
                 with self.assertRaisesRegex(PersistenceIntegrityError, "Conflicting graph record values"):
-                    store.write_snapshot(GraphSnapshot(evidence=(second,)))
+                    store.write_snapshot(GraphSnapshot(evidence=(second,), provenance=(provenance,)))
 
     def test_persisted_readback_excludes_code_and_external_payloads(self) -> None:
+        confluence_identity = SourceArtifactIdentity(
+            "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+        )
+        confluence_provenance = _external_provenance(confluence_identity)
         graph = GraphSnapshot(
             evidence=(
                 Evidence(
@@ -497,15 +546,12 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                     ),
                 ),
                 Evidence(
-                    id=stable_id("evidence", SourceArtifactIdentity(
-                        "confluence", "engineering-wiki", "page", "123", "pages/123456789"
-                    ).id),
+                    id=stable_id("evidence", confluence_identity.id),
                     source="confluence",
-                    locator=SourceArtifactLocator(SourceArtifactIdentity(
-                        "confluence", "engineering-wiki", "page", "123", "pages/123456789"
-                    )),
+                    locator=SourceArtifactLocator(confluence_identity),
+                    provenance_ids=(confluence_provenance.id,),
                 ),
-            )
+            ), provenance=(confluence_provenance,)
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -536,3 +582,20 @@ class LadybugDbPersistenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _legacy_external_provenance() -> dict[str, str]:
+    return {
+        "observed_at": "2026-01-02T03:04:05+00:00",
+        "content_hash_algorithm": "sha256",
+        "content_hash": "a" * 64,
+        "extractor_id": "legacy-test-extractor",
+        "extractor_version": "1",
+    }
+
+
+def _external_provenance(identity: SourceArtifactIdentity) -> ProvenanceRecord:
+    return ProvenanceRecord(
+        "external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64,
+        "test-extractor", "1", identity,
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -40,6 +41,11 @@ class EdgeKind(StrEnum):
     OPENSPEC_CHANGE_HAS_ARTIFACT = "openspec-change-has-artifact"
     ASSERTS = "asserts"
     RELATED_TO = "related_to"
+
+
+class ProvenanceKind(StrEnum):
+    EXTERNAL = "external"
+    DERIVED = "derived"
 
 
 def stable_id(object_kind: str, *identity_parts: object) -> str:
@@ -220,6 +226,113 @@ class SourceArtifactIdentity:
             "source_type": self.source_type,
             "stable_locator": self.stable_locator,
         }
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROVENANCE_ID_RE = re.compile(r"^provenance:[0-9a-f]{16}$")
+
+
+@dataclass(frozen=True)
+class ProvenanceRecord:
+    """Immutable and payload-free provenance for an external or derived fact."""
+
+    kind: ProvenanceKind | str
+    observed_at: str
+    content_hash_algorithm: str
+    content_hash: str
+    extractor_id: str
+    extractor_version: str
+    source_artifact_identity: SourceArtifactIdentity | None = None
+    derivation_rule_id: str | None = None
+    input_provenance_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", ProvenanceKind(self.kind))
+        _validate_provenance_input_ids(self.input_provenance_ids)
+        object.__setattr__(self, "input_provenance_ids", tuple(sorted(set(self.input_provenance_ids))))
+        _validate_provenance_record(self)
+
+    @property
+    def id(self) -> str:
+        raw = json.dumps([
+            self.kind.value, self.source_artifact_identity.id if self.source_artifact_identity else "",
+            self.source_artifact_identity.revision_or_version if self.source_artifact_identity else "",
+            self.observed_at, self.content_hash_algorithm, self.content_hash,
+            self.extractor_id, self.extractor_version, self.derivation_rule_id or "", *self.input_provenance_ids,
+        ], ensure_ascii=False, separators=(",", ":"))
+        return f"provenance:{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "content_hash": self.content_hash, "content_hash_algorithm": self.content_hash_algorithm,
+            "extractor_id": self.extractor_id, "extractor_version": self.extractor_version,
+            "id": self.id, "input_provenance_ids": list(self.input_provenance_ids),
+            "kind": self.kind.value, "observed_at": self.observed_at,
+        }
+        if self.source_artifact_identity is not None:
+            result["source_artifact_identity"] = self.source_artifact_identity.as_dict()
+        if self.derivation_rule_id is not None:
+            result["derivation_rule_id"] = self.derivation_rule_id
+        return result
+
+
+def _validate_provenance_record(record: ProvenanceRecord) -> None:
+    for name in ("observed_at", "content_hash_algorithm", "content_hash"):
+        value = getattr(record, name)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"invalid-provenance: {name} must be a non-empty string")
+        if value != value.strip() or _UNSAFE_IDENTITY_RE.search(value):
+            raise ValueError(f"invalid-provenance: {name} contains unsafe content")
+    _validate_provenance_identifier(record.extractor_id, "extractor_id")
+    _validate_provenance_identifier(record.extractor_version, "extractor_version")
+    try:
+        instant = datetime.fromisoformat(record.observed_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid-provenance: observed_at must be an offset-aware ISO-8601 instant") from exc
+    if instant.tzinfo is None:
+        raise ValueError("invalid-provenance: observed_at must be an offset-aware ISO-8601 instant")
+    if record.content_hash_algorithm != "sha256" or not _SHA256_RE.fullmatch(record.content_hash):
+        raise ValueError("invalid-provenance: content_hash must be a lowercase sha256 digest")
+    if record.kind is ProvenanceKind.EXTERNAL:
+        if record.source_artifact_identity is None:
+            raise ValueError("invalid-provenance: external source_artifact_identity is required")
+        if record.derivation_rule_id is not None or record.input_provenance_ids:
+            raise ValueError("invalid-provenance: external provenance cannot contain derivation fields")
+    else:
+        if record.source_artifact_identity is not None:
+            raise ValueError("invalid-provenance: derived provenance cannot contain source_artifact_identity")
+        if (
+            not isinstance(record.derivation_rule_id, str)
+            or not record.derivation_rule_id.strip()
+            or not record.input_provenance_ids
+        ):
+            raise ValueError("invalid-provenance: derived rule and input_provenance_ids are required")
+        _validate_provenance_identifier(record.derivation_rule_id, "derivation_rule_id")
+
+
+def _validate_provenance_identifier(value: object, field_name: str) -> None:
+    """Reject source payloads from identifier-valued provenance fields."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"invalid-provenance: {field_name} must be a non-empty string")
+    if (
+        value != value.strip()
+        or any(char.isspace() for char in value)
+        or len(value) > 512
+        or _UNSAFE_IDENTITY_RE.search(value)
+    ):
+        raise ValueError(f"invalid-provenance: {field_name} contains unsafe content")
+
+
+def _validate_provenance_input_ids(value: object) -> None:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("invalid-provenance: input_provenance_ids must be references")
+    for item in value:
+        _validate_provenance_identifier(item, "input_provenance_ids")
+        if not _PROVENANCE_ID_RE.fullmatch(item):
+            raise ValueError(
+                "invalid-provenance: input_provenance_ids must contain stable provenance IDs"
+            )
 
 
 @dataclass(frozen=True)
@@ -495,6 +608,7 @@ class Evidence:
     source: str
     locator: str | CodeLocator | ConfluencePageRef | OpenSpecLocator | SourceArtifactLocator
     properties: dict[str, Any] = field(default_factory=dict)
+    provenance_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.locator, SourceArtifactLocator):
@@ -507,6 +621,7 @@ class Evidence:
             "id": self.id,
             "locator": _serialize_value(self.locator),
             "properties": _serialize_value(self.properties),
+            "provenance_ids": list(sorted(self.provenance_ids)),
             "source": self.source,
         }
 
@@ -543,6 +658,41 @@ def source_artifact_identity_error(evidence: Evidence) -> str | None:
         return None
     if evidence.id != expected_id:
         return "evidence ID does not match its derived source-artifact identity"
+    return None
+
+
+def provenance_association_error(
+    evidence: Evidence,
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> str | None:
+    """Return the semantic provenance/evidence association failure, if any."""
+
+    if not evidence_requires_source_artifact_identity(evidence):
+        return None
+    locator = evidence.locator
+    identity = (
+        locator.source_artifact_identity
+        if isinstance(locator, SourceArtifactLocator)
+        else locator.source_artifact_identity
+        if isinstance(locator, OpenSpecLocator)
+        else None
+    )
+    if identity is None:
+        return None
+    for provenance_id in sorted(evidence.provenance_ids):
+        record = provenance_by_id.get(provenance_id)
+        if record is None:
+            continue
+        if record.kind is ProvenanceKind.DERIVED:
+            return (
+                "external evidence cannot reference derived provenance: "
+                f"{evidence.id}: {record.id}"
+            )
+        if record.source_artifact_identity != identity:
+            return (
+                "external evidence provenance source-artifact identity does not match "
+                f"evidence: {evidence.id}: {record.id}"
+            )
     return None
 
 
@@ -596,6 +746,7 @@ class GraphSnapshot:
     cross_graph_link_claims: tuple[CrossGraphLinkClaim, ...] = ()
     cross_graph_link_evidence: tuple[CrossGraphLinkEvidence, ...] = ()
     cross_graph_link_lifecycle: tuple[CrossGraphLinkLifecycle, ...] = ()
+    provenance: tuple[ProvenanceRecord, ...] = ()
     # Legacy persistence decoding explicitly opts in before guarded migration.
     allow_legacy_evidence: bool = field(default=False, repr=False, compare=False)
 
@@ -604,7 +755,34 @@ class GraphSnapshot:
             for item in self.evidence:
                 if error := source_artifact_identity_error(item):
                     raise ValueError(f"invalid-source-artifact-identity: {error}: {item.id}")
+                if evidence_requires_source_artifact_identity(item) and not item.provenance_ids:
+                    raise ValueError(f"invalid-provenance: external evidence lacks complete provenance: {item.id}")
+            provenance_ids = {item.id for item in self.provenance}
+            for item in self.provenance:
+                if item.kind is ProvenanceKind.DERIVED:
+                    missing = next(
+                        (
+                            provenance_id
+                            for provenance_id in item.input_provenance_ids
+                            if provenance_id not in provenance_ids
+                        ),
+                        None,
+                    )
+                    if missing is not None:
+                        raise ValueError(
+                            "invalid-provenance: derived provenance references absent input "
+                            f"provenance: {item.id}: {missing}"
+                        )
+            for item in self.evidence:
+                if any(provenance_id not in provenance_ids for provenance_id in item.provenance_ids):
+                    missing = next(provenance_id for provenance_id in item.provenance_ids if provenance_id not in provenance_ids)
+                    raise ValueError(f"invalid-provenance: evidence references absent provenance: {item.id}: {missing}")
+                if error := provenance_association_error(
+                    item, {record.id: record for record in self.provenance}
+                ):
+                    raise ValueError(f"invalid-provenance: {error}")
         object.__setattr__(self, "cross_graph_link_claims", tuple(sorted(self.cross_graph_link_claims, key=lambda item: item.id)))
+        object.__setattr__(self, "provenance", tuple(sorted(self.provenance, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_evidence", tuple(sorted(self.cross_graph_link_evidence, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_lifecycle", tuple(sorted(self.cross_graph_link_lifecycle, key=lambda item: (item.claim_id, item.revision))))
 
@@ -619,6 +797,10 @@ class GraphSnapshot:
     @property
     def evidence_count(self) -> int:
         return len(self.evidence)
+
+    @property
+    def provenance_count(self) -> int:
+        return len(self.provenance)
 
     @property
     def cross_graph_link_claim_count(self) -> int:
@@ -661,6 +843,8 @@ class GraphSnapshot:
             "edges": [_serialize_value(edge) for edge in self.edges],
             "evidence": [_serialize_value(item) for item in self.evidence],
             "evidence_count": self.evidence_count,
+            "provenance": [_serialize_value(item) for item in self.provenance],
+            "provenance_count": self.provenance_count,
             "cross_graph_link_claim_count": self.cross_graph_link_claim_count,
             "cross_graph_link_claims": [_serialize_value(item) for item in self.cross_graph_link_claims],
             "cross_graph_link_evidence_count": self.cross_graph_link_evidence_count,
@@ -678,6 +862,7 @@ class GraphSnapshot:
         nodes = _merge_records(self.nodes, other.nodes)
         edges = _merge_records(self.edges, other.edges)
         evidence = _merge_records(self.evidence, other.evidence)
+        provenance = _merge_records(self.provenance, other.provenance)
         for item in evidence:
             if error := source_artifact_identity_error(item):
                 raise ValueError(f"invalid-source-artifact-identity: {error}: {item.id}")
@@ -685,14 +870,17 @@ class GraphSnapshot:
         observations = _merge_records(self.cross_graph_link_evidence, other.cross_graph_link_evidence)
         lifecycle = _merge_records(self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle)
         _validate_cross_graph_claim_references(
-            nodes, evidence, claims, observations, lifecycle
+            nodes, evidence, provenance, claims, observations, lifecycle
         )
-        return GraphSnapshot(nodes, edges, evidence, claims, observations, lifecycle)
+        return GraphSnapshot(
+            nodes, edges, evidence, claims, observations, lifecycle, provenance
+        )
 
 
 def _validate_cross_graph_claim_references(
     nodes: tuple[Node, ...],
     evidence: tuple[Evidence, ...],
+    provenance: tuple[ProvenanceRecord, ...],
     claims: tuple[CrossGraphLinkClaim, ...],
     observations: tuple[CrossGraphLinkEvidence, ...],
     lifecycle: tuple[CrossGraphLinkLifecycle, ...],
@@ -702,12 +890,19 @@ def _validate_cross_graph_claim_references(
     node_ids = {node.id for node in nodes}
     claim_ids = {claim.id for claim in claims}
     evidence_ids = {item.id for item in evidence}
+    provenance_ids = {item.id for item in provenance}
+    for item in evidence:
+        if any(provenance_id not in provenance_ids for provenance_id in item.provenance_ids):
+            missing = next(provenance_id for provenance_id in item.provenance_ids if provenance_id not in provenance_ids)
+            raise ValueError(f"Evidence references absent provenance: {item.id}: {missing}")
     for claim in sorted(claims, key=lambda item: item.id):
         if claim.subject_id not in node_ids:
             raise ValueError(
                 "Cross-graph claim subject_id does not reference an existing node: "
                 f"{claim.subject_id}"
             )
+    evidence_by_id = {item.id: item for item in evidence}
+    provenance_by_id = {item.id: item for item in provenance}
     for observation in sorted(observations, key=lambda item: item.id):
         if observation.claim_id not in claim_ids:
             raise ValueError(
@@ -719,6 +914,10 @@ def _validate_cross_graph_claim_references(
                 "Cross-graph evidence references absent provenance evidence: "
                 f"{observation.provenance_evidence_id}"
             )
+        elif not _has_complete_provenance(
+            evidence_by_id[observation.provenance_evidence_id], provenance_by_id
+        ):
+            raise ValueError(f"Cross-graph evidence requires complete provenance: {observation.id}")
     for entry in sorted(lifecycle, key=lambda item: item.id):
         if entry.claim_id not in claim_ids:
             raise ValueError(
@@ -730,6 +929,35 @@ def _validate_cross_graph_claim_references(
                 "Cross-graph lifecycle references absent provenance evidence: "
                 f"{entry.provenance_evidence_id}"
             )
+        elif not _has_complete_provenance(
+            evidence_by_id[entry.provenance_evidence_id], provenance_by_id
+        ):
+            raise ValueError(f"Cross-graph lifecycle requires complete provenance: {entry.id}")
+
+
+def _has_complete_provenance(
+    evidence: Evidence, provenance_by_id: dict[str, ProvenanceRecord],
+) -> bool:
+    """Return whether evidence resolves exclusively to valid first-class provenance."""
+
+    if not evidence.provenance_ids:
+        return False
+    for provenance_id in evidence.provenance_ids:
+        record = provenance_by_id.get(provenance_id)
+        if record is None:
+            return False
+        try:
+            expected = ProvenanceRecord(
+                record.kind, record.observed_at, record.content_hash_algorithm,
+                record.content_hash, record.extractor_id, record.extractor_version,
+                record.source_artifact_identity, record.derivation_rule_id,
+                record.input_provenance_ids,
+            )
+        except (AttributeError, ValueError):
+            return False
+        if record.id != expected.id:
+            return False
+    return True
 
 
 def _merge_records(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -762,6 +990,17 @@ def _merge_record(left: Any, right: Any) -> Any:
         if isinstance(left, Node):
             return dataclass_replace(left, name=min(left.name, right.name), evidence_ids=evidence_ids)
         return dataclass_replace(left, evidence_ids=evidence_ids)
+    if isinstance(left, Evidence):
+        left_data = left.as_dict()
+        right_data = right.as_dict()
+        left_data.pop("provenance_ids")
+        right_data.pop("provenance_ids")
+        if left_data != right_data:
+            raise ValueError(f"Conflicting graph record values for ID: {left.id}")
+        return dataclass_replace(
+            left,
+            provenance_ids=tuple(sorted(set(left.provenance_ids) | set(right.provenance_ids))),
+        )
     if left.as_dict() != right.as_dict():
         raise ValueError(f"Conflicting graph record values for ID: {left.id}")
     return left

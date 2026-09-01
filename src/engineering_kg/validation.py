@@ -18,7 +18,11 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     OpenSpecLocator,
+    ProvenanceKind,
+    ProvenanceRecord,
     SourceArtifactLocator,
+    _has_complete_provenance,
+    provenance_association_error,
     source_artifact_identity_error,
     openspec_requirement_id,
     openspec_scenario_id,
@@ -109,6 +113,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_duplicate_conflict_diagnostics("node", snapshot.nodes))
     diagnostics.extend(_duplicate_conflict_diagnostics("edge", snapshot.edges))
     diagnostics.extend(_duplicate_conflict_diagnostics("evidence", snapshot.evidence))
+    diagnostics.extend(_duplicate_conflict_diagnostics("provenance", snapshot.provenance))
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-claim", snapshot.cross_graph_link_claims))
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-evidence", snapshot.cross_graph_link_evidence))
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-lifecycle", snapshot.cross_graph_link_lifecycle))
@@ -123,6 +128,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
     diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_source_artifact_identity_diagnostics(snapshot))
+    diagnostics.extend(_provenance_diagnostics(snapshot))
 
     sorted_diagnostics = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     severity_counts = Counter(item.severity for item in sorted_diagnostics)
@@ -135,6 +141,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
         graph_counts={
             "edge_count": snapshot.edge_count,
             "evidence_count": snapshot.evidence_count,
+            "provenance_count": snapshot.provenance_count,
             "cross_graph_link_claim_count": snapshot.cross_graph_link_claim_count,
             "cross_graph_link_evidence_count": snapshot.cross_graph_link_evidence_count,
             "cross_graph_link_lifecycle_count": snapshot.cross_graph_link_lifecycle_count,
@@ -142,6 +149,43 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
         },
     )
     return GraphValidationResult(status=status, metadata=metadata)
+
+
+def _provenance_diagnostics(snapshot: GraphSnapshot) -> list[GraphValidationDiagnostic]:
+    """Validate the association and chain independently of producer code."""
+    diagnostics: list[GraphValidationDiagnostic] = []
+    by_id = {item.id: item for item in snapshot.provenance}
+    for evidence in sorted(snapshot.evidence, key=lambda item: item.id):
+        if evidence.provenance_ids and any(item not in by_id for item in evidence.provenance_ids):
+            missing = next(item for item in sorted(evidence.provenance_ids) if item not in by_id)
+            diagnostics.append(GraphValidationDiagnostic("error", "provenance-reference-exists", evidence.id, f"Evidence references absent provenance: {missing}"))
+        if error := provenance_association_error(evidence, by_id):
+            diagnostics.append(GraphValidationDiagnostic(
+                "error", "provenance-evidence-semantic-consistency", evidence.id, error,
+            ))
+        if source_artifact_identity_error(evidence) is None and evidence_requires_external_provenance(evidence) and not evidence.provenance_ids:
+            diagnostics.append(GraphValidationDiagnostic("error", "external-provenance-complete", evidence.id, "External evidence lacks complete first-class provenance."))
+    for record in sorted(snapshot.provenance, key=lambda item: item.id):
+        try:
+            # Reconstructing forces stable identity and all immutable field checks.
+            expected = ProvenanceRecord(record.kind, record.observed_at, record.content_hash_algorithm, record.content_hash, record.extractor_id, record.extractor_version, record.source_artifact_identity, record.derivation_rule_id, record.input_provenance_ids)
+            if record.id != expected.id:
+                raise ValueError("stable ID does not match immutable fields")
+        except ValueError as exc:
+            diagnostics.append(GraphValidationDiagnostic("error", "provenance-valid", record.id, f"Invalid provenance: {exc}"))
+            continue
+        if record.kind is ProvenanceKind.DERIVED:
+            for input_id in record.input_provenance_ids:
+                if input_id not in by_id:
+                    diagnostics.append(GraphValidationDiagnostic("error", "derived-provenance-input-exists", record.id, f"Derived provenance references absent input provenance: {input_id}"))
+    return diagnostics
+
+
+def evidence_requires_external_provenance(evidence: object) -> bool:
+    """Only authoritative source evidence is governed by external provenance."""
+    return getattr(evidence, "source", "") not in {
+        "fixture", "openlore", "pr-code-candidate-extraction", "repo-index", "review"
+    }
 
 
 def _source_artifact_identity_diagnostics(snapshot: GraphSnapshot) -> list[GraphValidationDiagnostic]:
@@ -237,6 +281,7 @@ def _duplicate_counts(snapshot: GraphSnapshot) -> dict[str, int]:
     return {
         "edge": _duplicate_id_count(snapshot.edges),
         "evidence": _duplicate_id_count(snapshot.evidence),
+        "provenance": _duplicate_id_count(snapshot.provenance),
         "node": _duplicate_id_count(snapshot.nodes),
         "cross_graph_link_claim": _duplicate_id_count(snapshot.cross_graph_link_claims),
         "cross_graph_link_evidence": _duplicate_id_count(snapshot.cross_graph_link_evidence),
@@ -288,6 +333,7 @@ def _cross_graph_link_diagnostics(
 ) -> list[GraphValidationDiagnostic]:
     diagnostics: list[GraphValidationDiagnostic] = []
     claims_by_id = {item.id: item for item in snapshot.cross_graph_link_claims}
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
     for claim in snapshot.cross_graph_link_claims:
         if claim.subject_id not in nodes_by_id:
             diagnostics.append(_cross_error("cross-graph-subject-exists", claim.id, "Cross-graph claim subject_id does not reference an existing node."))
@@ -298,6 +344,10 @@ def _cross_graph_link_diagnostics(
             diagnostics.append(_cross_error("cross-graph-claim-exists", observation.id, "Cross-graph evidence references an absent claim."))
         if observation.provenance_evidence_id not in evidence_by_id:
             diagnostics.append(_cross_error("cross-graph-provenance-exists", observation.id, "Cross-graph evidence references absent provenance evidence."))
+        elif not _has_complete_provenance(
+            evidence_by_id[observation.provenance_evidence_id], provenance_by_id
+        ):
+            diagnostics.append(_cross_error("cross-graph-provenance-complete", observation.id, "Cross-graph evidence requires complete resolvable first-class provenance."))
     revisions: dict[tuple[str, int], CrossGraphLinkLifecycle] = {}
     lifecycle_claims: set[str] = set()
     for entry in snapshot.cross_graph_link_lifecycle:
@@ -306,6 +356,10 @@ def _cross_graph_link_diagnostics(
             diagnostics.append(_cross_error("cross-graph-claim-exists", entry.id, "Cross-graph lifecycle references an absent claim."))
         if entry.provenance_evidence_id not in evidence_by_id:
             diagnostics.append(_cross_error("cross-graph-provenance-exists", entry.id, "Cross-graph lifecycle references absent provenance evidence."))
+        elif not _has_complete_provenance(
+            evidence_by_id[entry.provenance_evidence_id], provenance_by_id
+        ):
+            diagnostics.append(_cross_error("cross-graph-provenance-complete", entry.id, "Cross-graph lifecycle requires complete resolvable first-class provenance."))
         if not isinstance(entry.revision, int) or isinstance(entry.revision, bool) or entry.revision <= 0:
             diagnostics.append(_cross_error("cross-graph-lifecycle-revision", entry.id, "Cross-graph lifecycle revision must be a positive integer."))
         if _value(entry.state) not in CROSS_GRAPH_LINK_LIFECYCLE_STATES:

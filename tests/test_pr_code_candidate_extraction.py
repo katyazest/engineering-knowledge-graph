@@ -26,6 +26,7 @@ from engineering_kg.ontology import (
     SourceArtifactLocator,
 )
 from engineering_kg.persistence import initialize_ladybugdb_store
+from engineering_kg.query import EngineeringKgQuery
 from engineering_kg.validation import validate_graph_integrity
 
 
@@ -35,6 +36,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         self.raw = {
             "association": {"id": "jira-link-1", "engineering_change_subject_id": self.subject.id, "pull_request_id": "pr-42", "provider_payload": {"secret": "ignored"}},
             "pull_request_id": "pr-42", "repository": "payment-service", "merged_revision": "a" * 40, "merged": True,
+            "observed_at": "2026-09-01T12:00:00+00:00",
             "mappings": [{"id": "graphify:mapping-1", "file": "src/payments.py", "outcome": "resolved", "symbol": "payments.submit", "source_code": "ignored"}],
             "diff": "ignored",
         }
@@ -53,6 +55,10 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             normalize_merged_pr_change_set({**self.raw, "merged_revision": "main"})
         with self.assertRaisesRegex(PrCodeCandidateValidationError, "immutable revision"):
             normalize_merged_pr_change_set({**self.raw, "merged_revision": "deadbee"})
+        with self.assertRaisesRegex(PrCodeCandidateValidationError, "observed_at is required"):
+            normalize_merged_pr_change_set({**self.raw, "observed_at": ""})
+        with self.assertRaisesRegex(PrCodeCandidateValidationError, "offset-aware ISO-8601"):
+            normalize_merged_pr_change_set({**self.raw, "observed_at": "2026-09-01T12:00:00"})
 
     def test_resolved_mapping_requires_qualified_symbol_identity(self) -> None:
         invalid_symbols = (
@@ -118,7 +124,9 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         graph = GraphSnapshot(nodes=(self.subject,)).merged_with(result.graph)
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
         promoted = GraphSnapshot(
-            nodes=graph.nodes, evidence=(*graph.evidence, Evidence("review", "review", "review-1")),
+            nodes=graph.nodes,
+            evidence=(*graph.evidence, Evidence("review", "review", "review-1")),
+            provenance=graph.provenance,
             cross_graph_link_claims=graph.cross_graph_link_claims, cross_graph_link_evidence=graph.cross_graph_link_evidence,
             cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", "review")),
         )
@@ -133,6 +141,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             first.repository,
             first.merged_revision,
             (ChangedSymbolMapping("graphify:mapping-2", first.mappings[0].file, "resolved", first.mappings[0].symbol),),
+            observed_at=first.observed_at,
         )
         subject_graph = GraphSnapshot(nodes=(self.subject,))
 
@@ -174,7 +183,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         skipped = MergedPrChangeSet(base.association, base.pull_request_id, base.repository, base.merged_revision, (
             ChangedSymbolMapping("graphify:unresolved", "a.py", MappingOutcome.UNRESOLVED),
             ChangedSymbolMapping("graphify:ambiguous", "b.py", MappingOutcome.AMBIGUOUS),
-        ))
+        ), observed_at=base.observed_at)
         result = extract_pr_code_candidates((skipped,), GraphSnapshot(nodes=(self.subject,)))
         self.assertEqual(result.graph.cross_graph_link_claims, ())
         self.assertEqual([item.reason_code for item in result.metadata.diagnostics], ["ambiguous-symbol", "unresolved-symbol"])
@@ -198,6 +207,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
                 ChangedSymbolMapping("graphify:mapping-1", "src/payments.py", MappingOutcome.RESOLVED, "payments.submit"),
                 ChangedSymbolMapping("graphify:mapping-1", "src/refunds.py", MappingOutcome.RESOLVED, "refunds.refund"),
             ),
+            observed_at=base.observed_at,
         )
 
         result = extract_pr_code_candidates((conflicting,), GraphSnapshot(nodes=(self.subject,)))
@@ -222,6 +232,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             base.repository,
             base.merged_revision,
             (ChangedSymbolMapping("graphify:mapping-1", "src/refunds.py", MappingOutcome.RESOLVED, "refunds.refund"),),
+            observed_at=base.observed_at,
         )
 
         first = extract_pr_code_candidates(
@@ -263,6 +274,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             "PAYMENT-SERVICE",
             base.merged_revision.upper(),
             (ChangedSymbolMapping("graphify:mapping-1", "src/refunds.py", "resolved", "refunds.refund"),),
+            observed_at=base.observed_at,
         )
 
         self.assertEqual(base.id, conflicting.id)
@@ -376,11 +388,13 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         base = normalize_merged_pr_change_set(self.raw)
         with self.assertRaisesRegex(PrCodeCandidateValidationError, "immutable revision"):
             MergedPrChangeSet(
-                base.association, base.pull_request_id, base.repository, "main", base.mappings
+                base.association, base.pull_request_id, base.repository, "main", base.mappings,
+                observed_at=base.observed_at,
             )
         with self.assertRaisesRegex(PrCodeCandidateValidationError, "immutable revision"):
             MergedPrChangeSet(
-                base.association, base.pull_request_id, base.repository, "deadbee", base.mappings
+                base.association, base.pull_request_id, base.repository, "deadbee", base.mappings,
+                observed_at=base.observed_at,
             )
 
     def test_invalid_mapping_identity_never_enters_graph_records(self) -> None:
@@ -473,6 +487,41 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             self.assertNotIn("source_code", readback.as_json())
             self.assertNotIn("provider_payload", readback.as_json())
             self.assertEqual(store.write_snapshot(graph).as_json(), graph.as_json())
+
+    def test_lifecycle_readback_retains_the_mapping_external_provenance_chain(self) -> None:
+        result = extract_pr_code_candidates(
+            (normalize_merged_pr_change_set(self.raw),),
+            GraphSnapshot(nodes=(self.subject,)),
+        )
+        graph = GraphSnapshot(nodes=(self.subject,)).merged_with(result.graph)
+        claim = graph.cross_graph_link_claims[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = initialize_ladybugdb_store(Path(temporary) / "store")
+            readback = store.write_snapshot(graph)
+            traceability = EngineeringKgQuery.from_snapshot(readback).get_traceability(
+                self.subject.id
+            )
+
+        lifecycle_provenance = traceability["cross_graph_links"][0]["lifecycle"][0][
+            "provenance"
+        ]
+        self.assertEqual(len(lifecycle_provenance), 1)
+        derived = lifecycle_provenance[0]
+        self.assertEqual(derived["kind"], "derived")
+        self.assertEqual(
+            derived["derivation_rule_id"], "cross-graph-candidate-initialization"
+        )
+        external_id = derived["input_provenance_ids"][0]
+        mapping_external = next(record for record in readback.provenance if record.id == external_id)
+        self.assertEqual(mapping_external.kind, "external")
+        self.assertEqual(
+            mapping_external.source_artifact_identity.artifact_type,
+            "pull-request-mapping",
+        )
+        self.assertEqual(
+            traceability["cross_graph_links"][0]["claim"]["id"], claim.id
+        )
 
 
 if __name__ == "__main__":
