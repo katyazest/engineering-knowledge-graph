@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.ontology import (
-    Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, SourceArtifactIdentity,
+    Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceRecord, SourceArtifactIdentity,
     SourceArtifactLocator, openspec_specification_id, stable_id,
 )
 from engineering_kg.validation import validate_graph_integrity
@@ -20,9 +20,10 @@ class GraphIntegrityValidationTest(unittest.TestCase):
         spec = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})
         edge = Edge("assertion", EdgeKind.ASSERTS, change.id, spec.id, evidence_ids=("e",))
         identity = SourceArtifactIdentity("openspec", "requirements", "openspec-spec", "a" * 40, "openspec/specs/payments/spec.md")
-        evidence = Evidence(stable_id("evidence", identity.id), "openspec", SourceArtifactLocator(identity))
+        provenance = ProvenanceRecord("external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64, "test-extractor", "1", identity)
+        evidence = Evidence(stable_id("evidence", identity.id), "openspec", SourceArtifactLocator(identity), provenance_ids=(provenance.id,))
         edge = Edge("assertion", EdgeKind.ASSERTS, change.id, spec.id, evidence_ids=(evidence.id,))
-        self.assertEqual(validate_graph_integrity(GraphSnapshot((change, spec), (edge,), (evidence,))).status, "valid")
+        self.assertEqual(validate_graph_integrity(GraphSnapshot((change, spec), (edge,), (evidence,), provenance=(provenance,))).status, "valid")
 
     def test_retired_vocabulary_is_invalid(self) -> None:
         legacy = Node("legacy", "openspec-spec", "Payments")

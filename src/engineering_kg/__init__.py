@@ -14,6 +14,8 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     NormalizedSourceArtifact,
+    ProvenanceKind,
+    ProvenanceRecord,
     SourceArtifactIdentity,
     stable_id,
 )
@@ -63,6 +65,8 @@ __all__ = [
     "Node",
     "NodeKind",
     "NormalizedSourceArtifact",
+    "ProvenanceKind",
+    "ProvenanceRecord",
     "OpenLoreRepositoryReference",
     "OpenLoreSourceValidationError",
     "OpenLoreSourceValidationResult",

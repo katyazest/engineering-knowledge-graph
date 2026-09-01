@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 import re
+import hashlib
+import json
 from typing import Any, Mapping
 
 from engineering_kg.ontology import (
@@ -18,6 +21,8 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     SourceArtifactIdentity,
     SourceArtifactLocator,
+    ProvenanceKind,
+    ProvenanceRecord,
     stable_id,
 )
 
@@ -193,6 +198,7 @@ class MergedPrChangeSet:
     merged_revision: str
     mappings: tuple[ChangedSymbolMapping, ...]
     merged: bool = True
+    observed_at: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.association, EngineeringChangePrAssociation):
@@ -216,6 +222,7 @@ class MergedPrChangeSet:
             raise PrCodeCandidateValidationError("change_set.mappings must be a non-empty tuple")
         if not all(isinstance(item, ChangedSymbolMapping) for item in self.mappings):
             raise PrCodeCandidateValidationError("change_set.mappings must contain ChangedSymbolMapping records")
+        _observed_at(self.observed_at)
 
     @property
     def id(self) -> str:
@@ -257,6 +264,7 @@ def normalize_merged_pr_change_set(value: Mapping[str, Any]) -> MergedPrChangeSe
         merged_revision=value.get("merged_revision"),
         mappings=mappings,
         merged=value.get("merged", False),
+        observed_at=value.get("observed_at", ""),
     )
     return change_set
 
@@ -306,6 +314,7 @@ def extract_pr_code_candidates(
     claims: list[CrossGraphLinkClaim] = []
     observations: list[CrossGraphLinkEvidence] = []
     lifecycle: list[CrossGraphLinkLifecycle] = []
+    provenance_records: list[ProvenanceRecord] = []
     accepted = 0
     subjects = {node.id: node for node in subject_graph.nodes}
     change_sets_by_id = _change_sets_by_id(change_sets)
@@ -357,8 +366,9 @@ def extract_pr_code_candidates(
                     PrCodeCandidateDiagnostic("invalid-mapping-identity", change_set.id)
                 )
                 continue
-            provenance = _mapping_provenance(change_set, mapping)
+            provenance, record = _mapping_provenance(change_set, mapping)
             evidence.append(provenance)
+            provenance_records.append(record)
             if mapping.id in conflicting_mapping_ids:
                 # A source mapping must identify one outcome.  Conflicting adapted
                 # records cannot be safely resolved by processing order, so retain
@@ -383,8 +393,9 @@ def extract_pr_code_candidates(
                 continue
             target = CodeLocator(change_set.repository, change_set.merged_revision, mapping.file, mapping.symbol)
             claim = CrossGraphLinkClaim(change_set.association.engineering_change_subject_id, RELATION_KIND, target)
-            lifecycle_provenance = _initial_candidate_lifecycle_provenance(claim)
+            lifecycle_provenance, lifecycle_records = _initial_candidate_lifecycle_provenance(claim, record)
             evidence.append(lifecycle_provenance)
+            provenance_records.extend(lifecycle_records)
             claims.append(claim)
             observations.append(CrossGraphLinkEvidence(claim.id, STRATEGY_ID, mapping.id, provenance.id))
             # Lifecycle revisions are claim-wide.  PR mapping provenance belongs to
@@ -397,6 +408,7 @@ def extract_pr_code_candidates(
         cross_graph_link_claims=tuple({item.id: item for item in claims}.values()),
         cross_graph_link_evidence=tuple({item.id: item for item in observations}.values()),
         cross_graph_link_lifecycle=tuple({item.id: item for item in lifecycle}.values()),
+        provenance=tuple({item.id: item for item in provenance_records}.values()),
     )
     # Validate/collapse duplicate records against subjects without leaking those subjects into output.
     subject_graph.merged_with(graph)
@@ -410,6 +422,28 @@ def _immutable_revision(value: str) -> bool:
     return len(value) in (40, 64) and all(
         character in "0123456789abcdefABCDEF" for character in value
     )
+
+
+def _observed_at(value: object) -> str:
+    """Require the adapter-provided instant used by external provenance.
+
+    Extraction intentionally does not substitute a clock or repository timestamp:
+    the normalized provider input must supply this immutable observation value.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        raise PrCodeCandidateValidationError("change_set.observed_at is required")
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PrCodeCandidateValidationError(
+            "change_set.observed_at must be an offset-aware ISO-8601 instant"
+        ) from exc
+    if instant.tzinfo is None:
+        raise PrCodeCandidateValidationError(
+            "change_set.observed_at must be an offset-aware ISO-8601 instant"
+        )
+    return value
 
 
 def _is_complete_deterministic_symbol_identity(value: str) -> bool:
@@ -545,7 +579,7 @@ def _change_set_conflict_provenance(change_set: MergedPrChangeSet) -> Evidence:
     )
 
 
-def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMapping) -> Evidence:
+def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMapping) -> tuple[Evidence, ProvenanceRecord]:
     """Return payload-safe provenance for one admissible source mapping."""
 
     artifact_identity = SourceArtifactIdentity(
@@ -555,9 +589,14 @@ def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMap
         revision_or_version=change_set.merged_revision,
         stable_locator=f"pr-change-set:{change_set.id}:mapping:{mapping.id}",
     )
-    provenance_id = stable_id("evidence", artifact_identity.id)
+    record = ProvenanceRecord(
+        ProvenanceKind.EXTERNAL, change_set.observed_at, "sha256",
+        hashlib.sha256(json.dumps({"mapping_id": mapping.id, "outcome": mapping.outcome.value, "file": mapping.file, "symbol": mapping.symbol}, sort_keys=True).encode()).hexdigest(),
+        STRATEGY_ID, "1", artifact_identity,
+    )
+    evidence_id = stable_id("evidence", artifact_identity.id)
     return Evidence(
-        provenance_id,
+        evidence_id,
         STRATEGY_ID,
         SourceArtifactLocator(
             artifact_identity,
@@ -573,19 +612,38 @@ def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMap
             "pull_request_id": change_set.pull_request_id,
             "repository": change_set.repository,
             "source_mapping_id": mapping.id,
-        },
-    )
+        }, (record.id,),
+    ), record
 
 
-def _initial_candidate_lifecycle_provenance(claim: CrossGraphLinkClaim) -> Evidence:
+def _initial_candidate_lifecycle_provenance(
+    claim: CrossGraphLinkClaim, input_record: ProvenanceRecord
+) -> tuple[Evidence, tuple[ProvenanceRecord, ...]]:
     """Return the deterministic, claim-scoped provenance of candidate initialization."""
 
-    provenance_id = stable_id(
-        "evidence", STRATEGY_ID, "candidate-initialization", claim.id
+    # A lifecycle is claim-scoped while a mapping observation is not.  Retain
+    # each actual mapping provenance as an input rather than inventing a
+    # claim-scoped external observation.  When several mappings support the
+    # same claim, merge unions their derived lifecycle evidence associations
+    # deterministically, preserving every mapping's external provenance chain.
+    input_provenance_ids = (input_record.id,)
+    input_representation = json.dumps(
+        {
+            "claim_id": claim.id,
+            "input_provenance_ids": input_provenance_ids,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
+    record = ProvenanceRecord(
+        ProvenanceKind.DERIVED, input_record.observed_at, "sha256",
+        hashlib.sha256(input_representation.encode()).hexdigest(), STRATEGY_ID, "1", None,
+        "cross-graph-candidate-initialization", input_provenance_ids,
+    )
+    evidence_id = stable_id("evidence", STRATEGY_ID, "candidate-initialization", claim.id)
     return Evidence(
-        provenance_id,
+        evidence_id,
         STRATEGY_ID,
         f"cross-graph-link:{claim.id}:candidate-initialization",
-        {"claim_id": claim.id, "state": CrossGraphLinkLifecycleState.CANDIDATE.value},
-    )
+        {"claim_id": claim.id, "state": CrossGraphLinkLifecycleState.CANDIDATE.value}, (record.id,),
+    ), (record,)

@@ -17,6 +17,8 @@ from engineering_kg.ontology import (
     Evidence,
     Node,
     NodeKind,
+    ProvenanceRecord,
+    SourceArtifactIdentity,
 )
 from engineering_kg.persistence import PersistenceIntegrityError, initialize_ladybugdb_store
 from engineering_kg.validation import validate_graph_integrity
@@ -24,14 +26,19 @@ from engineering_kg.validation import validate_graph_integrity
 
 class CrossGraphLinkEvidenceTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.subject = Node("requirement-1", NodeKind.REQUIREMENT, "Requirement")
-        self.provenance = Evidence("provenance-1", "fixture", "fixture.md")
+        self.subject = Node("requirement-1", NodeKind.JIRA_STORY, "Requirement")
+        self.provenance_record = ProvenanceRecord(
+            "external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64,
+            "test-extractor", "1",
+            SourceArtifactIdentity("fixture-source", "cross-graph", "fixture", "1", "fixtures/cross-graph.md"),
+        )
+        self.provenance = Evidence("provenance-1", "fixture", "fixture.md", provenance_ids=(self.provenance_record.id,))
         self.target = CodeLocator("payments", "abc123", "src/payments.py", "submit")
         self.claim = CrossGraphLinkClaim(self.subject.id, "implements", self.target)
 
     def snapshot(self, state: str = "candidate", observations: tuple[CrossGraphLinkEvidence, ...] = ()) -> GraphSnapshot:
         return GraphSnapshot(
-            nodes=(self.subject,), evidence=(self.provenance,),
+            nodes=(self.subject,), evidence=(self.provenance,), provenance=(self.provenance_record,),
             cross_graph_link_claims=(self.claim,),
             cross_graph_link_evidence=observations,
             cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(self.claim.id, 1, state, self.provenance.id),),
@@ -63,6 +70,40 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         merged = self.snapshot(observations=(first,)).merged_with(self.snapshot(observations=(second,)))
         self.assertEqual(tuple(item.id for item in merged.cross_graph_link_evidence), tuple(sorted((first.id, second.id))))
         self.assertEqual(merged.merged_with(merged).as_json(), merged.as_json())
+
+    def test_merge_retains_distinct_observation_instants_without_provenance_selection(self) -> None:
+        later = ProvenanceRecord(
+            "external", "2026-01-02T03:05:05+00:00", "sha256", "b" * 64,
+            "test-extractor", "1", self.provenance_record.source_artifact_identity,
+        )
+        later_evidence = Evidence(
+            self.provenance.id, "fixture", "fixture.md", provenance_ids=(later.id,)
+        )
+        first_observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "first-observation", self.provenance.id
+        )
+        later_observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "later-observation", later_evidence.id
+        )
+        merged = GraphSnapshot(
+            nodes=(self.subject,), evidence=(self.provenance,), provenance=(self.provenance_record,),
+            cross_graph_link_claims=(self.claim,), cross_graph_link_evidence=(first_observation,),
+            cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(self.claim.id, 1, "candidate", self.provenance.id),),
+        ).merged_with(GraphSnapshot(
+            nodes=(self.subject,), evidence=(later_evidence,), provenance=(later,),
+            cross_graph_link_claims=(self.claim,), cross_graph_link_evidence=(later_observation,),
+            cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(self.claim.id, 1, "candidate", later_evidence.id),),
+        ))
+        self.assertEqual(
+            merged.evidence[0].provenance_ids,
+            tuple(sorted((self.provenance_record.id, later.id))),
+        )
+        self.assertEqual(
+            tuple(item.id for item in merged.cross_graph_link_evidence),
+            tuple(sorted((first_observation.id, later_observation.id))),
+        )
+        self.assertEqual(merged.cross_graph_link_lifecycle[0].provenance_evidence_id, self.provenance.id)
+        self.assertEqual(validate_graph_integrity(merged).status, "valid")
 
     def test_merge_rejects_evidence_that_references_an_absent_claim(self) -> None:
         dangling = CrossGraphLinkEvidence("missing-claim", "manual", "one", self.provenance.id)
@@ -110,7 +151,7 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         candidate = self.snapshot(observations=(observation,))
         self.assertEqual(candidate.trusted_cross_graph_links, ())
         trusted = GraphSnapshot(
-            nodes=candidate.nodes, evidence=candidate.evidence,
+            nodes=candidate.nodes, evidence=candidate.evidence, provenance=candidate.provenance,
             cross_graph_link_claims=candidate.cross_graph_link_claims,
             cross_graph_link_evidence=candidate.cross_graph_link_evidence,
             cross_graph_link_lifecycle=(
@@ -134,6 +175,45 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         )
         self.assertEqual(validate_graph_integrity(GraphSnapshot(nodes=(self.subject,), cross_graph_link_claims=(self.claim,))).status, "invalid")
 
+    def test_validation_rejects_observation_and_lifecycle_without_resolvable_provenance(self) -> None:
+        incomplete = Evidence("incomplete-provenance", "fixture", "fixture.md")
+        observation = CrossGraphLinkEvidence(self.claim.id, "manual", "one", incomplete.id)
+        lifecycle = CrossGraphLinkLifecycle(self.claim.id, 1, "candidate", incomplete.id)
+        snapshot = GraphSnapshot(
+            nodes=(self.subject,), evidence=(incomplete,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(observation,), cross_graph_link_lifecycle=(lifecycle,),
+        )
+        result = validate_graph_integrity(snapshot)
+        self.assertEqual(result.status, "invalid")
+        self.assertEqual(
+            [item.rule_id for item in result.metadata.diagnostics],
+            ["cross-graph-provenance-complete", "cross-graph-provenance-complete"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "Cross-graph evidence requires complete provenance"):
+            snapshot.merged_with(GraphSnapshot())
+
+        dangling = Evidence("dangling-provenance", "fixture", "fixture.md", provenance_ids=("missing",))
+        unresolved = GraphSnapshot(
+            nodes=(self.subject,), evidence=(dangling,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(
+                CrossGraphLinkEvidence(self.claim.id, "manual", "two", dangling.id),
+            ),
+            cross_graph_link_lifecycle=(
+                CrossGraphLinkLifecycle(self.claim.id, 1, "candidate", dangling.id),
+            ),
+            allow_legacy_evidence=True,
+        )
+        unresolved_result = validate_graph_integrity(unresolved)
+        self.assertEqual(
+            [item.rule_id for item in unresolved_result.metadata.diagnostics].count(
+                "cross-graph-provenance-complete"
+            ),
+            2,
+        )
+
     def test_validation_rejects_unknown_state_and_conflicting_lifecycle_revision(self) -> None:
         unsupported = object.__new__(CrossGraphLinkLifecycle)
         object.__setattr__(unsupported, "claim_id", self.claim.id)
@@ -142,7 +222,7 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         object.__setattr__(unsupported, "provenance_evidence_id", self.provenance.id)
         conflicting = CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", self.provenance.id)
         result = validate_graph_integrity(GraphSnapshot(
-            nodes=(self.subject,), evidence=(self.provenance,), cross_graph_link_claims=(self.claim,),
+            nodes=(self.subject,), evidence=(self.provenance,), provenance=(self.provenance_record,), cross_graph_link_claims=(self.claim,),
             cross_graph_link_lifecycle=(unsupported, conflicting),
         ))
         self.assertEqual(result.status, "invalid")
@@ -180,7 +260,7 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
 
             readback = store.write_snapshot(
                 GraphSnapshot(
-                    evidence=(self.provenance,),
+                    evidence=(self.provenance,), provenance=(self.provenance_record,),
                     cross_graph_link_evidence=(observation,),
                 )
             )

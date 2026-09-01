@@ -100,6 +100,7 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
                 specs_path=root / "openspec/specs",
                 changes_path=root / "openspec/changes",
                 revision_or_version="a" * 40,
+                observed_at="2026-09-01T12:00:00+00:00",
             )
             graph = extract_openspec_graph(source).graph
         specification = next(node for node in graph.nodes if node.kind == NodeKind.SPECIFICATION)

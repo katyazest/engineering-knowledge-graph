@@ -98,6 +98,7 @@ class QueryNodeResult:
     properties: dict[str, Any] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()
     locators: tuple[dict[str, Any], ...] = ()
+    provenance: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +108,7 @@ class QueryNodeResult:
             "locators": [dict(item) for item in self.locators],
             "name": self.name,
             "properties": _sanitize_value(self.properties),
+            "provenance": [_sanitize_value(item) for item in self.provenance],
         }
 
 
@@ -116,10 +118,12 @@ class TraceabilityResult:
 
     object_id: str
     relationships: tuple[dict[str, Any], ...] = ()
+    cross_graph_links: tuple[dict[str, Any], ...] = ()
     missing: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "cross_graph_links": [_sanitize_value(item) for item in self.cross_graph_links],
             "missing": self.missing,
             "object_id": self.object_id,
             "relationships": [_sanitize_value(item) for item in self.relationships],
@@ -138,6 +142,7 @@ class EngineeringKgQuery:
         self.validation = validation
         self._nodes_by_id = {node.id: node for node in snapshot.nodes}
         self._evidence_by_id = {item.id: item for item in snapshot.evidence}
+        self._provenance_by_id = {item.id: item for item in snapshot.provenance}
 
     @classmethod
     def from_snapshot(
@@ -224,7 +229,11 @@ class EngineeringKgQuery:
                 if edge.source_id == object_id or edge.target_id == object_id
             )
         )
-        return TraceabilityResult(object_id=object_id, relationships=relationships).as_dict()
+        return TraceabilityResult(
+            object_id=object_id,
+            relationships=relationships,
+            cross_graph_links=self._cross_graph_links_for(object_id),
+        ).as_dict()
 
     def _node_result(self, node: Node) -> QueryNodeResult:
         return QueryNodeResult(
@@ -234,6 +243,7 @@ class EngineeringKgQuery:
             properties=dict(node.properties),
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
+            provenance=self._provenance_for(node.evidence_ids),
         )
 
     def _service_result(self, node: Node) -> QueryNodeResult:
@@ -255,6 +265,7 @@ class EngineeringKgQuery:
             properties=properties,
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
+            provenance=self._provenance_for(node.evidence_ids),
         )
 
     def _change_result(self, node: Node) -> QueryNodeResult:
@@ -274,6 +285,7 @@ class EngineeringKgQuery:
             properties=properties,
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
+            provenance=self._provenance_for(node.evidence_ids),
         )
 
     def _edge_result(self, edge: Edge) -> dict[str, Any]:
@@ -290,6 +302,9 @@ class EngineeringKgQuery:
         locators = self._locators_for(edge.evidence_ids)
         if locators:
             data["locators"] = [dict(item) for item in locators]
+        provenance = self._provenance_for(edge.evidence_ids)
+        if provenance:
+            data["provenance"] = [dict(item) for item in provenance]
         return data
 
     def _targets_for(self, source_id: str, kind: EdgeKind) -> list[str]:
@@ -307,6 +322,53 @@ class EngineeringKgQuery:
                 continue
             locators.append(_evidence_locator(evidence))
         return tuple(locators)
+
+    def _provenance_for(self, evidence_ids: tuple[str, ...]) -> tuple[dict[str, Any], ...]:
+        ids = sorted({
+            provenance_id
+            for evidence_id in evidence_ids
+            for provenance_id in (
+                self._evidence_by_id[evidence_id].provenance_ids
+                if evidence_id in self._evidence_by_id else ()
+            )
+        })
+        return tuple(_sanitize_value(self._provenance_by_id[item].as_dict()) for item in ids if item in self._provenance_by_id)
+
+    def _cross_graph_links_for(self, object_id: str) -> tuple[dict[str, Any], ...]:
+        """Project cross-graph support and its provenance for one claim subject."""
+
+        links: list[dict[str, Any]] = []
+        for claim in self.snapshot.cross_graph_link_claims:
+            if claim.subject_id != object_id:
+                continue
+            observations = [
+                {
+                    **observation.as_dict(),
+                    "provenance": list(
+                        self._provenance_for((observation.provenance_evidence_id,))
+                    ),
+                }
+                for observation in self.snapshot.cross_graph_link_evidence
+                if observation.claim_id == claim.id
+            ]
+            lifecycle = [
+                {
+                    **entry.as_dict(),
+                    "provenance": list(
+                        self._provenance_for((entry.provenance_evidence_id,))
+                    ),
+                }
+                for entry in self.snapshot.cross_graph_link_lifecycle
+                if entry.claim_id == claim.id
+            ]
+            links.append(
+                {
+                    "claim": claim.as_dict(),
+                    "lifecycle": lifecycle,
+                    "observations": observations,
+                }
+            )
+        return tuple(links)
 
     def _node_has_evidence_ref(self, node: Node, evidence_ref: str) -> bool:
         if evidence_ref in node.evidence_ids:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -20,6 +21,8 @@ from engineering_kg.ontology import (
     NodeKind,
     OpenSpecLocator,
     SourceArtifactIdentity,
+    ProvenanceKind,
+    ProvenanceRecord,
     openspec_requirement_id,
     openspec_scenario_id,
     openspec_specification_id,
@@ -64,6 +67,7 @@ class OpenSpecStoreSourceValidationResult:
     changes_path: Path
     store_id: str = ""
     revision_or_version: str = ""
+    observed_at: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -76,6 +80,7 @@ class OpenSpecStoreSourceValidationResult:
             "specs_path": str(self.specs_path),
             "status": self.status,
             "revision_or_version": self.revision_or_version,
+            "observed_at": self.observed_at,
         }
         if self.store_id:
             data["store_id"] = self.store_id
@@ -271,7 +276,7 @@ def extract_openspec_graph(
     related_edges, unresolved = _related_spec_edges(durable_specs)
     edges.extend(related_edges)
 
-    graph = _snapshot(nodes, edges, evidence)
+    graph = _snapshot(store_source, nodes, edges, evidence)
     metadata = OpenSpecExtractionMetadata(
         status="completed",
         store_id=store_source.store_id,
@@ -409,6 +414,7 @@ def _validate_selected_store(
         specs_path=specs_path,
         changes_path=changes_path,
         revision_or_version=_git_head(resolved_store_path),
+        observed_at=_git_observed_at(resolved_store_path),
     )
 
 
@@ -440,6 +446,18 @@ def _git_head(repository_path: Path) -> str:
             "invalid-source-artifact-identity: OpenSpec Git HEAD is unavailable"
         )
     return revision
+
+
+def _git_observed_at(repository_path: Path) -> str:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository_path), "show", "-s", "--format=%cI", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise OpenSpecStoreSourceValidationError(
+            "invalid-provenance: OpenSpec Git observation time is unavailable"
+        ) from exc
 
 
 def _store_id(item: dict[str, Any], index: int) -> str:
@@ -876,12 +894,41 @@ def _evidence_id(
     return stable_id("evidence", identity.id, openspec_identity)
 
 
-def _snapshot(nodes: list[Node], edges: list[Edge], evidence: list[Evidence]) -> GraphSnapshot:
+def _snapshot(store_source: OpenSpecStoreSourceValidationResult, nodes: list[Node], edges: list[Edge], evidence: list[Evidence]) -> GraphSnapshot:
+    if not store_source.observed_at:
+        raise OpenSpecGraphExtractionError("invalid-provenance: OpenSpec observation time is unavailable")
+    provenance: list[ProvenanceRecord] = []
+    explained_evidence: list[Evidence] = []
+    for item in evidence:
+        locator = item.locator
+        identity = locator.source_artifact_identity if isinstance(locator, OpenSpecLocator) else None
+        if identity is None:
+            explained_evidence.append(item)
+            continue
+        source_path = store_source.repository_path / identity.stable_locator
+        try:
+            if source_path.is_dir():
+                useful_representation = json.dumps(
+                    [path.relative_to(source_path).as_posix() for path in sorted(source_path.rglob("*")) if path.is_file()],
+                    separators=(",", ":"),
+                ).encode()
+            else:
+                useful_representation = source_path.read_bytes()
+        except OSError as exc:
+            raise OpenSpecGraphExtractionError(f"invalid-provenance: cannot read normalized OpenSpec representation: {identity.stable_locator}") from exc
+        record = ProvenanceRecord(
+            ProvenanceKind.EXTERNAL, store_source.observed_at, "sha256",
+            hashlib.sha256(useful_representation).hexdigest(), "openspec-extractor", "1",
+            identity,
+        )
+        provenance.append(record)
+        explained_evidence.append(Evidence(item.id, item.source, item.locator, item.properties, (record.id,)))
     return GraphSnapshot().merged_with(
         GraphSnapshot(
             nodes=tuple(sorted(nodes, key=lambda item: item.id)),
             edges=tuple(sorted(edges, key=lambda item: item.id)),
-            evidence=tuple(sorted(evidence, key=lambda item: item.id)),
+            evidence=tuple(sorted(explained_evidence, key=lambda item: item.id)),
+            provenance=tuple(sorted({item.id: item for item in provenance}.values(), key=lambda item: item.id)),
         )
     )
 

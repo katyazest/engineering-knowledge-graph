@@ -8,20 +8,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.derivation import derive_graph_relationships
-from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, openspec_specification_id, stable_id
+from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceRecord, SourceArtifactIdentity, SourceArtifactLocator, openspec_specification_id, stable_id
 
 
 class GraphDerivationTest(unittest.TestCase):
     def test_derives_traceability_from_evidenced_assertion(self) -> None:
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
         specification = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments", {"repository_id": "requirements", "capability": "payments"})
-        assertion = Edge("assertion", EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=("e",))
-        graph = GraphSnapshot((change, specification), (assertion,), (Evidence("e", "fixture", "fixture"),))
+        identity = SourceArtifactIdentity("fixture-source", "derivation", "fixture", "1", "fixtures/derivation.md")
+        provenance = ProvenanceRecord("external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64, "test-extractor", "1", identity)
+        evidence = Evidence(stable_id("evidence", identity.id), "fixture", SourceArtifactLocator(identity), provenance_ids=(provenance.id,))
+        assertion = Edge("assertion", EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=(evidence.id,))
+        graph = GraphSnapshot((change, specification), (assertion,), (evidence,), provenance=(provenance,))
         result = derive_graph_relationships(graph)
         derived = [edge for edge in result.graph.edges if edge.kind == EdgeKind.TRACES_TO]
         self.assertEqual(len(derived), 1)
         self.assertEqual(derived[0].properties["input_edge_ids"], ("assertion",))
         self.assertTrue(derived[0].properties["derived"])
+        self.assertEqual(
+            [item.derivation_rule_id for item in result.graph.provenance if item.kind == "derived"],
+            ["openspec-change-to-durable-spec"],
+        )
+        derived_provenance = next(item for item in result.graph.provenance if item.kind == "derived")
+        self.assertEqual(derived_provenance.input_provenance_ids, (provenance.id,))
         self.assertEqual(result.graph.as_dict(), derive_graph_relationships(result.graph).graph.as_dict())
 
     def test_invalid_assertion_is_reported_without_traceability(self) -> None:

@@ -9,7 +9,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.ontology import (
     Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, OpenSpecLocator,
-    SourceArtifactIdentity, SourceArtifactLocator,
+    ProvenanceRecord, SourceArtifactIdentity, SourceArtifactLocator,
     openspec_requirement_id, openspec_scenario_id, openspec_specification_id,
     stable_id,
 )
@@ -50,17 +50,25 @@ class CanonicalOntologyTest(unittest.TestCase):
 
     def test_equivalent_external_evidence_coalesces_and_conflicts_are_order_independent(self) -> None:
         identity = SourceArtifactIdentity("jira", "ENG", "issue", "42", "issues/ENG-42")
-        evidence = Evidence(stable_id("evidence", identity.id), "jira", SourceArtifactLocator(identity))
+        provenance = _external_provenance(identity)
+        evidence = Evidence(stable_id("evidence", identity.id), "jira", SourceArtifactLocator(identity), provenance_ids=(provenance.id,))
         self.assertEqual(
-            GraphSnapshot(evidence=(evidence,)).merged_with(GraphSnapshot(evidence=(evidence,))).evidence,
+            GraphSnapshot(evidence=(evidence,), provenance=(provenance,)).merged_with(GraphSnapshot(evidence=(evidence,), provenance=(provenance,))).evidence,
             (evidence,),
         )
         conflicting = Evidence(
-            evidence.id, "jira", SourceArtifactLocator(identity, {"heading_name": "Conflicting"})
+            evidence.id, "jira", SourceArtifactLocator(identity, {"heading_name": "Conflicting"}), provenance_ids=(provenance.id,)
         )
         for first, second in ((evidence, conflicting), (conflicting, evidence)):
             with self.assertRaisesRegex(ValueError, "Conflicting graph record values"):
-                GraphSnapshot(evidence=(first,)).merged_with(GraphSnapshot(evidence=(second,)))
+                GraphSnapshot(evidence=(first,), provenance=(provenance,)).merged_with(GraphSnapshot(evidence=(second,), provenance=(provenance,)))
+
+
+def _external_provenance(identity: SourceArtifactIdentity) -> ProvenanceRecord:
+    return ProvenanceRecord(
+        "external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64,
+        "test-extractor", "1", identity,
+    )
 
 
 if __name__ == "__main__":
