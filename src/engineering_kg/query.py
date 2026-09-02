@@ -13,8 +13,10 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    has_complete_resolvable_provenance,
 )
 from engineering_kg.persistence import read_graph_snapshot
+from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, relationship_error
 from engineering_kg.validation import GraphValidationResult, validate_graph_integrity
 
 
@@ -118,6 +120,7 @@ class TraceabilityResult:
 
     object_id: str
     relationships: tuple[dict[str, Any], ...] = ()
+    support_records: tuple[dict[str, Any], ...] = ()
     cross_graph_links: tuple[dict[str, Any], ...] = ()
     missing: bool = False
 
@@ -127,6 +130,7 @@ class TraceabilityResult:
             "missing": self.missing,
             "object_id": self.object_id,
             "relationships": [_sanitize_value(item) for item in self.relationships],
+            "support_records": [_sanitize_value(item) for item in self.support_records],
         }
 
 
@@ -226,12 +230,23 @@ class EngineeringKgQuery:
             for edge in _sort_edges(
                 edge
                 for edge in self.snapshot.edges
-                if edge.source_id == object_id or edge.target_id == object_id
+                if (edge.source_id == object_id or edge.target_id == object_id)
+                and self._is_trusted_semantic_edge(edge)
+            )
+        )
+        support_records = tuple(
+            self._edge_result(edge)
+            for edge in _sort_edges(
+                edge
+                for edge in self.snapshot.edges
+                if (edge.source_id == object_id or edge.target_id == object_id)
+                and _value(edge.kind) == EdgeKind.ASSERTS.value
             )
         )
         return TraceabilityResult(
             object_id=object_id,
             relationships=relationships,
+            support_records=support_records,
             cross_graph_links=self._cross_graph_links_for(object_id),
         ).as_dict()
 
@@ -250,10 +265,11 @@ class EngineeringKgQuery:
         repositories = [
             self._nodes_by_id[edge.target_id].id
             for edge in self.snapshot.edges
-            if edge.source_id == node.id
-            and _value(edge.kind) in {EdgeKind.OWNS.value, EdgeKind.CONTAINS.value}
-            and edge.target_id in self._nodes_by_id
-            and _value(self._nodes_by_id[edge.target_id].kind) == NodeKind.REPOSITORY.value
+            if edge.target_id == node.id
+            and _value(edge.kind) == EdgeKind.OWNED_BY.value
+            and edge.source_id in self._nodes_by_id
+            and _value(self._nodes_by_id[edge.source_id].kind) == NodeKind.REPOSITORY.value
+            and self._is_trusted_semantic_edge(edge)
         ]
         properties = dict(node.properties)
         if repositories:
@@ -270,9 +286,9 @@ class EngineeringKgQuery:
 
     def _change_result(self, node: Node) -> QueryNodeResult:
         properties = dict(node.properties)
-        properties["artifact_ids"] = self._targets_for(node.id, EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT)
+        properties["artifact_ids"] = self._targets_for(node.id, EdgeKind.CONTAINS)
         touched = self._targets_for(node.id, EdgeKind.ASSERTS)
-        traced = self._targets_for(node.id, EdgeKind.TRACES_TO)
+        traced = self._targets_for(node.id, EdgeKind.TRACES_TO, trusted_semantic=True)
         properties["asserted_spec_ids"] = touched
         properties["traceability_spec_ids"] = traced
         properties["missing_traceability_spec_ids"] = [
@@ -307,11 +323,35 @@ class EngineeringKgQuery:
             data["provenance"] = [dict(item) for item in provenance]
         return data
 
-    def _targets_for(self, source_id: str, kind: EdgeKind) -> list[str]:
+    def _is_trusted_semantic_edge(self, edge: Edge) -> bool:
+        """Return whether an edge is safe to expose as a semantic relationship."""
+
+        kind = str(_value(edge.kind))
+        definition = CATALOG_BY_KIND.get(kind)
+        return (
+            definition is not None
+            and definition.classification == "semantic"
+            and relationship_error(
+                kind, self._nodes_by_id.get(edge.source_id), self._nodes_by_id.get(edge.target_id)
+            ) is None
+            and bool(edge.evidence_ids)
+            and all(self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids)
+        )
+
+    def _has_complete_provenance(self, evidence_id: str) -> bool:
+        evidence = self._evidence_by_id.get(evidence_id)
+        return evidence is not None and has_complete_resolvable_provenance(
+            evidence, self._provenance_by_id
+        )
+
+    def _targets_for(
+        self, source_id: str, kind: EdgeKind, *, trusted_semantic: bool = False,
+    ) -> list[str]:
         return sorted(
             edge.target_id
             for edge in self.snapshot.edges
             if edge.source_id == source_id and _value(edge.kind) == kind.value
+            and (not trusted_semantic or self._is_trusted_semantic_edge(edge))
         )
 
     def _locators_for(self, evidence_ids: tuple[str, ...]) -> tuple[dict[str, Any], ...]:

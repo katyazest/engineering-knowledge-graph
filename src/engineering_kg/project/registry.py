@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from engineering_kg.ontology import Edge, EdgeKind, GraphSnapshot, Node, NodeKind, stable_id
+from engineering_kg.ontology import GraphSnapshot, Node, NodeKind, stable_id
 
 
 class RegistryValidationError(ValueError):
@@ -146,8 +146,6 @@ class WorkspaceRegistry:
         )
 
         nodes: list[Node] = [workspace_node]
-        edges: list[Edge] = []
-
         for repo in sorted(self.repositories, key=lambda item: item.id):
             repository_node = Node(
                 id=stable_id("node", NodeKind.REPOSITORY, repo.id),
@@ -167,15 +165,6 @@ class WorkspaceRegistry:
                 },
             )
             nodes.append(repository_node)
-            edges.append(
-                Edge(
-                    id=stable_id("edge", EdgeKind.CONTAINS, workspace_node.id, repository_node.id),
-                    kind=EdgeKind.CONTAINS,
-                    source_id=workspace_node.id,
-                    target_id=repository_node.id,
-                )
-            )
-
             if repo.service_id:
                 service_node = Node(
                     id=stable_id("node", NodeKind.SERVICE, repo.service_id),
@@ -184,16 +173,10 @@ class WorkspaceRegistry:
                     properties={"repository_id": repo.id},
                 )
                 nodes.append(service_node)
-                edges.append(
-                    Edge(
-                        id=stable_id("edge", EdgeKind.OWNS, service_node.id, repository_node.id),
-                        kind=EdgeKind.OWNS,
-                        source_id=service_node.id,
-                        target_id=repository_node.id,
-                    )
-                )
 
-        return GraphSnapshot(nodes=tuple(nodes), edges=tuple(edges), evidence=())
+        # Registry configuration establishes inventory only.  It is not
+        # provenance-complete evidence for a trusted ownership relationship.
+        return GraphSnapshot(nodes=tuple(nodes), evidence=())
 
 
 def load_workspace_registry(path: str | Path) -> WorkspaceRegistry:

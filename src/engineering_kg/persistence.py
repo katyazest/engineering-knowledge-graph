@@ -40,6 +40,7 @@ from engineering_kg.ontology import (
     stable_id,
 )
 from engineering_kg.validation import validate_graph_integrity
+from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, CATALOG_REVISION
 
 
 GRAPH_FILE_NAME = "graph.json"
@@ -148,10 +149,17 @@ class LadybugDbStore:
 
     def write_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         try:
-            current = self._migrate_raw_if_needed(self._read_raw())
-            merged = _merge_snapshot(current, snapshot)
-            _snapshot_from_data(merged)
-            self._write_raw(merged)
+            current = _snapshot_from_data(
+                self._migrate_raw_if_needed(self._read_raw())
+            )
+            try:
+                prospective = current.merged_with(snapshot)
+            except ValueError as exc:
+                raise PersistenceIntegrityError(str(exc)) from exc
+            # Validate the full prospective graph, including constraints that
+            # apply across writes, before replacing the persisted snapshot.
+            _validate_snapshot(prospective)
+            self._write_raw(_snapshot_data(prospective))
             return self.read_snapshot()
         except PersistenceError:
             raise
@@ -168,20 +176,12 @@ class LadybugDbStore:
             raise PersistenceReadError(f"Cannot read graph snapshot: {exc}") from exc
 
     def migrate_persisted_snapshot(self) -> OntologyMigrationResult:
-        """Migrate the local graph file, if needed, before downstream use."""
+        """Read and verify the only supported canonical persisted format."""
 
         try:
             data = self._read_raw()
-            result = migrate_graph_snapshot(_snapshot_from_data(data, allow_legacy_evidence=True))
-            if result.migrated:
-                _validate_snapshot(result.snapshot)
-                validation = validate_graph_integrity(result.snapshot)
-                if validation.status != "valid":
-                    raise PersistenceIntegrityError("Migrated graph snapshot failed integrity validation")
-                if self._graph_file.exists():
-                    shutil.copy2(self._graph_file, self.path / MIGRATION_BACKUP_FILE_NAME)
-                self._write_raw(_merge_snapshot(_empty_graph_data(), result.snapshot))
-            return result
+            _require_current_catalog_revision(data)
+            return OntologyMigrationResult(_snapshot_from_data(data))
         except PersistenceError:
             raise
         except OSError as exc:
@@ -204,15 +204,8 @@ class LadybugDbStore:
         os.replace(temporary, self._graph_file)
 
     def _migrate_raw_if_needed(self, data: dict[str, Any]) -> dict[str, Any]:
-        result = migrate_graph_snapshot(_snapshot_from_data(data, allow_legacy_evidence=True))
-        if not result.migrated:
-            return data
-        _validate_snapshot(result.snapshot)
-        if self._graph_file.exists():
-            shutil.copy2(self._graph_file, self.path / MIGRATION_BACKUP_FILE_NAME)
-        migrated = _merge_snapshot(_empty_graph_data(), result.snapshot)
-        self._write_raw(migrated)
-        return migrated
+        _require_current_catalog_revision(data)
+        return data
 
 
 def initialize_ladybugdb_store(path: str | Path) -> LadybugDbStore:
@@ -234,129 +227,50 @@ def read_graph_snapshot(path: str | Path) -> GraphSnapshot:
 
 
 def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
-    """Convert retired OpenSpec domain records to the canonical ontology."""
+    """Verify a current canonical snapshot; historical records are not migrated."""
 
-    snapshot, migrated_evidence = _migrate_legacy_evidence(snapshot)
-
-    node_ids: dict[str, str] = {}
-    nodes: list[Node] = []
-    migrated_nodes = 0
-    for node in snapshot.nodes:
-        kind = _value(node.kind)
-        if kind == "openspec-spec":
-            capability = _expect_string(node.properties.get("capability"), "legacy specification.capability")
-            repository_id = _expect_string(node.properties.get("repository_id"), "legacy specification.repository_id")
-            new_id = openspec_specification_id(repository_id, capability)
-            nodes.append(Node(new_id, NodeKind.SPECIFICATION, capability, {
-                "capability": capability, "repository_id": repository_id
-            }, node.evidence_ids))
-            node_ids[node.id] = new_id
-            migrated_nodes += 1
-        elif kind == "openspec-requirement":
-            capability = _expect_string(node.properties.get("capability"), "legacy requirement.capability")
-            repository_id = _repository_for_legacy_requirement(snapshot.nodes, node, capability)
-            specification_id = openspec_specification_id(repository_id, capability)
-            new_id = openspec_requirement_id(specification_id, node.name)
-            nodes.append(Node(new_id, NodeKind.REQUIREMENT, node.name, {
-                "capability": capability,
-                "requirement_key": _normalized(node.name),
-                "specification_id": specification_id,
-            }, node.evidence_ids))
-            node_ids[node.id] = new_id
-            migrated_nodes += 1
-        elif kind == "openspec-scenario":
-            requirement = _legacy_requirement_for_scenario(snapshot.edges, snapshot.nodes, node.id)
-            capability = _expect_string(requirement.properties.get("capability"), "legacy requirement.capability")
-            repository_id = _repository_for_legacy_requirement(snapshot.nodes, requirement, capability)
-            requirement_id = openspec_requirement_id(
-                openspec_specification_id(repository_id, capability), requirement.name
+    for item in snapshot.evidence:
+        if error := source_artifact_identity_error(item):
+            raise PersistenceIntegrityError(
+                f"legacy-evidence-migration-unsupported: {item.id}: {error}"
             )
-            new_id = openspec_scenario_id(requirement_id, node.name)
-            nodes.append(Node(new_id, NodeKind.SCENARIO, node.name, {
-                "capability": capability,
-                "requirement_id": requirement_id,
-                "scenario_key": _normalized(node.name),
-            }, node.evidence_ids))
-            node_ids[node.id] = new_id
-            migrated_nodes += 1
-        else:
-            nodes.append(node)
-            node_ids[node.id] = node.id
-
-    edge_records: list[tuple[Edge, EdgeKind | str, str, str, dict[str, Any]]] = []
-    migrated_edges = 0
-    legacy_kinds = {
-        "openspec-spec-contains-requirement": EdgeKind.CONTAINS,
-        "openspec-requirement-contains-scenario": EdgeKind.CONTAINS,
-        "openspec-change-touches-spec": EdgeKind.ASSERTS,
-        "openspec-change-traces-to-spec": EdgeKind.TRACES_TO,
-        "openspec-related-spec": EdgeKind.RELATED_TO,
-    }
-    for edge in snapshot.edges:
-        new_kind = legacy_kinds.get(_value(edge.kind))
-        source_id = node_ids[edge.source_id]
-        target_id = node_ids[edge.target_id]
-        properties = dict(edge.properties)
-        if new_kind is None:
-            edge_records.append((edge, edge.kind, source_id, target_id, properties))
-            continue
-        if new_kind == EdgeKind.TRACES_TO:
-            properties.pop("source_scope", None)
-            properties.pop("target_scope", None)
-            properties.pop("via_spec_id", None)
-        edge_records.append((edge, new_kind, source_id, target_id, properties))
-        migrated_edges += 1
-
-    # Resolve asserted edge IDs before rebuilding derived traceability references.
-    nodes_by_id = {node.id: node for node in nodes}
-    edge_ids = {
-        edge.id: _migrated_edge_id(edge, kind, source_id, target_id, properties, nodes_by_id)
-        for edge, kind, source_id, target_id, properties in edge_records
-        if "input_edge_ids" not in properties
-    }
-    edges: list[Edge] = []
-    for edge, kind, source_id, target_id, properties in edge_records:
-        input_edge_ids = properties.get("input_edge_ids")
-        if isinstance(input_edge_ids, (list, tuple)):
-            properties["input_edge_ids"] = tuple(
-                edge_ids.get(input_edge_id, input_edge_id) for input_edge_id in input_edge_ids
-            )
-        edges.append(
-            Edge(
-                _migrated_edge_id(
-                    edge, kind, source_id, target_id, properties, nodes_by_id
-                ),
-                kind,
-                source_id,
-                target_id,
-                properties,
-                edge.evidence_ids,
-                edge.confidence,
-            )
-        )
     try:
-        migrated = GraphSnapshot(
-            nodes=tuple(nodes), edges=tuple(edges), evidence=snapshot.evidence,
-            cross_graph_link_claims=snapshot.cross_graph_link_claims,
-            cross_graph_link_evidence=snapshot.cross_graph_link_evidence,
-            cross_graph_link_lifecycle=snapshot.cross_graph_link_lifecycle,
-            provenance=snapshot.provenance,
+        canonical = GraphSnapshot(
+            snapshot.nodes, snapshot.edges, snapshot.evidence,
+            snapshot.cross_graph_link_claims, snapshot.cross_graph_link_evidence,
+            snapshot.cross_graph_link_lifecycle, snapshot.provenance,
         )
-        migrated = GraphSnapshot().merged_with(migrated)
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
-    return OntologyMigrationResult(migrated, migrated_nodes, migrated_edges + migrated_evidence)
+    _validate_snapshot(canonical)
+    return OntologyMigrationResult(canonical)
+
+
+def _reject_legacy_relationship_migration(snapshot: GraphSnapshot) -> None:
+    """Keep the retained domain migration from converting relationship aliases."""
+
+    for edge in sorted(snapshot.edges, key=lambda item: item.id):
+        kind = _value(edge.kind)
+        if kind != EdgeKind.ASSERTS.value and kind not in CATALOG_BY_KIND:
+            raise PersistenceIntegrityError(
+                f"legacy-relationship-migration-unsupported: {edge.id}: {kind}"
+            )
+
+
+def _require_current_catalog_revision(data: dict[str, Any]) -> None:
+    """Reject historical formats rather than converting them on readback."""
+    revision = data.get("catalog_revision")
+    if revision == CATALOG_REVISION:
+        return
+    if revision is None:
+        raise PersistenceIntegrityError("missing-catalog-revision")
+    raise PersistenceIntegrityError(f"unsupported-catalog-revision: {revision!r}")
 
 
 def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, int]:
-    """Upgrade legacy authoritative records that retain all five identity fields.
+    """Reject retired evidence records; persisted-data migration is unsupported."""
 
-    This deliberately does not use a display label, an absolute path, or the
-    filesystem to fill missing provenance.  Evidence references are rewritten
-    atomically with the evidence ID; canonical node and edge IDs are retained.
-    OpenSpec object detail remains part of its evidence ID, while all other
-    authoritative sources use the common identity-only evidence ID.
-    """
+    raise PersistenceIntegrityError("legacy-evidence-migration-unsupported")
 
     evidence_ids: dict[str, str] = {}
     evidence_by_id: dict[str, Evidence] = {}
@@ -553,6 +467,7 @@ def _value(value: object) -> object:
 
 def _empty_graph_data() -> dict[str, dict[str, Any]]:
     return {
+        "catalog_revision": CATALOG_REVISION,
         "edge_order": [],
         "edges": {},
         "evidence": {},
@@ -575,7 +490,14 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
         merged_snapshot = _snapshot_from_data(data).merged_with(snapshot)
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
+    return _snapshot_data(merged_snapshot)
+
+
+def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
+    """Serialize an already validated canonical snapshot for persistence."""
+
     merged = {
+        "catalog_revision": CATALOG_REVISION,
         "edge_order": [],
         "edges": {},
         "evidence": {},
@@ -592,25 +514,25 @@ def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, 
         "nodes": {},
     }
 
-    for node in merged_snapshot.nodes:
+    for node in snapshot.nodes:
         merged["nodes"][node.id] = node.as_dict()
         merged["node_order"].append(node.id)
-    for edge in merged_snapshot.edges:
+    for edge in snapshot.edges:
         merged["edges"][edge.id] = edge.as_dict()
         merged["edge_order"].append(edge.id)
-    for evidence in merged_snapshot.evidence:
+    for evidence in snapshot.evidence:
         merged["evidence"][evidence.id] = evidence.as_dict()
         merged["evidence_order"].append(evidence.id)
-    for provenance in merged_snapshot.provenance:
+    for provenance in snapshot.provenance:
         merged["provenance"][provenance.id] = provenance.as_dict()
         merged["provenance_order"].append(provenance.id)
-    for claim in merged_snapshot.cross_graph_link_claims:
+    for claim in snapshot.cross_graph_link_claims:
         merged["cross_graph_link_claims"][claim.id] = claim.as_dict()
         merged["cross_graph_link_claim_order"].append(claim.id)
-    for observation in merged_snapshot.cross_graph_link_evidence:
+    for observation in snapshot.cross_graph_link_evidence:
         merged["cross_graph_link_evidence"][observation.id] = observation.as_dict()
         merged["cross_graph_link_evidence_order"].append(observation.id)
-    for lifecycle in merged_snapshot.cross_graph_link_lifecycle:
+    for lifecycle in snapshot.cross_graph_link_lifecycle:
         merged["cross_graph_link_lifecycle"][lifecycle.id] = lifecycle.as_dict()
         merged["cross_graph_link_lifecycle_order"].append(lifecycle.id)
 

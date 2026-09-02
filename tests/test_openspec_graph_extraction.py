@@ -80,6 +80,33 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
         self.assertEqual(validation.status, "valid")
         self.assertTrue(any(item.rule_id == "unresolved-non-confident-related-spec" for item in validation.metadata.diagnostics))
 
+    def test_uniquely_resolved_related_metadata_is_non_confident_references_with_source_evidence(self) -> None:
+        graph = _extract().graph
+        specifications = {
+            node.properties["capability"]: node
+            for node in graph.nodes
+            if node.kind == NodeKind.SPECIFICATION
+        }
+        source = specifications["payments"]
+        target = specifications["settlement"]
+        reference = next(
+            edge for edge in graph.edges
+            if edge.kind == EdgeKind.REFERENCES
+            and edge.source_id == source.id
+            and edge.target_id == target.id
+        )
+
+        self.assertEqual(reference.confidence, "non-confident")
+        self.assertEqual(reference.properties, {"related_title": "Settlement Capability"})
+        self.assertEqual(len(reference.evidence_ids), 1)
+        self.assertIn(reference.evidence_ids[0], source.evidence_ids)
+        evidence = next(item for item in graph.evidence if item.id == reference.evidence_ids[0])
+        self.assertEqual(evidence.source, "openspec")
+        self.assertEqual(
+            evidence.locator.as_dict()["relative_file_path"],
+            "openspec/specs/payments/spec.md",
+        )
+
     def test_change_only_nested_capability_creates_canonical_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

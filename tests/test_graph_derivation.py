@@ -64,6 +64,29 @@ class GraphDerivationTest(unittest.TestCase):
             {"missing-endpoint", "missing-evidence"},
         )
 
+    def test_assertion_requires_every_evidence_record_to_resolve_complete_provenance(self) -> None:
+        change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "JIRA-1")
+        specification = Node(openspec_specification_id("requirements", "payments"), NodeKind.SPECIFICATION, "payments")
+        identity = SourceArtifactIdentity("fixture-source", "derivation", "fixture", "1", "fixtures/derivation.md")
+        complete_provenance = ProvenanceRecord("external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64, "test-extractor", "1", identity)
+        complete_evidence = Evidence("complete", "fixture", "fixture", provenance_ids=(complete_provenance.id,))
+        unresolved_evidence = Evidence("unresolved", "fixture", "fixture")
+        graph = GraphSnapshot(
+            (change, specification),
+            (Edge("assertion", EdgeKind.ASSERTS, change.id, specification.id,
+                  evidence_ids=(complete_evidence.id, unresolved_evidence.id)),),
+            (complete_evidence, unresolved_evidence),
+            provenance=(complete_provenance,),
+        )
+
+        result = derive_graph_relationships(graph)
+
+        self.assertEqual(result.metadata.derived_edge_count, 0)
+        self.assertEqual(
+            result.metadata.diagnostics[0].message,
+            "Cannot derive OpenSpec traceability because asserted provenance is incomplete or unresolved.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

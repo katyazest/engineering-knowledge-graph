@@ -14,6 +14,7 @@ from engineering_kg.ingest.pr_code_candidates import ChangedSymbolMapping, Engin
 from engineering_kg.ontology import Evidence, GraphSnapshot, Node, NodeKind, stable_id
 from engineering_kg.pipeline import run_pipeline
 from engineering_kg.persistence import PersistenceIntegrityError, initialize_ladybugdb_store
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION
 
 ROOT = REPO_ROOT / "tests/fixtures/non-git-workspace/openspec/requirements_repo"
 
@@ -50,7 +51,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         self.assertNotIn("graph-derivation", result["executed_stages"])
         self.assertNotIn("graph-integrity-validation", result["executed_stages"])
 
-    def test_pipeline_migrates_legacy_records_before_derivation_and_validation(self) -> None:
+    def test_pipeline_rejects_legacy_records_without_conversion(self) -> None:
         legacy = Node(
             "legacy-spec",
             "openspec-spec",
@@ -62,6 +63,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
             graph_path = Path(temporary) / "graph"
             store = initialize_ladybugdb_store(graph_path)
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [legacy.id],
                 "nodes": {legacy.id: legacy.as_dict()},
                 "edge_order": [],
@@ -74,9 +76,12 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
                 graph_path,
                 openspec_stores=(RegisteredOpenSpecStore("requirements-store", ROOT),),
             ).as_dict()
-        self.assertEqual(result["ontology_migration"]["status"], "migrated")
-        self.assertEqual(result["graph_integrity_validation"]["metadata"]["status"], "valid")
-        self.assertFalse(any(node["kind"] == "openspec-spec" for node in result["graph"]["nodes"]))
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["ontology_migration"]["status"], "failed")
+        self.assertEqual(result["ontology_migration"]["diagnostics"], [
+            "Retired OpenSpec-prefixed domain vocabulary is not valid in a canonical graph."
+        ])
+        self.assertNotIn("ladybugdb-persistence", result["executed_stages"])
 
     def test_candidate_stage_requires_input_and_prior_available_subject(self) -> None:
         subject_id = "missing-engineering-change"

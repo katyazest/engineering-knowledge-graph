@@ -73,3 +73,11 @@ The system SHALL associate every derived relationship with first-class derived p
 - **WHEN** the OpenSpec change-to-specification derivation produces a traceability edge from evidenced asserted input
 - **THEN** the derived edge retains the rule identity and referenced input provenance identifiers
 - **THEN** the input evidence's source identity, revision, observation time, hash, and extractor metadata remain available through those references
+
+### Requirement: Derivation produces only catalog-conformant relationships
+Graph derivation SHALL validate each proposed output against the canonical relationship catalog before it is emitted. It SHALL derive the existing OpenSpec change-to-specification relationship as `TRACES_TO` only from valid asserted support and complete input provenance, and SHALL skip with a deterministic diagnostic any output with an unsupported kind, endpoint contract, cardinality violation, or absent provenance.
+
+#### Scenario: Invalid derived relationship is skipped
+- **WHEN** a derivation input would produce a relationship outside the catalog contract
+- **THEN** derivation emits no edge for that input
+- **THEN** it reports a deterministic diagnostic without changing other valid derivation output

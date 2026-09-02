@@ -7,7 +7,8 @@ import hashlib
 import json
 from typing import Any
 
-from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceKind, ProvenanceRecord, stable_id
+from engineering_kg.ontology import Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceKind, ProvenanceRecord, has_complete_resolvable_provenance, stable_id
+from engineering_kg.relationship_vocabulary import relationship_error
 
 
 OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE = "openspec-change-to-durable-spec"
@@ -77,7 +78,7 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
     diagnostics: list[GraphDerivationDiagnostic] = []
     evidence_ids = {item.id for item in snapshot.evidence}
     evidence_by_id = {item.id: item for item in snapshot.evidence}
-    provenance_ids = {item.id for item in snapshot.provenance}
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
     derived_evidence: list[Evidence] = []
     derived_provenance: list[ProvenanceRecord] = []
     seen_inputs: set[str] = set()
@@ -133,16 +134,19 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
                 )
             )
             continue
+        if not all(
+            has_complete_resolvable_provenance(evidence_by_id[evidence_id], provenance_by_id)
+            for evidence_id in edge.evidence_ids
+        ):
+            diagnostics.append(GraphDerivationDiagnostic(
+                OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE, edge.id,
+                "Cannot derive OpenSpec traceability because asserted provenance is incomplete or unresolved.", "warning",
+            ))
+            continue
         input_provenance_ids = tuple(sorted({
             provenance_id for evidence_id in edge.evidence_ids
             for provenance_id in evidence_by_id[evidence_id].provenance_ids
         }))
-        if not input_provenance_ids or any(item not in provenance_ids for item in input_provenance_ids):
-            diagnostics.append(GraphDerivationDiagnostic(
-                OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE, edge.id,
-                "Cannot derive OpenSpec traceability because asserted provenance is missing.", "warning",
-            ))
-            continue
         input_representation = json.dumps(
             {"input_edge_id": edge.id, "input_provenance_ids": input_provenance_ids},
             sort_keys=True, separators=(",", ":"),
@@ -159,8 +163,7 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
         )
         derived_provenance.append(provenance)
         derived_evidence.append(provenance_evidence)
-        derived_edges.append(
-            Edge(
+        candidate = Edge(
                 id=stable_id(
                     "edge",
                     EdgeKind.TRACES_TO,
@@ -179,7 +182,15 @@ def derive_graph_relationships(snapshot: GraphSnapshot) -> GraphDerivationResult
                 },
                 evidence_ids=(provenance_evidence.id,),
             )
-        )
+        if error := relationship_error(candidate.kind, change_node, change_scoped_spec):
+            diagnostics.append(GraphDerivationDiagnostic(
+                OPENSPEC_CHANGE_TO_DURABLE_SPEC_RULE, edge.id,
+                f"Cannot derive OpenSpec traceability because catalog admission failed: {error}.", "warning",
+            ))
+            derived_provenance.pop()
+            derived_evidence.pop()
+            continue
+        derived_edges.append(candidate)
 
     derived_graph = GraphSnapshot(
         edges=tuple(sorted(derived_edges, key=lambda item: item.id)),

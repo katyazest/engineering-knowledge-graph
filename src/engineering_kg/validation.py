@@ -29,11 +29,13 @@ from engineering_kg.ontology import (
     openspec_specification_id,
     stable_id,
 )
+from engineering_kg.relationship_vocabulary import relationship_error
 
 
 SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
 OPENSPEC_CHANGE_TRACEABILITY_KINDS = {EdgeKind.ASSERTS.value, EdgeKind.TRACES_TO.value}
 RETIRED_OPENSPEC_DOMAIN_KINDS = {
+    "openspec_change",
     "openspec-spec",
     "openspec-requirement",
     "openspec-scenario",
@@ -124,6 +126,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_evidence_reference_diagnostics(snapshot, evidence_by_id))
     diagnostics.extend(_retired_vocabulary_diagnostics(snapshot))
     diagnostics.extend(_canonical_identity_diagnostics(snapshot.nodes))
+    diagnostics.extend(_relationship_vocabulary_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
     diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
@@ -339,6 +342,9 @@ def _cross_graph_link_diagnostics(
             diagnostics.append(_cross_error("cross-graph-subject-exists", claim.id, "Cross-graph claim subject_id does not reference an existing node."))
         if not _complete_code_locator(claim.target):
             diagnostics.append(_cross_error("cross-graph-target-complete", claim.id, "Cross-graph claim target must be a complete CodeLocator."))
+        error = relationship_error(claim.relation_kind, nodes_by_id.get(claim.subject_id), claim.target)
+        if error:
+            diagnostics.append(_cross_error(error, claim.id, "Cross-graph claim does not satisfy the canonical relationship catalog."))
     for observation in snapshot.cross_graph_link_evidence:
         if observation.claim_id not in claims_by_id:
             diagnostics.append(_cross_error("cross-graph-claim-exists", observation.id, "Cross-graph evidence references an absent claim."))
@@ -350,6 +356,7 @@ def _cross_graph_link_diagnostics(
             diagnostics.append(_cross_error("cross-graph-provenance-complete", observation.id, "Cross-graph evidence requires complete resolvable first-class provenance."))
     revisions: dict[tuple[str, int], CrossGraphLinkLifecycle] = {}
     lifecycle_claims: set[str] = set()
+    latest_lifecycle: dict[str, CrossGraphLinkLifecycle] = {}
     for entry in snapshot.cross_graph_link_lifecycle:
         lifecycle_claims.add(entry.claim_id)
         if entry.claim_id not in claims_by_id:
@@ -369,9 +376,60 @@ def _cross_graph_link_diagnostics(
         if previous is not None and previous.as_dict() != entry.as_dict():
             diagnostics.append(_cross_error("cross-graph-lifecycle-revision-conflict", entry.id, "Cross-graph lifecycle revision has conflicting values."))
         revisions[key] = entry
+        current = latest_lifecycle.get(entry.claim_id)
+        if current is None or entry.revision > current.revision:
+            latest_lifecycle[entry.claim_id] = entry
     for claim in snapshot.cross_graph_link_claims:
         if claim.id not in lifecycle_claims:
             diagnostics.append(_cross_error("cross-graph-lifecycle-current", claim.id, "Cross-graph claim has no determinable current lifecycle revision."))
+        elif (
+            _value(latest_lifecycle[claim.id].state) == "trusted"
+            and not any(item.claim_id == claim.id for item in snapshot.cross_graph_link_evidence)
+        ):
+            diagnostics.append(_cross_error(
+                "cross-graph-trusted-supporting-observation",
+                claim.id,
+                "Trusted cross-graph claims require attributable supporting observation evidence.",
+            ))
+    return diagnostics
+
+
+def _relationship_vocabulary_diagnostics(
+    snapshot: GraphSnapshot, nodes_by_id: dict[str, Node], evidence_by_id: dict[str, object],
+) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    owner_targets: dict[str, set[str]] = defaultdict(set)
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
+    for edge in snapshot.edges:
+        kind = _value(edge.kind)
+        if kind == EdgeKind.ASSERTS.value:
+            # ASSERTS is deliberately narrow non-semantic source support.
+            source, target = nodes_by_id.get(edge.source_id), nodes_by_id.get(edge.target_id)
+            if (source is None or target is None or
+                _value(source.kind) not in {NodeKind.OPENSPEC_ACTIVE_CHANGE.value, NodeKind.OPENSPEC_ARCHIVED_CHANGE.value} or
+                _value(target.kind) != NodeKind.SPECIFICATION.value):
+                diagnostics.append(GraphValidationDiagnostic("error", "asserts-support-contract", edge.id, "ASSERTS is restricted to OpenSpec change-to-specification support."))
+            continue
+        error = relationship_error(kind, nodes_by_id.get(edge.source_id), nodes_by_id.get(edge.target_id))
+        if error:
+            diagnostics.append(GraphValidationDiagnostic("error", error, edge.id, "Edge does not satisfy the canonical relationship catalog."))
+        elif (
+            not edge.evidence_ids
+            or any(
+                evidence_id not in evidence_by_id
+                or not _has_complete_provenance(evidence_by_id[evidence_id], provenance_by_id)
+                for evidence_id in edge.evidence_ids
+            )
+        ):
+            diagnostics.append(GraphValidationDiagnostic(
+                "error", "relationship-provenance-complete", edge.id,
+                "Canonical relationships require complete evidence provenance.",
+            ))
+        if kind == EdgeKind.OWNED_BY.value:
+            owner_targets[edge.source_id].add(edge.target_id)
+    for source_id, targets in sorted(owner_targets.items()):
+        if len(targets) > 1:
+            diagnostics.append(GraphValidationDiagnostic("error", "relationship-cardinality", source_id, "OWNED_BY permits at most one target per source."))
     return diagnostics
 
 
@@ -438,7 +496,7 @@ def _unresolved_related_spec_diagnostics(
 ) -> list[GraphValidationDiagnostic]:
     related_edges_by_source: dict[str, set[str]] = defaultdict(set)
     for edge in edges:
-        if _value(edge.kind) != EdgeKind.RELATED_TO.value:
+        if _value(edge.kind) != EdgeKind.REFERENCES.value:
             continue
         related_title = edge.properties.get("related_title")
         if isinstance(related_title, str):

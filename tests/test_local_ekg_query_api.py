@@ -36,6 +36,93 @@ class LocalEkgQueryApiTest(unittest.TestCase):
         self.assertEqual(trace["provenance"][0]["derivation_rule_id"], "openspec-change-to-durable-spec")
         self.assertEqual(len(trace["provenance"][0]["input_provenance_ids"]), 1)
 
+    def test_traceability_separates_assertion_support_and_excludes_untrusted_edges(self) -> None:
+        change, specification, _, graph = _graph()
+        invalid = Edge(
+            "invalid", EdgeKind.TOUCHES, change.id, specification.id,
+            evidence_ids=(graph.evidence[0].id,),
+        )
+        unprovenanced = Edge(
+            "unprovenanced", EdgeKind.REFERENCES, change.id, specification.id,
+            evidence_ids=("unprovenanced-evidence",),
+        )
+        graph = GraphSnapshot(
+            nodes=graph.nodes,
+            edges=(*graph.edges, invalid, unprovenanced),
+            evidence=(*graph.evidence, Evidence("unprovenanced-evidence", "fixture", "fixture")),
+            provenance=graph.provenance,
+        )
+
+        result = EngineeringKgQuery.from_snapshot(graph).get_traceability(change.id)
+
+        self.assertEqual([item["edge_id"] for item in result["relationships"]], ["trace"])
+        self.assertEqual([item["edge_id"] for item in result["support_records"]], ["assertion"])
+        self.assertNotIn("assertion", [item["edge_id"] for item in result["relationships"]])
+
+    def test_traceability_excludes_malformed_or_unresolved_derived_provenance(self) -> None:
+        change, specification, _, graph = _graph()
+        stale_derived = ProvenanceRecord(
+            "derived", "2026-01-02T03:04:06+00:00", "sha256", "b" * 64,
+            "engineering-kg-derivation", "1", None,
+            "openspec-change-to-durable-spec", ("provenance:" + "f" * 16,),
+        )
+        stale_evidence = Evidence(
+            "stale-derived-evidence", "fixture", "derivation",
+            provenance_ids=(stale_derived.id,),
+        )
+        stale_edge = Edge(
+            "stale-trace", EdgeKind.TRACES_TO, change.id, specification.id,
+            evidence_ids=(stale_evidence.id,),
+        )
+        malformed_derived = ProvenanceRecord(
+            "derived", "2026-01-02T03:04:07+00:00", "sha256", "c" * 64,
+            "engineering-kg-derivation", "1", None,
+            "openspec-change-to-durable-spec", (graph.provenance[0].id,),
+        )
+        object.__setattr__(malformed_derived, "content_hash", "not-a-sha256-digest")
+        malformed_evidence = Evidence(
+            "malformed-derived-evidence", "fixture", "derivation",
+            provenance_ids=(malformed_derived.id,),
+        )
+        malformed_edge = Edge(
+            "malformed-trace", EdgeKind.TRACES_TO, change.id, specification.id,
+            evidence_ids=(malformed_evidence.id,),
+        )
+        snapshot = GraphSnapshot(
+            nodes=graph.nodes,
+            edges=(*graph.edges, stale_edge, malformed_edge),
+            evidence=(*graph.evidence, stale_evidence, malformed_evidence),
+            provenance=(*graph.provenance, stale_derived, malformed_derived),
+            allow_legacy_evidence=True,
+        )
+
+        result = EngineeringKgQuery.from_snapshot(snapshot).get_traceability(change.id)
+
+        self.assertEqual([item["edge_id"] for item in result["relationships"]], ["trace"])
+
+    def test_list_dtos_filter_untrusted_semantic_relationships(self) -> None:
+        change, specification, _, graph = _graph()
+        repository = Node("repository", NodeKind.REPOSITORY, "payments")
+        service = Node("service", NodeKind.SERVICE, "payments")
+        invalid_trace = Edge(
+            "invalid-trace", EdgeKind.TRACES_TO, change.id, specification.id,
+            evidence_ids=("missing-evidence",),
+        )
+        invalid_owner = Edge("invalid-owner", EdgeKind.OWNED_BY, repository.id, service.id)
+        snapshot = GraphSnapshot(
+            nodes=(*graph.nodes, repository, service),
+            edges=(*graph.edges, invalid_trace, invalid_owner),
+            evidence=graph.evidence,
+            provenance=graph.provenance,
+        )
+        query = EngineeringKgQuery.from_snapshot(snapshot)
+
+        change_result = query.list_changes()[0]
+        service_result = query.list_services()[0]
+
+        self.assertEqual(change_result["properties"]["traceability_spec_ids"], [specification.id])
+        self.assertNotIn("repository_ids", service_result["properties"])
+
     def test_filters_canonical_requirements_by_evidence_reference(self) -> None:
         _, _, requirement, graph = _graph()
         result = EngineeringKgQuery.from_snapshot(graph).list_requirements(

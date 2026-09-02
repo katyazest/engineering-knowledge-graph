@@ -782,7 +782,7 @@ def _change_artifacts(
         evidence.append(_evidence(store_source, evidence_id, relative_path, "openspec-artifact", identity))
         edges.append(
             _edge(
-                EdgeKind.OPENSPEC_CHANGE_HAS_ARTIFACT,
+                EdgeKind.CONTAINS,
                 change_node_id,
                 node.id,
                 "change-artifact",
@@ -808,7 +808,7 @@ def _related_spec_edges(durable_specs: list[_ParsedSpec]) -> tuple[list[Edge], l
                 target = matches[0]
                 edges.append(
                     _edge(
-                        EdgeKind.RELATED_TO,
+                        EdgeKind.REFERENCES,
                         spec.node.id,
                         target.node.id,
                         "related-spec",

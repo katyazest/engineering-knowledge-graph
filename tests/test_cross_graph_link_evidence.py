@@ -20,7 +20,11 @@ from engineering_kg.ontology import (
     ProvenanceRecord,
     SourceArtifactIdentity,
 )
-from engineering_kg.persistence import PersistenceIntegrityError, initialize_ladybugdb_store
+from engineering_kg.persistence import (
+    PersistenceIntegrityError,
+    initialize_ladybugdb_store,
+)
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION
 from engineering_kg.validation import validate_graph_integrity
 
 
@@ -63,6 +67,10 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
             CrossGraphLinkClaim("requirement-1", "implements", CodeLocator("", "rev", "file", "symbol"))
         with self.assertRaises(ValueError):
             CrossGraphLinkEvidence(self.claim.id, "", "observation", self.provenance.id)
+
+    def test_legacy_pr_claim_kind_is_rejected_without_conversion(self) -> None:
+        with self.assertRaisesRegex(ValueError, "relationship-vocabulary-kind"):
+            CrossGraphLinkClaim(self.subject.id, "observed-pr-change", self.target)
 
     def test_merge_is_idempotent_and_accumulates_attributable_observations(self) -> None:
         first = CrossGraphLinkEvidence(self.claim.id, "manual", "one", self.provenance.id)
@@ -165,6 +173,121 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         self.assertEqual(self.snapshot("rejected").trusted_cross_graph_links, ())
         self.assertEqual(self.snapshot("superseded").trusted_cross_graph_links, ())
 
+    def test_trusted_projection_retains_distinct_observation_and_lifecycle_provenance(self) -> None:
+        lifecycle_provenance_record = ProvenanceRecord(
+            "external", "2026-01-02T03:05:05+00:00", "sha256", "b" * 64,
+            "test-extractor", "1", self.provenance_record.source_artifact_identity,
+        )
+        lifecycle_provenance = Evidence(
+            "lifecycle-provenance", "fixture", "fixture.md",
+            provenance_ids=(lifecycle_provenance_record.id,),
+        )
+        observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "observation", self.provenance.id,
+        )
+        trusted = GraphSnapshot(
+            nodes=(self.subject,),
+            evidence=(self.provenance, lifecycle_provenance),
+            provenance=(self.provenance_record, lifecycle_provenance_record),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(observation,),
+            cross_graph_link_lifecycle=(
+                CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", lifecycle_provenance.id),
+            ),
+        )
+
+        link = trusted.trusted_cross_graph_links[0]
+
+        self.assertEqual(link.supporting_evidence_ids, (observation.id,))
+        self.assertEqual(
+            link.supporting_provenance_evidence_ids,
+            tuple(sorted((self.provenance.id, lifecycle_provenance.id))),
+        )
+
+    def test_trusted_projection_requires_complete_resolvable_observation_provenance(self) -> None:
+        valid_observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "valid", self.provenance.id
+        )
+        valid = self.snapshot("trusted", (valid_observation,))
+        self.assertEqual(
+            tuple(link.claim_id for link in valid.trusted_cross_graph_links),
+            (self.claim.id,),
+        )
+
+        incomplete = Evidence("incomplete-provenance", "fixture", "fixture.md")
+        incomplete_observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "incomplete", incomplete.id
+        )
+        incomplete_snapshot = GraphSnapshot(
+            nodes=(self.subject,), evidence=(incomplete,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(incomplete_observation,),
+            cross_graph_link_lifecycle=(
+                CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", incomplete.id),
+            ),
+        )
+        self.assertEqual(incomplete_snapshot.trusted_cross_graph_links, ())
+
+        unresolved = Evidence(
+            "unresolved-provenance", "fixture", "fixture.md", provenance_ids=("missing",)
+        )
+        unresolved_observation = CrossGraphLinkEvidence(
+            self.claim.id, "manual", "unresolved", unresolved.id
+        )
+        unresolved_snapshot = GraphSnapshot(
+            nodes=(self.subject,), evidence=(unresolved,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(unresolved_observation,),
+            cross_graph_link_lifecycle=(
+                CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", unresolved.id),
+            ),
+            allow_legacy_evidence=True,
+        )
+        self.assertEqual(unresolved_snapshot.trusted_cross_graph_links, ())
+
+    def test_trusted_projection_rejects_recursive_unresolved_or_cyclic_derived_provenance(self) -> None:
+        unresolved_derived = ProvenanceRecord(
+            "derived", "2026-01-02T03:04:06+00:00", "sha256", "b" * 64,
+            "test-deriver", "1", None, "test-rule", ("provenance:" + "f" * 16,),
+        )
+        unresolved_evidence = Evidence(
+            "unresolved-derived", "fixture", "fixture.md", provenance_ids=(unresolved_derived.id,),
+        )
+        unresolved = GraphSnapshot(
+            nodes=(self.subject,), evidence=(unresolved_evidence,), provenance=(unresolved_derived,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(CrossGraphLinkEvidence(self.claim.id, "manual", "unresolved", unresolved_evidence.id),),
+            cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", unresolved_evidence.id),),
+            allow_legacy_evidence=True,
+        )
+        self.assertEqual(unresolved.trusted_cross_graph_links, ())
+
+        cyclic = ProvenanceRecord(
+            "derived", "2026-01-02T03:04:07+00:00", "sha256", "c" * 64,
+            "test-deriver", "1", None, "test-rule", (self.provenance_record.id,),
+        )
+        object.__setattr__(cyclic, "input_provenance_ids", (cyclic.id,))
+        cyclic_evidence = Evidence("cyclic-derived", "fixture", "fixture.md", provenance_ids=(cyclic.id,))
+        cyclic_snapshot = GraphSnapshot(
+            nodes=(self.subject,), evidence=(cyclic_evidence,), provenance=(cyclic,),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(CrossGraphLinkEvidence(self.claim.id, "manual", "cyclic", cyclic_evidence.id),),
+            cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(self.claim.id, 1, "trusted", cyclic_evidence.id),),
+            allow_legacy_evidence=True,
+        )
+        self.assertEqual(cyclic_snapshot.trusted_cross_graph_links, ())
+
+    def test_trusted_projection_requires_attributable_supporting_observation(self) -> None:
+        trusted_without_observation = self.snapshot("trusted")
+
+        self.assertEqual(trusted_without_observation.trusted_cross_graph_links, ())
+        validation = validate_graph_integrity(trusted_without_observation)
+        self.assertEqual(validation.status, "invalid")
+        self.assertEqual(
+            [item.rule_id for item in validation.metadata.diagnostics],
+            ["cross-graph-trusted-supporting-observation"],
+        )
+
     def test_validation_reports_dangling_records_and_missing_lifecycle(self) -> None:
         dangling = CrossGraphLinkEvidence("missing-claim", "manual", "one", "missing-evidence")
         result = validate_graph_integrity(GraphSnapshot(cross_graph_link_evidence=(dangling,)))
@@ -230,19 +353,21 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
             {item.rule_id for item in result.metadata.diagnostics}
         ))
 
-    def test_persistence_round_trip_legacy_compatibility_and_malformed_rejection(self) -> None:
+    def test_persistence_round_trip_and_malformed_rejection(self) -> None:
         observation = CrossGraphLinkEvidence(self.claim.id, "manual", "one", self.provenance.id)
         graph = self.snapshot("trusted", (observation,))
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "store")
             self.assertEqual(store.write_snapshot(graph).as_dict(), graph.as_dict())
-            store._write_raw({"nodes": {}, "node_order": [], "edges": {}, "edge_order": [], "evidence": {}, "evidence_order": []})
+            store._write_raw({"catalog_revision": CATALOG_REVISION, "nodes": {}, "node_order": [], "edges": {}, "edge_order": [], "evidence": {}, "evidence_order": []})
             legacy = store.read_snapshot()
             self.assertEqual(legacy.cross_graph_link_claims, ())
             malformed = graph.as_dict()["cross_graph_link_evidence"][0]
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "nodes": {self.subject.id: self.subject.as_dict()}, "node_order": [self.subject.id],
                 "edges": {}, "edge_order": [], "evidence": {self.provenance.id: self.provenance.as_dict()}, "evidence_order": [self.provenance.id],
+                "provenance": {self.provenance_record.id: self.provenance_record.as_dict()}, "provenance_order": [self.provenance_record.id],
                 "cross_graph_link_claims": {}, "cross_graph_link_claim_order": [],
                 "cross_graph_link_evidence": {observation.id: malformed}, "cross_graph_link_evidence_order": [observation.id],
                 "cross_graph_link_lifecycle": {}, "cross_graph_link_lifecycle_order": [],
