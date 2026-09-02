@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
 import sys
 
@@ -39,9 +38,35 @@ from engineering_kg.persistence import (
     migrate_graph_snapshot,
 )
 from engineering_kg.project import load_workspace_registry
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION
 
 
 class LadybugDbPersistenceTest(unittest.TestCase):
+    def test_write_rejects_noncanonical_input_without_mutating_storage(self) -> None:
+        legacy_node = Node("legacy-spec", "openspec-spec", "Payments")
+        legacy_change = Node("legacy-change", NodeKind.OPENSPEC_CHANGE, "Payments change")
+        service = Node("service", NodeKind.SERVICE, "service")
+        workspace = Node("workspace", NodeKind.WORKSPACE, "workspace")
+        legacy_relationship = Edge("legacy-owns", "owns", service.id, workspace.id)
+
+        for name, invalid in (
+            ("node", GraphSnapshot(nodes=(legacy_node,))),
+            ("openspec_change", GraphSnapshot(nodes=(legacy_change,))),
+            ("relationship", GraphSnapshot(
+                nodes=(service, workspace), edges=(legacy_relationship,),
+            )),
+        ):
+            with self.subTest(input=name), tempfile.TemporaryDirectory() as tmp:
+                store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+                original = store._graph_file.read_text(encoding="utf-8")
+
+                with self.assertRaises(PersistenceIntegrityError):
+                    store.write_snapshot(invalid)
+
+                self.assertEqual(
+                    store._graph_file.read_text(encoding="utf-8"), original,
+                )
+
     def test_repeated_canonical_writes_merge_evidence(self) -> None:
         node_id = stable_id("node", NodeKind.SPECIFICATION, "requirements", "payments")
         node = lambda evidence_id: Node(
@@ -57,21 +82,31 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             result = store.write_snapshot(GraphSnapshot(nodes=(node("second"),), evidence=(Evidence("second", "fixture", "two"),)))
         self.assertEqual(result.nodes[0].evidence_ids, ("first", "second"))
 
-    def test_migrates_legacy_openspec_records_and_preserves_backup(self) -> None:
+    def test_readback_rejects_legacy_openspec_records_without_conversion(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("spec-evidence",))
         legacy_requirement = Node("legacy-requirement", "openspec-requirement", "Payment is submitted", {"capability": "payments"}, ("requirement-evidence",))
         legacy_edge = Edge("legacy-edge", "openspec-spec-contains-requirement", legacy_spec.id, legacy_requirement.id, evidence_ids=("requirement-evidence",))
         snapshot = GraphSnapshot((legacy_spec, legacy_requirement), (legacy_edge,), (Evidence("spec-evidence", "fixture", "spec.md"), Evidence("requirement-evidence", "fixture", "spec.md")))
-        migrated = migrate_graph_snapshot(snapshot)
-        self.assertTrue(migrated.migrated)
-        self.assertEqual({node.kind for node in migrated.snapshot.nodes}, {NodeKind.SPECIFICATION, NodeKind.REQUIREMENT})
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "Retired OpenSpec-prefixed domain vocabulary"
+        ):
+            migrate_graph_snapshot(GraphSnapshot(nodes=(Node(
+                legacy_spec.id, legacy_spec.kind, legacy_spec.name, legacy_spec.properties,
+            ),)))
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "canonical relationship catalog"
+        ):
+            migrate_graph_snapshot(snapshot)
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"node_order": [item.id for item in snapshot.nodes], "nodes": {item.id: item.as_dict() for item in snapshot.nodes}, "edge_order": [legacy_edge.id], "edges": {legacy_edge.id: legacy_edge.as_dict()}, "evidence_order": [item.id for item in snapshot.evidence], "evidence": {item.id: item.as_dict() for item in snapshot.evidence}})
-            self.assertEqual(store.read_snapshot().node_count, 2)
-            self.assertTrue((store.path / MIGRATION_BACKUP_FILE_NAME).is_file())
+            store._write_raw({"catalog_revision": CATALOG_REVISION, "node_order": [item.id for item in snapshot.nodes], "nodes": {item.id: item.as_dict() for item in snapshot.nodes}, "edge_order": [legacy_edge.id], "edges": {legacy_edge.id: legacy_edge.as_dict()}, "evidence_order": [item.id for item in snapshot.evidence], "evidence": {item.id: item.as_dict() for item in snapshot.evidence}})
+            original = store._graph_file.read_text(encoding="utf-8")
+            with self.assertRaisesRegex(PersistenceIntegrityError, "canonical relationship catalog"):
+                store.read_snapshot()
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
+            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
 
-    def test_migrates_sufficient_legacy_openspec_evidence_and_rewrites_references(self) -> None:
+    def test_readback_rejects_legacy_openspec_evidence_without_conversion(self) -> None:
         node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=("legacy-evidence",))
         legacy = Evidence(
             "legacy-evidence", "openspec",
@@ -82,42 +117,42 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 "stable_locator": "openspec/changes/change/proposal.md",
             }, "provenance": _legacy_external_provenance()},
         )
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "legacy-evidence-migration-unsupported"
+        ):
+            migrate_graph_snapshot(GraphSnapshot(
+                nodes=(node,), evidence=(legacy,), allow_legacy_evidence=True,
+            ))
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"node_order": [node.id], "nodes": {node.id: node.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": [legacy.id], "evidence": {legacy.id: legacy.as_dict()}})
-            result = store.migrate_persisted_snapshot()
-        self.assertTrue(result.migrated)
-        self.assertEqual(result.snapshot.nodes[0].id, node.id)
-        self.assertNotEqual(result.snapshot.nodes[0].evidence_ids, node.evidence_ids)
-        self.assertIsNotNone(result.snapshot.evidence[0].locator.source_artifact_identity)
+            store._write_raw({"catalog_revision": CATALOG_REVISION, "node_order": [node.id], "nodes": {node.id: node.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": [legacy.id], "evidence": {legacy.id: legacy.as_dict()}})
+            original = store._graph_file.read_text(encoding="utf-8")
+            with self.assertRaisesRegex(PersistenceIntegrityError, "explicit source-artifact identity"):
+                store.migrate_persisted_snapshot()
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
 
-    def test_migrates_sufficient_legacy_non_openspec_authoritative_evidence(self) -> None:
+    def test_migration_rejects_legacy_authoritative_evidence_without_conversion(self) -> None:
         identity_fields = {
             "source_type": "bitbucket", "source_identity": "payments",
             "artifact_type": "pull-request", "revision_or_version": "abc123",
             "stable_locator": "pull-requests/7",
         }
-        node = Node("canonical-node", NodeKind.REPOSITORY, "payments", evidence_ids=("legacy",))
-        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=("legacy",))
+        node = Node("canonical-node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=("legacy",))
+        artifact = Node("artifact", NodeKind.OPENSPEC_ARTIFACT, "proposal")
+        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, artifact.id, evidence_ids=("legacy",))
         legacy = Evidence("legacy", "bitbucket", "legacy-pr-7", {
             "source_artifact_identity": identity_fields,
             "provenance": _legacy_external_provenance(),
         })
 
-        migrated = migrate_graph_snapshot(
-            GraphSnapshot((node,), (edge,), (legacy,), allow_legacy_evidence=True)
-        ).snapshot
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "legacy-evidence-migration-unsupported"
+        ):
+            migrate_graph_snapshot(
+                GraphSnapshot((node, artifact), (edge,), (legacy,), allow_legacy_evidence=True)
+            )
 
-        identity = SourceArtifactIdentity(**identity_fields)
-        evidence = migrated.evidence[0]
-        self.assertEqual(evidence.id, stable_id("evidence", identity.id))
-        self.assertEqual(evidence.locator, SourceArtifactLocator(identity))
-        self.assertEqual(migrated.nodes[0].id, node.id)
-        self.assertEqual(migrated.edges[0].id, edge.id)
-        self.assertEqual(migrated.nodes[0].evidence_ids, (evidence.id,))
-        self.assertEqual(migrated.edges[0].evidence_ids, (evidence.id,))
-
-    def test_complete_legacy_migration_retains_only_provenance_association_on_readback(self) -> None:
+    def test_readback_rejects_legacy_evidence_without_conversion(self) -> None:
         identity_fields = {
             "source_type": "bitbucket", "source_identity": "payments",
             "artifact_type": "pull-request", "revision_or_version": "abc123",
@@ -130,20 +165,16 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                 "evidence_order": [legacy.id], "evidence": {legacy.id: legacy.as_dict()},
             })
-            readback = store.read_snapshot()
-            persisted = store._graph_file.read_text(encoding="utf-8")
+            original = store._graph_file.read_text(encoding="utf-8")
+            with self.assertRaisesRegex(PersistenceIntegrityError, "explicit source-artifact identity"):
+                store.read_snapshot()
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
 
-        self.assertEqual(readback.evidence[0].properties, {})
-        self.assertEqual(readback.evidence[0].provenance_ids, (readback.provenance[0].id,))
-        persisted_evidence = json.loads(persisted)["evidence"][readback.evidence[0].id]
-        self.assertEqual(persisted_evidence["properties"], {})
-        self.assertNotIn("provenance", persisted_evidence)
-        self.assertNotIn("legacy-pr-7", persisted)
-
-    def test_coalesces_equivalent_legacy_evidence_with_the_same_migrated_id(self) -> None:
+    def test_migration_rejects_equivalent_legacy_evidence_without_coalescing(self) -> None:
         identity_fields = {
             "source_type": "openspec", "source_identity": "requirements",
             "artifact_type": "openspec-artifact", "revision_or_version": "a" * 40,
@@ -160,26 +191,21 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             {"source_artifact_identity": identity_fields, "provenance": _legacy_external_provenance()},
         )
         node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=(first.id, second.id))
-        edge = Edge("edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=(second.id, first.id))
+        artifact = Node("artifact", NodeKind.OPENSPEC_ARTIFACT, "proposal")
+        edge = Edge("edge", EdgeKind.CONTAINS, node.id, artifact.id, evidence_ids=(second.id, first.id))
 
-        migrated = migrate_graph_snapshot(
-            GraphSnapshot((node,), (edge,), (second, first), allow_legacy_evidence=True)
-        ).snapshot
-        reverse_migrated = migrate_graph_snapshot(
-            GraphSnapshot((node,), (edge,), (first, second), allow_legacy_evidence=True)
-        ).snapshot
-
-        self.assertEqual(migrated.evidence_count, 1)
-        migrated_evidence_id = migrated.evidence[0].id
-        self.assertEqual(migrated.nodes[0].evidence_ids, (migrated_evidence_id,))
-        self.assertEqual(migrated.edges[0].evidence_ids, (migrated_evidence_id,))
-        self.assertEqual(migrated.as_json(), reverse_migrated.as_json())
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "legacy-evidence-migration-unsupported"
+        ):
+            migrate_graph_snapshot(
+                GraphSnapshot((node, artifact), (edge,), (second, first), allow_legacy_evidence=True)
+            )
 
     def test_rejects_ambiguous_legacy_openspec_evidence_without_path_inference(self) -> None:
         snapshot = GraphSnapshot(evidence=(
             Evidence("legacy", "openspec", OpenSpecLocator("/tmp/spec.md", "openspec-spec", "durable:payments")),
         ), allow_legacy_evidence=True)
-        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-source-artifact-identity"):
+        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-evidence-migration-unsupported"):
             migrate_graph_snapshot(snapshot)
 
     def test_rejects_legacy_evidence_without_retained_provenance(self) -> None:
@@ -193,7 +219,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-spec", "durable:payments"),
             {"source_artifact_identity": identity_fields},
         )
-        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-provenance"):
+        with self.assertRaisesRegex(PersistenceIntegrityError, "legacy-evidence-migration-unsupported"):
             migrate_graph_snapshot(GraphSnapshot(evidence=(legacy,), allow_legacy_evidence=True))
 
     def test_readback_rejects_openspec_locator_identity_disagreement(self) -> None:
@@ -215,6 +241,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                 "evidence_order": [raw_evidence["id"]],
                 "evidence": {raw_evidence["id"]: raw_evidence},
@@ -248,6 +275,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             with self.subTest(mapping=mapping_name, field=field), tempfile.TemporaryDirectory() as tmp:
                 store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
                 store._write_raw({
+                    "catalog_revision": CATALOG_REVISION,
                     "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                     "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
                 })
@@ -257,37 +285,46 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 ):
                     store.read_snapshot()
 
-    def test_migration_rewrites_derived_traceability_input_ids_and_is_idempotent(self) -> None:
+    def test_migration_rejects_legacy_traceability_relationships_without_conversion(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("e",))
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change")
         assertion = Edge("legacy-assertion", "openspec-change-touches-spec", change.id, legacy_spec.id, evidence_ids=("e",))
         trace = Edge("legacy-trace", "openspec-change-traces-to-spec", change.id, legacy_spec.id, {"derived": True, "input_edge_ids": (assertion.id,), "rule_id": "openspec-change-to-durable-spec"}, ("e",))
-        migrated = migrate_graph_snapshot(GraphSnapshot((change, legacy_spec), (assertion, trace), (Evidence("e", "fixture", "fixture"),)))
-        migrated_assertion = next(edge for edge in migrated.snapshot.edges if edge.kind == EdgeKind.ASSERTS)
-        migrated_trace = next(edge for edge in migrated.snapshot.edges if edge.kind == EdgeKind.TRACES_TO)
-        self.assertEqual(migrated_trace.properties["input_edge_ids"], (migrated_assertion.id,))
-        self.assertFalse(migrate_graph_snapshot(migrated.snapshot).migrated)
+        provenance = _external_provenance(SourceArtifactIdentity(
+            "openspec", "requirements", "openspec-artifact", "a" * 40,
+            "openspec/changes/change/proposal.md",
+        ))
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "canonical relationship catalog"
+        ):
+            migrate_graph_snapshot(GraphSnapshot(
+                (change, legacy_spec), (assertion, trace),
+                (Evidence("e", "fixture", "fixture", provenance_ids=(provenance.id,)),),
+                provenance=(provenance,),
+            ))
 
-    def test_legacy_evidence_migration_preserves_canonical_node_and_edge_ids(self) -> None:
+    def test_migration_rejects_legacy_openspec_evidence_without_rewriting_ids(self) -> None:
         identity_fields = {
             "source_type": "openspec", "source_identity": "requirements",
             "artifact_type": "openspec-spec", "revision_or_version": "a" * 40,
             "stable_locator": "openspec/specs/payments/spec.md",
         }
-        node = Node("canonical-node", NodeKind.REPOSITORY, "requirements", evidence_ids=("legacy",))
-        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, node.id, evidence_ids=("legacy",))
+        node = Node("canonical-node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=("legacy",))
+        artifact = Node("artifact", NodeKind.OPENSPEC_ARTIFACT, "proposal")
+        edge = Edge("canonical-edge", EdgeKind.CONTAINS, node.id, artifact.id, evidence_ids=("legacy",))
         legacy = Evidence(
             "legacy", "openspec",
             OpenSpecLocator("openspec/specs/payments/spec.md", "openspec-spec", "durable:payments"),
             {"source_artifact_identity": identity_fields, "provenance": _legacy_external_provenance()},
         )
-        migrated = migrate_graph_snapshot(
-            GraphSnapshot((node,), (edge,), (legacy,), allow_legacy_evidence=True)
-        ).snapshot
-        self.assertEqual(migrated.nodes[0].id, node.id)
-        self.assertEqual(migrated.edges[0].id, edge.id)
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "legacy-evidence-migration-unsupported"
+        ):
+            migrate_graph_snapshot(
+                GraphSnapshot((node, artifact), (edge,), (legacy,), allow_legacy_evidence=True)
+            )
 
-    def test_migrated_legacy_graph_matches_clean_canonical_rebuild(self) -> None:
+    def test_migration_rejects_legacy_graph_relationships_without_rebuild(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("spec-evidence",))
         legacy_requirement = Node("legacy-requirement", "openspec-requirement", "Payment is submitted", {"capability": "payments"}, ("requirement-evidence",))
         legacy_scenario = Node("legacy-scenario", "openspec-scenario", "Valid payment", {"capability": "payments"}, ("scenario-evidence",))
@@ -302,20 +339,10 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             ),
             tuple(Evidence(item, "fixture", "fixture") for item in ("spec-evidence", "requirement-evidence", "scenario-evidence", "change-evidence")),
         )
-        migrated = migrate_graph_snapshot(legacy_graph).snapshot
-        specification = next(node for node in migrated.nodes if node.kind == NodeKind.SPECIFICATION)
-        requirement = next(node for node in migrated.nodes if node.kind == NodeKind.REQUIREMENT)
-        scenario = next(node for node in migrated.nodes if node.kind == NodeKind.SCENARIO)
-        clean_rebuild = GraphSnapshot(
-            (specification, requirement, scenario, change),
-            (
-                Edge(stable_id("edge", EdgeKind.CONTAINS, specification.id, requirement.id, "spec-requirement", "specification-requirement"), EdgeKind.CONTAINS, specification.id, requirement.id, evidence_ids=("requirement-evidence",)),
-                Edge(stable_id("edge", EdgeKind.CONTAINS, requirement.id, scenario.id, "requirement-scenario", "requirement-scenario"), EdgeKind.CONTAINS, requirement.id, scenario.id, evidence_ids=("scenario-evidence",)),
-                Edge(stable_id("edge", EdgeKind.ASSERTS, change.id, specification.id, "openspec-change-specification", "add-payments", "payments"), EdgeKind.ASSERTS, change.id, specification.id, evidence_ids=("spec-evidence",)),
-            ),
-            legacy_graph.evidence,
-        )
-        self.assertEqual(migrated.as_json(), clean_rebuild.as_json())
+        with self.assertRaisesRegex(
+            PersistenceIntegrityError, "canonical relationship catalog"
+        ):
+            migrate_graph_snapshot(legacy_graph)
 
     def test_migration_rejects_conflicting_canonical_records(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"})
@@ -327,17 +354,16 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with self.assertRaises(PersistenceIntegrityError):
             migrate_graph_snapshot(GraphSnapshot(nodes=(legacy_spec, conflicting)))
 
-    def test_migration_write_failure_preserves_graph_and_backup(self) -> None:
+    def test_readback_rejection_preserves_graph_without_backup(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("e",))
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"node_order": [legacy_spec.id], "nodes": {legacy_spec.id: legacy_spec.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": ["e"], "evidence": {"e": Evidence("e", "fixture", "fixture").as_dict()}})
+            store._write_raw({"catalog_revision": CATALOG_REVISION, "node_order": [legacy_spec.id], "nodes": {legacy_spec.id: legacy_spec.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": ["e"], "evidence": {"e": Evidence("e", "fixture", "fixture").as_dict()}})
             original = store._graph_file.read_text(encoding="utf-8")
-            with mock.patch("engineering_kg.persistence.os.replace", side_effect=OSError("disk full")):
-                with self.assertRaises(PersistenceWriteError):
-                    store.migrate_persisted_snapshot()
+            with self.assertRaises(PersistenceIntegrityError):
+                store.migrate_persisted_snapshot()
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
-            self.assertTrue((store.path / MIGRATION_BACKUP_FILE_NAME).is_file())
+            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
 
     def test_invalid_migration_preserves_original_snapshot(self) -> None:
         legacy_spec = Node(
@@ -357,6 +383,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [item.id for item in snapshot.nodes],
                 "nodes": {item.id: item.as_dict() for item in snapshot.nodes},
                 "edge_order": [item.id for item in snapshot.edges],
@@ -369,6 +396,58 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 store.migrate_persisted_snapshot()
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
             self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+
+    def test_current_readback_rejects_noncanonical_relationships_without_conversion(self) -> None:
+        owner = Node("owner", NodeKind.SERVICE, "owner")
+        resource = Node("resource", NodeKind.WORKSPACE, "resource")
+        legacy_owns = Edge("legacy-owns", "owns", owner.id, resource.id)
+        snapshot = GraphSnapshot(nodes=(owner, resource), edges=(legacy_owns,))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({
+                "catalog_revision": "1",
+                "node_order": [item.id for item in snapshot.nodes],
+                "nodes": {item.id: item.as_dict() for item in snapshot.nodes},
+                "edge_order": [legacy_owns.id],
+                "edges": {legacy_owns.id: legacy_owns.as_dict()},
+            })
+            original = store._graph_file.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                PersistenceIntegrityError,
+                "canonical relationship catalog",
+            ):
+                store.read_snapshot()
+
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
+            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+
+    def test_readback_rejects_missing_catalog_revision_without_writing(self) -> None:
+        node = Node("node", NodeKind.REPOSITORY, "payments")
+        raw = {"node_order": [node.id], "nodes": {node.id: node.as_dict()}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            self.assertEqual(store.read_snapshot(), GraphSnapshot())
+            store._write_raw(raw)
+            original = store._graph_file.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(PersistenceIntegrityError, "missing-catalog-revision"):
+                store.read_snapshot()
+
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
+
+    def test_readback_rejects_unsupported_catalog_revision_without_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+            store._write_raw({"catalog_revision": "2"})
+            original = store._graph_file.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: '2'"):
+                store.read_snapshot()
+
+            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
 
     def test_empty_store_initializes_and_reads_empty_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -409,10 +488,13 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             name="payment-service",
         )
         edge = Edge(
-            id=stable_id("edge", EdgeKind.REFERENCES_CODE, node.id, "create_payment"),
-            kind=EdgeKind.REFERENCES_CODE,
+            id=stable_id("edge", EdgeKind.REFERENCES, node.id, "create_payment"),
+            kind=EdgeKind.REFERENCES,
             source_id=node.id,
             target_id=node.id,
+            evidence_ids=(stable_id("evidence", SourceArtifactIdentity(
+                "confluence", "engineering-wiki", "page", "123", "pages/123456789"
+            ).id),),
         )
         confluence_identity = SourceArtifactIdentity(
             "confluence", "engineering-wiki", "page", "123", "pages/123456789"
@@ -477,6 +559,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                 "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
             })
@@ -499,6 +582,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 with self.subTest(field=field, value=unsafe_value), tempfile.TemporaryDirectory() as tmp:
                     store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
                     store._write_raw({
+                        "catalog_revision": CATALOG_REVISION,
                         "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                         "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
                     })

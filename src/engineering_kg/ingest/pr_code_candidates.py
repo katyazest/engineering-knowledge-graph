@@ -25,10 +25,11 @@ from engineering_kg.ontology import (
     ProvenanceRecord,
     stable_id,
 )
+from engineering_kg.relationship_vocabulary import RelationshipKind
 
 
 STRATEGY_ID = "pr-code-candidate-extraction"
-RELATION_KIND = "observed-pr-change"
+RELATION_KIND = RelationshipKind.TOUCHES.value
 
 # A PR mapping supplies a code-side identity, not display text or source.  The
 # extractor accepts a portable, fully-qualified identifier form so it can be
@@ -67,6 +68,7 @@ class MappingOutcome(StrEnum):
     UNRESOLVED = "unresolved"
     AMBIGUOUS = "ambiguous"
     MALFORMED = "malformed"
+    UNSUPPORTED = "unsupported"
 
 
 def _text(value: object, field_name: str) -> str:
@@ -167,7 +169,9 @@ class ChangedSymbolMapping:
         try:
             outcome = MappingOutcome(self.outcome)
         except ValueError:
-            raise PrCodeCandidateValidationError("mapping.outcome is unsupported") from None
+            # A future/provider-specific relationship assertion has no approved
+            # source mapping. Preserve only its classified non-admission state.
+            outcome = MappingOutcome.UNSUPPORTED
         object.__setattr__(self, "outcome", outcome)
         if mapping_id is None:
             object.__setattr__(self, "outcome", MappingOutcome.MALFORMED)
@@ -380,8 +384,13 @@ def extract_pr_code_candidates(
                     reported_conflicts.add(mapping.id)
                 continue
             if mapping.outcome is not MappingOutcome.RESOLVED:
+                reason_code = (
+                    "unsupported-source-mapping"
+                    if mapping.outcome is MappingOutcome.UNSUPPORTED
+                    else f"{mapping.outcome.value}-symbol"
+                )
                 diagnostics.append(PrCodeCandidateDiagnostic(
-                    f"{mapping.outcome.value}-symbol", change_set.id, mapping.id, provenance.id
+                    reason_code, change_set.id, mapping.id, provenance.id
                 ))
                 continue
             # Constructors protect complete strings; this guard preserves behavior for

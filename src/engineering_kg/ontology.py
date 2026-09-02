@@ -34,13 +34,14 @@ class EdgeKind(StrEnum):
     CONTAINS = "contains"
     DEPENDS_ON = "depends_on"
     IMPLEMENTS = "implements"
-    IMPLEMENTS_CHANGE = "implements_change"
     TRACES_TO = "traces_to"
-    REFERENCES_CODE = "references_code"
-    OWNS = "owns"
-    OPENSPEC_CHANGE_HAS_ARTIFACT = "openspec-change-has-artifact"
+    VERIFIED_BY = "verified_by"
+    TOUCHES = "touches"
+    REFERENCES = "references"
+    OWNED_BY = "owned_by"
+    PROVIDES = "provides"
+    # ASSERTS is support for OpenSpec derivation, never a semantic catalog edge.
     ASSERTS = "asserts"
-    RELATED_TO = "related_to"
 
 
 class ProvenanceKind(StrEnum):
@@ -482,6 +483,11 @@ class CrossGraphLinkClaim:
 
     def __post_init__(self) -> None:
         cross_graph_link_claim_id(self.subject_id, self.relation_kind, self.target)
+        from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, complete_code_locator
+        if self.relation_kind not in CATALOG_BY_KIND:
+            raise ValueError("relationship-vocabulary-kind")
+        if not CATALOG_BY_KIND[self.relation_kind].permits_code_locator or not complete_code_locator(self.target):
+            raise ValueError("relationship-code-locator-contract")
 
     @property
     def id(self) -> str:
@@ -827,14 +833,23 @@ class GraphSnapshot:
         evidence_by_claim: dict[str, list[CrossGraphLinkEvidence]] = {}
         for observation in self.cross_graph_link_evidence:
             evidence_by_claim.setdefault(observation.claim_id, []).append(observation)
+        evidence_by_id = {item.id: item for item in self.evidence}
+        provenance_by_id = {item.id: item for item in self.provenance}
         return tuple(
             TrustedCrossGraphLink(claim.id, claim.subject_id, claim.relation_kind, claim.target,
                 tuple(item.id for item in evidence_by_claim.get(claim.id, ())),
-                tuple(sorted({item.provenance_evidence_id for item in evidence_by_claim.get(claim.id, ())})))
+                tuple(sorted({
+                    *(item.provenance_evidence_id for item in evidence_by_claim.get(claim.id, ())),
+                    lifecycles[claim.id].provenance_evidence_id,
+                })))
             for claim in self.cross_graph_link_claims
             if claim.id not in invalid_claims
             and lifecycles.get(claim.id) is not None
             and _lifecycle_state_value(lifecycles[claim.id].state) == CrossGraphLinkLifecycleState.TRUSTED.value
+            and _trusted_claim_is_catalog_valid(claim, {node.id: node for node in self.nodes})
+            and _trusted_claim_has_complete_provenance(
+                claim.id, lifecycles[claim.id], evidence_by_claim, evidence_by_id, provenance_by_id,
+            )
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -935,29 +950,85 @@ def _validate_cross_graph_claim_references(
             raise ValueError(f"Cross-graph lifecycle requires complete provenance: {entry.id}")
 
 
-def _has_complete_provenance(
+def has_complete_resolvable_provenance(
     evidence: Evidence, provenance_by_id: dict[str, ProvenanceRecord],
 ) -> bool:
-    """Return whether evidence resolves exclusively to valid first-class provenance."""
+    """Return whether every provenance record resolves through a valid acyclic chain."""
 
     if not evidence.provenance_ids:
         return False
-    for provenance_id in evidence.provenance_ids:
-        record = provenance_by_id.get(provenance_id)
-        if record is None:
-            return False
-        try:
-            expected = ProvenanceRecord(
-                record.kind, record.observed_at, record.content_hash_algorithm,
-                record.content_hash, record.extractor_id, record.extractor_version,
-                record.source_artifact_identity, record.derivation_rule_id,
-                record.input_provenance_ids,
-            )
-        except (AttributeError, ValueError):
-            return False
-        if record.id != expected.id:
-            return False
-    return True
+    return all(
+        _has_valid_provenance_record(provenance_id, provenance_by_id, set())
+        for provenance_id in evidence.provenance_ids
+    )
+
+
+def _has_valid_provenance_record(
+    provenance_id: str,
+    provenance_by_id: dict[str, ProvenanceRecord],
+    resolving_ids: set[str],
+) -> bool:
+    """Validate a provenance record, including every derived input recursively."""
+
+    if provenance_id in resolving_ids:
+        return False
+    record = provenance_by_id.get(provenance_id)
+    if record is None:
+        return False
+    try:
+        expected = ProvenanceRecord(
+            record.kind, record.observed_at, record.content_hash_algorithm,
+            record.content_hash, record.extractor_id, record.extractor_version,
+            record.source_artifact_identity, record.derivation_rule_id,
+            record.input_provenance_ids,
+        )
+    except (AttributeError, ValueError):
+        return False
+    if record.id != expected.id:
+        return False
+    if record.kind is not ProvenanceKind.DERIVED:
+        return True
+    return all(
+        _has_valid_provenance_record(input_id, provenance_by_id, resolving_ids | {provenance_id})
+        for input_id in record.input_provenance_ids
+    )
+
+
+# Compatibility for existing internal validation imports.
+def _has_complete_provenance(
+    evidence: Evidence, provenance_by_id: dict[str, ProvenanceRecord],
+) -> bool:
+    return has_complete_resolvable_provenance(evidence, provenance_by_id)
+
+
+def _trusted_claim_is_catalog_valid(
+    claim: CrossGraphLinkClaim, nodes_by_id: dict[str, Node],
+) -> bool:
+    from engineering_kg.relationship_vocabulary import relationship_error
+    return relationship_error(claim.relation_kind, nodes_by_id.get(claim.subject_id), claim.target) is None
+
+
+def _trusted_claim_has_complete_provenance(
+    claim_id: str,
+    lifecycle: CrossGraphLinkLifecycle,
+    evidence_by_claim: dict[str, list[CrossGraphLinkEvidence]],
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> bool:
+    """Require attributed observation and resolvable provenance for trusted projection."""
+
+    lifecycle_evidence = evidence_by_id.get(lifecycle.provenance_evidence_id)
+    if lifecycle_evidence is None or not _has_complete_provenance(
+        lifecycle_evidence, provenance_by_id
+    ):
+        return False
+    observations = evidence_by_claim.get(claim_id, ())
+    return bool(observations) and all(
+        (observation_evidence := evidence_by_id.get(observation.provenance_evidence_id))
+        is not None
+        and _has_complete_provenance(observation_evidence, provenance_by_id)
+        for observation in observations
+    )
 
 
 def _merge_records(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:

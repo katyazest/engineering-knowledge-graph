@@ -133,8 +133,9 @@ class WorkspaceRegistryTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first["node_count"], 5)
-        self.assertEqual(first["edge_count"], 4)
+        self.assertEqual(first["edge_count"], 0)
         self.assertEqual(first["evidence_count"], 0)
+        self.assertFalse(any(edge["kind"] == "owned_by" for edge in first["edges"]))
         self.assertEqual(first["nodes"][0]["kind"], NodeKind.WORKSPACE.value)
 
         repository_nodes = [
@@ -159,7 +160,7 @@ class WorkspaceRegistryTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(first["node_count"], 6)
-        self.assertEqual(first["edge_count"], 5)
+        self.assertEqual(first["edge_count"], 0)
         self.assertEqual(workspace_node["properties"]["engineering_kg"]["store_repository"], "requirements")
         self.assertEqual(
             workspace_node["properties"]["layout"]["resolved_root_path"],

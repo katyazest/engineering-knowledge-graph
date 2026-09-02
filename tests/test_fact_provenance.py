@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from engineering_kg.ontology import Evidence, GraphSnapshot, ProvenanceKind, ProvenanceRecord, SourceArtifactIdentity, SourceArtifactLocator, stable_id
 from engineering_kg.persistence import PersistenceIntegrityError, initialize_ladybugdb_store
 from engineering_kg.query import EngineeringKgQuery, GraphQueryValidationError
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION
 from engineering_kg.validation import validate_graph_integrity
 
 
@@ -181,6 +182,7 @@ class FactProvenanceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "store")
             store._write_raw({
+                "catalog_revision": CATALOG_REVISION,
                 "provenance": {raw_derived["id"]: raw_derived},
                 "provenance_order": [raw_derived["id"]],
             })

@@ -10,6 +10,9 @@
 - OpenLore owns code graph.
 - LadybugDB stores engineering knowledge only.
 - Engineering KG graph data is local generated state.
+- EKG has no historical deployment or persisted graph data. Compatibility,
+  migration, backup, or rollback work requires a future explicit requirement
+  backed by concrete evidence of pre-canonical data.
 - One service = one repository.
 - The project workspace may own one workspace-level OpenLore index.
 - The project workspace is not required to be a Git repository.

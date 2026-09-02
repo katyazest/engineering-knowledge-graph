@@ -117,18 +117,27 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         self.assertEqual(result.metadata.accepted_change_set_count, 1)
         self.assertEqual(result.metadata.emitted_candidate_count, 1)
         claim = result.graph.cross_graph_link_claims[0]
-        self.assertEqual(claim.relation_kind, "observed-pr-change")
+        self.assertEqual(claim.relation_kind, "touches")
         self.assertEqual(claim.target.revision, "a" * 40)
         self.assertEqual(result.graph.trusted_cross_graph_links, ())
         self.assertEqual(result.graph.edges, ())
         graph = GraphSnapshot(nodes=(self.subject,)).merged_with(result.graph)
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
-        promoted = GraphSnapshot(
+        incomplete_review = Evidence("review", "review", "review-1")
+        incomplete_promoted = GraphSnapshot(
             nodes=graph.nodes,
-            evidence=(*graph.evidence, Evidence("review", "review", "review-1")),
+            evidence=(*graph.evidence, incomplete_review),
             provenance=graph.provenance,
             cross_graph_link_claims=graph.cross_graph_link_claims, cross_graph_link_evidence=graph.cross_graph_link_evidence,
-            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", "review")),
+            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", incomplete_review.id)),
+        )
+        self.assertEqual(incomplete_promoted.trusted_cross_graph_links, ())
+
+        review = Evidence("review", "review", "review-1", provenance_ids=(graph.provenance[0].id,))
+        promoted = GraphSnapshot(
+            nodes=graph.nodes, evidence=(*graph.evidence, review), provenance=graph.provenance,
+            cross_graph_link_claims=graph.cross_graph_link_claims, cross_graph_link_evidence=graph.cross_graph_link_evidence,
+            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", review.id)),
         )
         self.assertEqual(promoted.trusted_cross_graph_links[0].claim_id, claim.id)
         self.assertEqual(len(promoted.cross_graph_link_evidence), 1)
@@ -195,6 +204,25 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             self.assertEqual(provenance[diagnostic.provenance_evidence_id].properties["source_mapping_id"], mapping_id)
         missing = extract_pr_code_candidates((base,), GraphSnapshot())
         self.assertEqual(missing.metadata.diagnostics[0].reason_code, "missing-subject")
+
+    def test_unsupported_source_mapping_is_diagnosed_and_not_admitted(self) -> None:
+        unsupported = normalize_merged_pr_change_set({
+            **self.raw,
+            "mappings": [{
+                "id": "graphify:unsupported-relationship",
+                "file": "src/payments.py",
+                "outcome": "provider-specific-implements",
+                "symbol": "payments.submit",
+            }],
+        })
+
+        result = extract_pr_code_candidates((unsupported,), GraphSnapshot(nodes=(self.subject,)))
+
+        self.assertEqual(result.graph.cross_graph_link_claims, ())
+        self.assertEqual(result.graph.cross_graph_link_evidence, ())
+        self.assertEqual(result.graph.cross_graph_link_lifecycle, ())
+        self.assertEqual(result.metadata.skipped_reason_counts, {"unsupported-source-mapping": 1})
+        self.assertEqual(result.metadata.diagnostics[0].reason_code, "unsupported-source-mapping")
 
     def test_conflicting_source_mapping_identity_is_not_admitted(self) -> None:
         base = normalize_merged_pr_change_set(self.raw)
