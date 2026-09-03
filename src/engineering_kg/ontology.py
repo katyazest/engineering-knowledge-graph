@@ -126,6 +126,46 @@ class CrossGraphLinkLifecycleState(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class CrossGraphEvidenceOrigin(StrEnum):
+    DECLARED = "declared"
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+
+
+class CrossGraphEvidenceStatus(StrEnum):
+    AUTHORITATIVE = "authoritative"
+    DERIVED = "derived"
+
+
+class CrossGraphTrustDisposition(StrEnum):
+    TRUSTED = "trusted"
+    UNTRUSTED = "untrusted"
+
+
+def normalized_support_classification(source_category: str) -> tuple[
+    CrossGraphEvidenceOrigin, CrossGraphEvidenceStatus, CrossGraphTrustDisposition,
+]:
+    """Return the only classifications admitted by project-owned adapters."""
+    categories = {
+        "declared-authoritative": (
+            CrossGraphEvidenceOrigin.DECLARED, CrossGraphEvidenceStatus.AUTHORITATIVE,
+            CrossGraphTrustDisposition.TRUSTED,
+        ),
+        "pr-file-observation": (
+            CrossGraphEvidenceOrigin.OBSERVED, CrossGraphEvidenceStatus.AUTHORITATIVE,
+            CrossGraphTrustDisposition.UNTRUSTED,
+        ),
+        "llm-only-inference": (
+            CrossGraphEvidenceOrigin.INFERRED, CrossGraphEvidenceStatus.DERIVED,
+            CrossGraphTrustDisposition.UNTRUSTED,
+        ),
+    }
+    try:
+        return categories[source_category]
+    except KeyError as exc:
+        raise ValueError("unsupported-cross-graph-source-category") from exc
+
+
 CROSS_GRAPH_LINK_LIFECYCLE_STATES = frozenset(
     state.value for state in CrossGraphLinkLifecycleState
 )
@@ -142,6 +182,13 @@ _UNSAFE_IDENTITY_RE = re.compile(
     r"(?:\b(?:body|content|payload|credential(?:s)?|password(?:s)?|secret(?:s)?|token(?:s)?|authorization|bearer)\b|"
     r"(?:api|access)[_-]?key|(?:https?|ftp|file|mailto|data|javascript|ssh|git):)",
     re.IGNORECASE,
+)
+_OPAQUE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
+_OPAQUE_IDENTIFIER_URI_RE = re.compile(
+    r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<value>.*)$"
+)
+_HIERARCHICAL_IDENTIFIER_SCHEMES = frozenset(
+    {"http", "https", "ssh", "git", "s3", "vscode"}
 )
 _UNSAFE_NAVIGATION_KEY_RE = re.compile(
     r"(?:body|content|payload|credential|password|secret|token|url)", re.IGNORECASE
@@ -166,6 +213,27 @@ _SOURCE_ARTIFACT_EVIDENCE_METADATA_SCHEMA = {
 }
 _MAX_NAVIGATION_TEXT_LENGTH = 512
 _MAX_NAVIGATION_LINE_NUMBER = 10_000_000
+
+
+def _payload_safe_opaque_identifier(value: object, field_name: str) -> str:
+    """Admit an opaque stable identifier, never a navigable location or payload."""
+
+    text = _required_text(value, field_name).strip()
+    uri = _OPAQUE_IDENTIFIER_URI_RE.fullmatch(text)
+    if (
+        text.startswith("//")
+        or not _OPAQUE_IDENTIFIER_RE.fullmatch(text)
+        or (
+            uri is not None
+            and (
+                uri.group("value").startswith("/")
+                or uri.group("scheme").lower() in _HIERARCHICAL_IDENTIFIER_SCHEMES
+            )
+        )
+        or _UNSAFE_IDENTITY_RE.search(text)
+    ):
+        raise ValueError(f"invalid-cross-graph-opaque-identifier: {field_name}")
+    return text
 
 
 def _identity_text(value: object, field_name: str) -> str:
@@ -452,27 +520,61 @@ def cross_graph_link_claim_id(subject_id: str, relation_kind: str, target: CodeL
     return f"cross-graph-link:{digest}"
 
 
+def _classified_support_values(
+    origin: CrossGraphEvidenceOrigin | str,
+    status: CrossGraphEvidenceStatus | str,
+    confidence: str,
+    trust_disposition: CrossGraphTrustDisposition | str,
+) -> tuple[CrossGraphEvidenceOrigin, CrossGraphEvidenceStatus, str, CrossGraphTrustDisposition]:
+    try:
+        normalized_origin = CrossGraphEvidenceOrigin(origin)
+        normalized_status = CrossGraphEvidenceStatus(status)
+        normalized_disposition = CrossGraphTrustDisposition(trust_disposition)
+    except ValueError as exc:
+        raise ValueError("invalid-cross-graph-classification") from exc
+    if (not isinstance(confidence, str) or not confidence.strip() or confidence != confidence.strip()
+            or len(confidence) > 128 or "\n" in confidence or "\r" in confidence
+            or _UNSAFE_IDENTITY_RE.search(confidence)):
+        raise ValueError("invalid-cross-graph-confidence")
+    if (
+        normalized_origin is CrossGraphEvidenceOrigin.INFERRED
+        and normalized_status is CrossGraphEvidenceStatus.AUTHORITATIVE
+    ):
+        raise ValueError("invalid-cross-graph-classification-consistency")
+    return normalized_origin, normalized_status, confidence, normalized_disposition
+
+
 def cross_graph_link_evidence_id(
-    claim_id: str, strategy_id: str, observation_id: str, provenance_evidence_id: str
+    claim_id: str, strategy_id: str, observation_id: str, provenance_evidence_id: str,
+    origin: CrossGraphEvidenceOrigin | str, status: CrossGraphEvidenceStatus | str,
+    confidence: str, trust_disposition: CrossGraphTrustDisposition | str,
 ) -> str:
     """Return the stable identity of one attributable link observation."""
 
     return stable_id(
         "cross-graph-link-evidence",
         _required_text(claim_id, "claim_id"),
-        _required_text(strategy_id, "strategy_id"),
-        _required_text(observation_id, "observation_id"),
+        _payload_safe_opaque_identifier(strategy_id, "strategy_id"),
+        _payload_safe_opaque_identifier(observation_id, "observation_id"),
         _required_text(provenance_evidence_id, "provenance_evidence_id"),
+        *_classified_support_values(origin, status, confidence, trust_disposition),
     )
 
 
-def cross_graph_link_lifecycle_id(claim_id: str, revision: int) -> str:
+def cross_graph_link_lifecycle_id(
+    claim_id: str, revision: int, origin: CrossGraphEvidenceOrigin | str,
+    status: CrossGraphEvidenceStatus | str, confidence: str,
+    trust_disposition: CrossGraphTrustDisposition | str,
+) -> str:
     """Return the stable identity of an append-only lifecycle revision."""
 
     _required_text(claim_id, "claim_id")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
         raise ValueError("revision must be a positive integer")
-    return stable_id("cross-graph-link-lifecycle", claim_id, revision)
+    return stable_id(
+        "cross-graph-link-lifecycle", claim_id, revision,
+        *_classified_support_values(origin, status, confidence, trust_disposition),
+    )
 
 
 @dataclass(frozen=True)
@@ -503,16 +605,50 @@ class CrossGraphLinkEvidence:
     strategy_id: str
     observation_id: str
     provenance_evidence_id: str
+    origin: CrossGraphEvidenceOrigin | str
+    status: CrossGraphEvidenceStatus | str
+    confidence: str
+    trust_disposition: CrossGraphTrustDisposition | str
 
     def __post_init__(self) -> None:
-        cross_graph_link_evidence_id(self.claim_id, self.strategy_id, self.observation_id, self.provenance_evidence_id)
+        _required_text(self.claim_id, "claim_id")
+        object.__setattr__(
+            self, "strategy_id",
+            _payload_safe_opaque_identifier(self.strategy_id, "strategy_id"),
+        )
+        object.__setattr__(
+            self, "observation_id",
+            _payload_safe_opaque_identifier(self.observation_id, "observation_id"),
+        )
+        _required_text(self.provenance_evidence_id, "provenance_evidence_id")
+        origin, status, confidence, disposition = _classified_support_values(
+            self.origin, self.status, self.confidence, self.trust_disposition
+        )
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "trust_disposition", disposition)
 
     @property
     def id(self) -> str:
-        return cross_graph_link_evidence_id(self.claim_id, self.strategy_id, self.observation_id, self.provenance_evidence_id)
+        # Construction validates this immutable shape. Retain a usable identity
+        # if a malformed fixture bypasses construction so validation can report
+        # a diagnostic instead of failing before its validation boundary.
+        return stable_id(
+            "cross-graph-link-evidence", self.claim_id, self.strategy_id,
+            self.observation_id, self.provenance_evidence_id, self.origin,
+            self.status, self.confidence, self.trust_disposition,
+        )
 
     def as_dict(self) -> dict[str, str]:
-        return {"claim_id": self.claim_id, "id": self.id, "observation_id": self.observation_id, "provenance_evidence_id": self.provenance_evidence_id, "strategy_id": self.strategy_id}
+        # Prevent records that bypass frozen construction from crossing any
+        # serialization, persistence, or query boundary.
+        validated = CrossGraphLinkEvidence(
+            self.claim_id, self.strategy_id, self.observation_id,
+            self.provenance_evidence_id, self.origin, self.status,
+            self.confidence, self.trust_disposition,
+        )
+        return {"claim_id": validated.claim_id, "confidence": validated.confidence, "id": validated.id, "observation_id": validated.observation_id, "origin": validated.origin.value, "provenance_evidence_id": validated.provenance_evidence_id, "status": validated.status.value, "strategy_id": validated.strategy_id, "trust_disposition": validated.trust_disposition.value}
 
 
 @dataclass(frozen=True)
@@ -521,19 +657,44 @@ class CrossGraphLinkLifecycle:
     revision: int
     state: CrossGraphLinkLifecycleState | str
     provenance_evidence_id: str
+    origin: CrossGraphEvidenceOrigin | str
+    status: CrossGraphEvidenceStatus | str
+    confidence: str
+    trust_disposition: CrossGraphTrustDisposition | str
 
     def __post_init__(self) -> None:
-        cross_graph_link_lifecycle_id(self.claim_id, self.revision)
         if _lifecycle_state_value(self.state) not in CROSS_GRAPH_LINK_LIFECYCLE_STATES:
             raise ValueError(f"Unsupported cross-graph lifecycle state: {self.state}")
         _required_text(self.provenance_evidence_id, "provenance_evidence_id")
+        origin, status, confidence, disposition = _classified_support_values(
+            self.origin, self.status, self.confidence, self.trust_disposition
+        )
+        object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "trust_disposition", disposition)
+        cross_graph_link_lifecycle_id(
+            self.claim_id, self.revision, origin, status, confidence, disposition
+        )
 
     @property
     def id(self) -> str:
-        return cross_graph_link_lifecycle_id(self.claim_id, self.revision)
+        # See CrossGraphLinkEvidence.id: diagnostics must remain available for
+        # malformed records that bypass frozen-constructor admission.
+        return stable_id(
+            "cross-graph-link-lifecycle", self.claim_id, self.revision,
+            self.origin, self.status, self.confidence, self.trust_disposition,
+        )
 
     def as_dict(self) -> dict[str, Any]:
-        return {"claim_id": self.claim_id, "id": self.id, "provenance_evidence_id": self.provenance_evidence_id, "revision": self.revision, "state": _lifecycle_state_value(self.state)}
+        # Frozen dataclasses can be bypassed with object.__setattr__. Re-run
+        # immutable admission validation before this record crosses a
+        # serialization, persistence, or query boundary.
+        validated = CrossGraphLinkLifecycle(
+            self.claim_id, self.revision, self.state, self.provenance_evidence_id,
+            self.origin, self.status, self.confidence, self.trust_disposition,
+        )
+        return {"claim_id": validated.claim_id, "confidence": validated.confidence, "id": validated.id, "origin": validated.origin.value, "provenance_evidence_id": validated.provenance_evidence_id, "revision": validated.revision, "state": _lifecycle_state_value(validated.state), "status": validated.status.value, "trust_disposition": validated.trust_disposition.value}
 
 
 @dataclass(frozen=True)
@@ -757,6 +918,18 @@ class GraphSnapshot:
     allow_legacy_evidence: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for item in self.cross_graph_link_evidence:
+            CrossGraphLinkEvidence(
+                item.claim_id, item.strategy_id, item.observation_id,
+                item.provenance_evidence_id, item.origin, item.status,
+                item.confidence, item.trust_disposition,
+            )
+        for item in self.cross_graph_link_lifecycle:
+            CrossGraphLinkLifecycle(
+                item.claim_id, item.revision, item.state,
+                item.provenance_evidence_id, item.origin, item.status,
+                item.confidence, item.trust_disposition,
+            )
         if not self.allow_legacy_evidence:
             for item in self.evidence:
                 if error := source_artifact_identity_error(item):
@@ -849,6 +1022,18 @@ class GraphSnapshot:
             and _trusted_claim_is_catalog_valid(claim, {node.id: node for node in self.nodes})
             and _trusted_claim_has_complete_provenance(
                 claim.id, lifecycles[claim.id], evidence_by_claim, evidence_by_id, provenance_by_id,
+            )
+            and _trusted_claim_has_classification_consistent_provenance(
+                claim.id, lifecycles[claim.id], evidence_by_claim, evidence_by_id, provenance_by_id,
+            )
+            and _trusted_claim_has_eligible_evidence(
+                claim,
+                tuple(evidence_by_claim.get(claim.id, ())),
+                lifecycles[claim.id],
+                tuple(
+                    entry for entry in self.cross_graph_link_lifecycle
+                    if entry.claim_id == claim.id
+                ),
             )
         )
 
@@ -1028,6 +1213,45 @@ def _trusted_claim_has_complete_provenance(
         is not None
         and _has_complete_provenance(observation_evidence, provenance_by_id)
         for observation in observations
+    )
+
+
+def _trusted_claim_has_classification_consistent_provenance(
+    claim_id: str,
+    lifecycle: CrossGraphLinkLifecycle,
+    evidence_by_claim: dict[str, list[CrossGraphLinkEvidence]],
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> bool:
+    """Require trusted support classifications to match direct provenance kind."""
+
+    supports = (*evidence_by_claim.get(claim_id, ()), lifecycle)
+    for support in supports:
+        evidence = evidence_by_id.get(support.provenance_evidence_id)
+        records = (
+            tuple(provenance_by_id[item] for item in evidence.provenance_ids if item in provenance_by_id)
+            if evidence is not None else ()
+        )
+        status = getattr(support.status, "value", support.status)
+        expected_kind = (
+            ProvenanceKind.EXTERNAL if status == CrossGraphEvidenceStatus.AUTHORITATIVE.value
+            else ProvenanceKind.DERIVED if status == CrossGraphEvidenceStatus.DERIVED.value
+            else None
+        )
+        if not records or expected_kind is None or any(record.kind is not expected_kind for record in records):
+            return False
+    return True
+
+
+def _trusted_claim_has_eligible_evidence(
+    claim: CrossGraphLinkClaim,
+    observations: tuple[CrossGraphLinkEvidence, ...],
+    lifecycle: CrossGraphLinkLifecycle,
+    lifecycle_support: tuple[CrossGraphLinkLifecycle, ...],
+) -> bool:
+    from engineering_kg.relationship_vocabulary import eligible_for_trusted_cross_graph_projection
+    return eligible_for_trusted_cross_graph_projection(
+        claim, observations, lifecycle, lifecycle_support
     )
 
 

@@ -51,6 +51,21 @@ class RelationshipVocabularyTest(unittest.TestCase):
         self.assertIsNotNone(serialized_catalog)
         self.assertEqual(json.loads(serialized_catalog.group(1)), catalog_as_dict())
 
+    def test_published_reference_revision_matches_executable_catalog(self) -> None:
+        reference = (
+            Path(__file__).resolve().parents[1]
+            / "docs" / "canonical-relationship-vocabulary.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            f"# Canonical relationship vocabulary (revision {CATALOG_REVISION})",
+            reference,
+        )
+        self.assertIn(
+            f"Persistence and readback accept only revision {CATALOG_REVISION}'s ",
+            " ".join(reference.split()),
+        )
+
     def test_published_greenfield_constraint_bounds_verification_matrix(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
         constraints = (repository_root / "docs" / "engineering-kg-project-constraints-mvp.md").read_text(
@@ -153,7 +168,7 @@ class RelationshipVocabularyTest(unittest.TestCase):
     def test_code_claim_requires_catalog_and_only_trusted_is_projected(self) -> None:
         story = Node("story", NodeKind.JIRA_STORY, "story")
         claim = CrossGraphLinkClaim(story.id, "touches", CodeLocator("repo", "rev", "a.py", "a.b"))
-        candidate = GraphSnapshot(nodes=(story,), cross_graph_link_claims=(claim,), cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(claim.id, 1, "candidate", "e"),))
+        candidate = GraphSnapshot(nodes=(story,), cross_graph_link_claims=(claim,), cross_graph_link_lifecycle=(CrossGraphLinkLifecycle(claim.id, 1, "candidate", "e", "observed", "authoritative", "fixture", "untrusted"),))
         # Missing evidence makes it invalid but candidate remains non-semantic.
         self.assertEqual(candidate.trusted_cross_graph_links, ())
         with self.assertRaisesRegex(ValueError, "relationship-vocabulary-kind"):

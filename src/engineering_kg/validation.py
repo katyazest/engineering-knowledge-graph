@@ -29,7 +29,7 @@ from engineering_kg.ontology import (
     openspec_specification_id,
     stable_id,
 )
-from engineering_kg.relationship_vocabulary import relationship_error
+from engineering_kg.relationship_vocabulary import eligible_for_trusted_cross_graph_projection, relationship_error
 
 
 SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
@@ -303,7 +303,17 @@ def _duplicate_conflict_diagnostics(
 ) -> list[GraphValidationDiagnostic]:
     by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in items:
-        serialized = item.as_dict()
+        try:
+            serialized = item.as_dict()
+        except (AttributeError, ValueError):
+            # Classified support that bypassed frozen construction must be
+            # diagnosed by _classified_support_diagnostics, not serialized
+            # while checking duplicate identities.
+            if collection in {
+                "cross-graph-link-evidence", "cross-graph-link-lifecycle",
+            }:
+                continue
+            raise
         if collection in {"node", "edge"}:
             serialized.pop("evidence_ids")
         if collection == "node" and _value(item.kind) in {
@@ -346,6 +356,7 @@ def _cross_graph_link_diagnostics(
         if error:
             diagnostics.append(_cross_error(error, claim.id, "Cross-graph claim does not satisfy the canonical relationship catalog."))
     for observation in snapshot.cross_graph_link_evidence:
+        diagnostics.extend(_classified_support_diagnostics(observation, evidence_by_id, provenance_by_id))
         if observation.claim_id not in claims_by_id:
             diagnostics.append(_cross_error("cross-graph-claim-exists", observation.id, "Cross-graph evidence references an absent claim."))
         if observation.provenance_evidence_id not in evidence_by_id:
@@ -358,6 +369,7 @@ def _cross_graph_link_diagnostics(
     lifecycle_claims: set[str] = set()
     latest_lifecycle: dict[str, CrossGraphLinkLifecycle] = {}
     for entry in snapshot.cross_graph_link_lifecycle:
+        diagnostics.extend(_classified_support_diagnostics(entry, evidence_by_id, provenance_by_id))
         lifecycle_claims.add(entry.claim_id)
         if entry.claim_id not in claims_by_id:
             diagnostics.append(_cross_error("cross-graph-claim-exists", entry.id, "Cross-graph lifecycle references an absent claim."))
@@ -391,6 +403,48 @@ def _cross_graph_link_diagnostics(
                 claim.id,
                 "Trusted cross-graph claims require attributable supporting observation evidence.",
             ))
+        elif _value(latest_lifecycle[claim.id].state) == "trusted" and not eligible_for_trusted_cross_graph_projection(
+            claim,
+            tuple(item for item in snapshot.cross_graph_link_evidence if item.claim_id == claim.id),
+            latest_lifecycle[claim.id],
+            tuple(item for item in snapshot.cross_graph_link_lifecycle if item.claim_id == claim.id),
+        ):
+            diagnostics.append(_cross_error(
+                "cross-graph-implementation-trust",
+                claim.id,
+                "Trusted IMPLEMENTS projection requires authoritative declared support and an explicit trusted lifecycle disposition.",
+            ))
+    return diagnostics
+
+
+def _classified_support_diagnostics(
+    support: object, evidence_by_id: dict[str, object],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> list[GraphValidationDiagnostic]:
+    """Validate support classification against its directly referenced provenance."""
+    diagnostics: list[GraphValidationDiagnostic] = []
+    try:
+        # Reconstruction catches records bypassing frozen constructors.
+        if isinstance(support, CrossGraphLinkEvidence):
+            CrossGraphLinkEvidence(support.claim_id, support.strategy_id, support.observation_id,
+                                   support.provenance_evidence_id, support.origin, support.status,
+                                   support.confidence, support.trust_disposition)
+        else:
+            CrossGraphLinkLifecycle(support.claim_id, support.revision, support.state,
+                                    support.provenance_evidence_id, support.origin, support.status,
+                                    support.confidence, support.trust_disposition)
+    except (AttributeError, ValueError):
+        return [_cross_error("cross-graph-classification-valid", getattr(support, "claim_id", "unknown"),
+                              "Cross-graph support has invalid classification or trust fields.")]
+    evidence = evidence_by_id.get(support.provenance_evidence_id)
+    records = [provenance_by_id[item] for item in evidence.provenance_ids if item in provenance_by_id] if evidence else []
+    if support.status is ProvenanceKind.EXTERNAL or getattr(support.status, "value", support.status) == "authoritative":
+        if not records or any(item.kind is not ProvenanceKind.EXTERNAL for item in records):
+            diagnostics.append(_cross_error("cross-graph-classification-provenance", support.id,
+                "Authoritative cross-graph support requires authoritative external provenance."))
+    elif not records or any(item.kind is not ProvenanceKind.DERIVED for item in records):
+        diagnostics.append(_cross_error("cross-graph-classification-provenance", support.id,
+            "Derived cross-graph support requires derived provenance."))
     return diagnostics
 
 

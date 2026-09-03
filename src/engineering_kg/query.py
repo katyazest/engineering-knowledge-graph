@@ -401,11 +401,22 @@ class EngineeringKgQuery:
                 for entry in self.snapshot.cross_graph_link_lifecycle
                 if entry.claim_id == claim.id
             ]
+            current_lifecycle = max(
+                lifecycle,
+                key=lambda entry: (entry["revision"], entry["id"]),
+                default=None,
+            )
             links.append(
                 {
                     "claim": claim.as_dict(),
+                    "current_lifecycle_disposition": (
+                        current_lifecycle["state"] if current_lifecycle is not None else None
+                    ),
                     "lifecycle": lifecycle,
                     "observations": observations,
+                    "trusted_projection": any(
+                        link.claim_id == claim.id for link in self.snapshot.trusted_cross_graph_links
+                    ),
                 }
             )
         return tuple(links)

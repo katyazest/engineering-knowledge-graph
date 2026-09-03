@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from engineering_kg.ontology import CodeLocator, Node
 
 
-CATALOG_REVISION = "1"
+CATALOG_REVISION = "2"
 
 
 class RelationshipKind(StrEnum):
@@ -141,3 +141,44 @@ _CANONICAL_NODE_KINDS = frozenset({
 def complete_code_locator(target: object) -> bool:
     return all(isinstance(getattr(target, name, None), str) and getattr(target, name).strip()
                for name in ("repository", "revision", "file", "symbol"))
+
+
+def eligible_for_trusted_cross_graph_projection(
+    claim: object,
+    observations: tuple[object, ...],
+    lifecycle: object,
+    lifecycle_support: tuple[object, ...] = (),
+) -> bool:
+    """Apply evidence eligibility only after catalog admission at the caller.
+
+    Confidence is deliberately absent: it is opaque metadata, never a trust score.
+    """
+    if getattr(lifecycle, "state", None) != "trusted":
+        return False
+    if getattr(lifecycle, "trust_disposition", None) != "trusted":
+        return False
+    if getattr(claim, "relation_kind", None) != RelationshipKind.IMPLEMENTS.value:
+        return True
+    has_authoritative_declared_observation = any(
+        getattr(item, "origin", None) == "declared"
+        and getattr(item, "status", None) == "authoritative"
+        and getattr(item, "trust_disposition", None) == "trusted"
+        for item in observations
+    )
+    # Every support record is part of the implementation support chain. A
+    # merged PR/file observation must not become implementation proof merely
+    # because separately supplied declared support and lifecycle revisions are
+    # trusted.
+    has_observed_or_inferred_observation_support = any(
+        getattr(item, "origin", None) in {"observed", "inferred"}
+        for item in observations
+    )
+    has_observed_or_inferred_lifecycle_support = any(
+        getattr(item, "origin", None) in {"observed", "inferred"}
+        for item in lifecycle_support
+    )
+    return (
+        has_authoritative_declared_observation
+        and not has_observed_or_inferred_observation_support
+        and not has_observed_or_inferred_lifecycle_support
+    )

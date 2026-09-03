@@ -699,6 +699,10 @@ def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLink
             _expect_string(data.get("strategy_id"), "cross_graph_link_evidence.strategy_id"),
             _expect_string(data.get("observation_id"), "cross_graph_link_evidence.observation_id"),
             _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_evidence.provenance_evidence_id"),
+            _expect_string(data.get("origin"), "cross_graph_link_evidence.origin"),
+            _expect_string(data.get("status"), "cross_graph_link_evidence.status"),
+            _expect_string(data.get("confidence"), "cross_graph_link_evidence.confidence"),
+            _expect_string(data.get("trust_disposition"), "cross_graph_link_evidence.trust_disposition"),
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -715,6 +719,10 @@ def _cross_graph_link_lifecycle_from_dict(data: dict[str, Any]) -> CrossGraphLin
             _expect_string(data.get("claim_id"), "cross_graph_link_lifecycle.claim_id"), revision,
             _expect_string(data.get("state"), "cross_graph_link_lifecycle.state"),
             _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_lifecycle.provenance_evidence_id"),
+            _expect_string(data.get("origin"), "cross_graph_link_lifecycle.origin"),
+            _expect_string(data.get("status"), "cross_graph_link_lifecycle.status"),
+            _expect_string(data.get("confidence"), "cross_graph_link_lifecycle.confidence"),
+            _expect_string(data.get("trust_disposition"), "cross_graph_link_lifecycle.trust_disposition"),
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc

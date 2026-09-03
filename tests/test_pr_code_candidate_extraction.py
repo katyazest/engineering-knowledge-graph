@@ -119,6 +119,10 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         claim = result.graph.cross_graph_link_claims[0]
         self.assertEqual(claim.relation_kind, "touches")
         self.assertEqual(claim.target.revision, "a" * 40)
+        self.assertEqual(result.graph.cross_graph_link_evidence[0].origin, "observed")
+        self.assertEqual(result.graph.cross_graph_link_evidence[0].trust_disposition, "untrusted")
+        self.assertEqual(result.graph.cross_graph_link_lifecycle[0].status, "derived")
+        self.assertEqual(result.graph.cross_graph_link_lifecycle[0].trust_disposition, "untrusted")
         self.assertEqual(result.graph.trusted_cross_graph_links, ())
         self.assertEqual(result.graph.edges, ())
         graph = GraphSnapshot(nodes=(self.subject,)).merged_with(result.graph)
@@ -129,7 +133,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
             evidence=(*graph.evidence, incomplete_review),
             provenance=graph.provenance,
             cross_graph_link_claims=graph.cross_graph_link_claims, cross_graph_link_evidence=graph.cross_graph_link_evidence,
-            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", incomplete_review.id)),
+            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", incomplete_review.id, "observed", "authoritative", "review", "trusted")),
         )
         self.assertEqual(incomplete_promoted.trusted_cross_graph_links, ())
 
@@ -137,7 +141,7 @@ class PrCodeCandidateExtractionTest(unittest.TestCase):
         promoted = GraphSnapshot(
             nodes=graph.nodes, evidence=(*graph.evidence, review), provenance=graph.provenance,
             cross_graph_link_claims=graph.cross_graph_link_claims, cross_graph_link_evidence=graph.cross_graph_link_evidence,
-            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", review.id)),
+            cross_graph_link_lifecycle=(*graph.cross_graph_link_lifecycle, CrossGraphLinkLifecycle(claim.id, 2, "trusted", review.id, "observed", "authoritative", "review", "trusted")),
         )
         self.assertEqual(promoted.trusted_cross_graph_links[0].claim_id, claim.id)
         self.assertEqual(len(promoted.cross_graph_link_evidence), 1)

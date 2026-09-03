@@ -1,4 +1,4 @@
-# Canonical relationship vocabulary (revision 1)
+# Canonical relationship vocabulary (revision 2)
 
 `engineering_kg.relationship_vocabulary` is the executable authority for
 semantic-edge and trusted-code-link admission. The catalog reference below is
@@ -28,7 +28,7 @@ means a complete locator (repository, revision, file, and symbol).
 
 ```json
 {
-  "revision": "1",
+  "revision": "2",
   "relationships": [
     {"classification": "structural", "kind": "contains", "max_targets_per_source": null, "permits_code_locator": false, "semantics": "Structural containment.", "source_kinds": ["openspec-active-change", "openspec-archived-change", "requirement", "specification"], "target_kinds": ["openspec-artifact", "requirement", "scenario"]},
     {"classification": "semantic", "kind": "traces_to", "max_targets_per_source": null, "permits_code_locator": false, "semantics": "Traceability relationship.", "source_kinds": ["jira_story", "openspec-active-change", "openspec-archived-change", "requirement", "scenario"], "target_kinds": ["jira_story", "requirement", "scenario", "specification"]},
@@ -58,7 +58,7 @@ symbols map to candidate `TOUCHES` claims. Unsupported source claims are
 diagnosed and skipped. No supported mapper emits `IMPLEMENTS`, `VERIFIED_BY`,
 `DEPENDS_ON`, `OWNED_BY`, or `PROVIDES`.
 
-Persistence and readback accept only revision 1's current canonical format.
+Persistence and readback accept only revision 2's current canonical format.
 Relationship aliases, reversed encodings (including `OWNS`), and historical
 candidate claim kinds fail with deterministic diagnostics; they are not
 converted, migrated, or backed up.

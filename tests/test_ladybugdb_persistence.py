@@ -406,7 +406,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
-                "catalog_revision": "1",
+                "catalog_revision": CATALOG_REVISION,
                 "node_order": [item.id for item in snapshot.nodes],
                 "nodes": {item.id: item.as_dict() for item in snapshot.nodes},
                 "edge_order": [legacy_owns.id],
@@ -441,10 +441,10 @@ class LadybugDbPersistenceTest(unittest.TestCase):
     def test_readback_rejects_unsupported_catalog_revision_without_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"catalog_revision": "2"})
+            store._write_raw({"catalog_revision": "1"})
             original = store._graph_file.read_text(encoding="utf-8")
 
-            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: '2'"):
+            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: '1'"):
                 store.read_snapshot()
 
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)

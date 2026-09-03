@@ -17,6 +17,9 @@ from engineering_kg.ontology import (
     CrossGraphLinkEvidence,
     CrossGraphLinkLifecycle,
     CrossGraphLinkLifecycleState,
+    CrossGraphEvidenceOrigin,
+    CrossGraphEvidenceStatus,
+    CrossGraphTrustDisposition,
     Evidence,
     GraphSnapshot,
     SourceArtifactIdentity,
@@ -406,12 +409,20 @@ def extract_pr_code_candidates(
             evidence.append(lifecycle_provenance)
             provenance_records.extend(lifecycle_records)
             claims.append(claim)
-            observations.append(CrossGraphLinkEvidence(claim.id, STRATEGY_ID, mapping.id, provenance.id))
+            observations.append(CrossGraphLinkEvidence(
+                claim.id, STRATEGY_ID, mapping.id, provenance.id,
+                CrossGraphEvidenceOrigin.OBSERVED, CrossGraphEvidenceStatus.AUTHORITATIVE,
+                "pr-changed-symbol", CrossGraphTrustDisposition.UNTRUSTED,
+            ))
             # Lifecycle revisions are claim-wide.  PR mapping provenance belongs to
             # its observation; a claim-scoped initialization record lets separately
             # extracted observations of the same claim merge without revision-one
             # provenance conflicts.
-            lifecycle.append(CrossGraphLinkLifecycle(claim.id, 1, CrossGraphLinkLifecycleState.CANDIDATE, lifecycle_provenance.id))
+            lifecycle.append(CrossGraphLinkLifecycle(
+                claim.id, 1, CrossGraphLinkLifecycleState.CANDIDATE, lifecycle_provenance.id,
+                CrossGraphEvidenceOrigin.OBSERVED, CrossGraphEvidenceStatus.DERIVED,
+                "candidate-initialization", CrossGraphTrustDisposition.UNTRUSTED,
+            ))
     graph = GraphSnapshot(
         evidence=tuple({item.id: item for item in evidence}.values()),
         cross_graph_link_claims=tuple({item.id: item for item in claims}.values()),

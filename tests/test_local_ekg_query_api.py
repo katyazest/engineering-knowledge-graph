@@ -139,6 +139,9 @@ class LocalEkgQueryApiTest(unittest.TestCase):
 
         link = result["cross_graph_links"][0]
         self.assertEqual(link["claim"]["subject_id"], subject.id)
+        self.assertFalse(link["trusted_projection"])
+        self.assertEqual(link["observations"][0]["origin"], "inferred")
+        self.assertEqual(link["observations"][0]["trust_disposition"], "untrusted")
         self.assertEqual(
             [item["id"] for item in link["observations"][0]["provenance"]],
             [derived.id],
@@ -152,6 +155,37 @@ class LocalEkgQueryApiTest(unittest.TestCase):
             [external.id],
         )
         self.assertNotIn("authoritative source body", str(result))
+
+    def test_traceability_exposes_latest_cross_graph_lifecycle_disposition(self) -> None:
+        subject, graph, _, _ = _cross_graph_fixture()
+        claim = graph.cross_graph_link_claims[0]
+        lifecycle = (
+            CrossGraphLinkLifecycle(
+                claim.id, 3, "rejected", graph.evidence[0].id,
+                "observed", "authoritative", "final", "untrusted",
+            ),
+            CrossGraphLinkLifecycle(
+                claim.id, 1, "candidate", graph.evidence[0].id,
+                "observed", "authoritative", "initial", "untrusted",
+            ),
+            CrossGraphLinkLifecycle(
+                claim.id, 2, "trusted", graph.evidence[0].id,
+                "observed", "authoritative", "reviewed", "trusted",
+            ),
+        )
+        snapshot = GraphSnapshot(
+            nodes=graph.nodes,
+            evidence=graph.evidence,
+            provenance=graph.provenance,
+            cross_graph_link_claims=graph.cross_graph_link_claims,
+            cross_graph_link_evidence=graph.cross_graph_link_evidence,
+            cross_graph_link_lifecycle=lifecycle,
+        )
+
+        link = EngineeringKgQuery.from_snapshot(snapshot).get_traceability(subject.id)["cross_graph_links"][0]
+
+        self.assertEqual(link["current_lifecycle_disposition"], "rejected")
+        self.assertEqual([entry["revision"] for entry in link["lifecycle"]], [1, 2, 3])
 
 
 def _graph():
@@ -235,10 +269,10 @@ def _cross_graph_fixture():
         nodes=(subject,), evidence=(external_evidence, derived_evidence), provenance=(external, derived),
         cross_graph_link_claims=(claim,),
         cross_graph_link_evidence=(
-            CrossGraphLinkEvidence(claim.id, "fixture", "derived-observation", derived_evidence.id),
+            CrossGraphLinkEvidence(claim.id, "fixture", "derived-observation", derived_evidence.id, "inferred", "derived", "fixture", "untrusted"),
         ),
         cross_graph_link_lifecycle=(
-            CrossGraphLinkLifecycle(claim.id, 1, "candidate", external_evidence.id),
+            CrossGraphLinkLifecycle(claim.id, 1, "candidate", external_evidence.id, "observed", "authoritative", "fixture", "untrusted"),
         ),
     )
     return subject, graph, external, derived
