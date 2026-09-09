@@ -11,6 +11,13 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+from engineering_kg.compact_identity import (
+    is_complete_symbol_identity,
+    is_immutable_revision,
+    safe_identity,
+    safe_relative_file,
+    safe_repository,
+)
 from engineering_kg.ontology import (
     CodeLocator,
     CrossGraphLinkClaim,
@@ -34,13 +41,6 @@ from engineering_kg.relationship_vocabulary import RelationshipKind
 STRATEGY_ID = "pr-code-candidate-extraction"
 RELATION_KIND = RelationshipKind.TOUCHES.value
 
-# A PR mapping supplies a code-side identity, not display text or source.  The
-# extractor accepts a portable, fully-qualified identifier form so it can be
-# validated locally without attempting source analysis or symbol resolution.
-_QUALIFIED_SYMBOL_IDENTITY = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$"
-)
-
 # Mapping identities identify adapted provider records, not source text. A
 # namespace-qualified token prevents source snippets or bodies from becoming
 # observation IDs, evidence locators, or retained provenance properties.
@@ -52,16 +52,9 @@ _QUALIFIED_SOURCE_MAPPING_IDENTITY = re.compile(
 # normalized boundary deliberately narrower than arbitrary provider display
 # fields so bodies, payload fragments, and multiline source cannot become
 # canonical graph identity.
-_SAFE_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
-_SAFE_REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
-_SAFE_RELATIVE_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}$")
 # Safe identities may use a colon as a namespace separator.  The URI scheme
 # and its value are checked separately so opaque IDs such as
 # ``urn:example.org/link-42`` are not confused with navigable URLs.
-_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):(?P<value>.*)$")
-_HIERARCHICAL_URL_SCHEMES = frozenset({"http", "https", "ssh", "git", "s3", "vscode"})
-
-
 class PrCodeCandidateValidationError(ValueError):
     """A provider-neutral input did not meet the normalized contract."""
 
@@ -83,12 +76,10 @@ def _text(value: object, field_name: str) -> str:
 def _safe_identity(value: object, field_name: str) -> str:
     """Return a trimmed opaque identifier that cannot carry payload-like text."""
 
-    text = _text(value, field_name).strip()
-    if _is_url_like_identity(text):
-        raise PrCodeCandidateValidationError(f"{field_name} must not be URL-like")
-    if not _SAFE_IDENTITY.fullmatch(text):
-        raise PrCodeCandidateValidationError(f"{field_name} must be a safe identity")
-    return text
+    try:
+        return safe_identity(value, field_name)
+    except ValueError as exc:
+        raise PrCodeCandidateValidationError(str(exc)) from None
 
 
 def _is_url_like_identity(value: str) -> bool:
@@ -101,36 +92,23 @@ def _is_url_like_identity(value: str) -> bool:
     (``https:host/path``).
     """
 
-    if value.startswith("//"):
-        return True
-    match = _URI_SCHEME.fullmatch(value)
-    if match is None:
-        return False
-    scheme = match.group("scheme").lower()
-    remainder = match.group("value")
-    # A slash immediately after the scheme delimiter is hierarchical URI
-    # syntax even without an authority (for example ``file:/private/secret``
-    # or ``custom:/provider.example/pr/42``).  Opaque identifiers such as
-    # ``urn:example.org/link-42`` have namespace-specific text instead.
-    return remainder.startswith("/") or scheme in _HIERARCHICAL_URL_SCHEMES
+    from engineering_kg.compact_identity import is_url_like_identity
+
+    return is_url_like_identity(value)
 
 
 def _safe_repository(value: object) -> str:
-    repository = _text(value, "change_set.repository").strip()
-    if not _SAFE_REPOSITORY.fullmatch(repository):
-        raise PrCodeCandidateValidationError("change_set.repository must be a safe identity")
-    return repository
+    try:
+        return safe_repository(value, "change_set.repository")
+    except ValueError as exc:
+        raise PrCodeCandidateValidationError(str(exc)) from None
 
 
 def _safe_relative_file(value: object) -> str:
-    file = _text(value, "mapping.file").strip()
-    if (
-        not _SAFE_RELATIVE_FILE.fullmatch(file)
-        or file.startswith("/")
-        or any(part == ".." for part in file.split("/"))
-    ):
-        raise PrCodeCandidateValidationError("mapping.file must be a safe relative locator")
-    return file
+    try:
+        return safe_relative_file(value, "mapping.file")
+    except ValueError as exc:
+        raise PrCodeCandidateValidationError(str(exc)) from None
 
 
 @dataclass(frozen=True)
@@ -439,9 +417,7 @@ def extract_pr_code_candidates(
 
 def _immutable_revision(value: str) -> bool:
     """Accept only complete Git object IDs, never abbreviated references."""
-    return len(value) in (40, 64) and all(
-        character in "0123456789abcdefABCDEF" for character in value
-    )
+    return is_immutable_revision(value)
 
 
 def _observed_at(value: object) -> str:
@@ -469,7 +445,7 @@ def _observed_at(value: object) -> str:
 def _is_complete_deterministic_symbol_identity(value: str) -> bool:
     """Return whether ``value`` is a complete, qualified code symbol identity."""
 
-    return bool(_QUALIFIED_SYMBOL_IDENTITY.fullmatch(value))
+    return is_complete_symbol_identity(value)
 
 
 def _normalized_source_mapping_id(value: object) -> str | None:
