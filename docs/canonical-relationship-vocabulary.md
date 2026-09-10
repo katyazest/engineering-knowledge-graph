@@ -1,4 +1,4 @@
-# Canonical relationship vocabulary (revision 2)
+# Canonical relationship vocabulary (revision 3)
 
 `engineering_kg.relationship_vocabulary` is the executable authority for
 semantic-edge and trusted-code-link admission. The catalog reference below is
@@ -28,13 +28,13 @@ means a complete locator (repository, revision, file, and symbol).
 
 ```json
 {
-  "revision": "2",
+  "revision": "3",
   "relationships": [
     {"classification": "structural", "kind": "contains", "max_targets_per_source": null, "permits_code_locator": false, "semantics": "Structural containment.", "source_kinds": ["openspec-active-change", "openspec-archived-change", "requirement", "specification"], "target_kinds": ["openspec-artifact", "requirement", "scenario"]},
     {"classification": "semantic", "kind": "traces_to", "max_targets_per_source": null, "permits_code_locator": false, "semantics": "Traceability relationship.", "source_kinds": ["jira_story", "openspec-active-change", "openspec-archived-change", "requirement", "scenario"], "target_kinds": ["jira_story", "requirement", "scenario", "specification"]},
-    {"classification": "semantic", "kind": "implements", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Implementation relationship.", "source_kinds": ["business_process", "contract", "jira_story", "pull_request", "repository", "service"], "target_kinds": ["business_process", "contract", "repository", "service"]},
+    {"classification": "semantic", "kind": "implements", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Implementation relationship.", "source_kinds": ["business_process", "contract", "jira_story", "repository", "service"], "target_kinds": ["business_process", "contract", "repository", "service"]},
     {"classification": "semantic", "kind": "verified_by", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Verification relationship.", "source_kinds": ["business_process", "contract", "jira_story", "requirement", "scenario", "service"], "target_kinds": ["contract", "pull_request", "scenario"]},
-    {"classification": "semantic", "kind": "touches", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Change touches an implementation target.", "source_kinds": ["jira_story", "pull_request"], "target_kinds": ["business_process", "contract", "repository", "service"]},
+    {"classification": "semantic", "kind": "touches", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Change touches an implementation target.", "source_kinds": ["jira_story", "openspec-active-change", "openspec-archived-change", "pull_request"], "target_kinds": ["business_process", "contract", "repository", "service"]},
     {"classification": "semantic", "kind": "depends_on", "max_targets_per_source": null, "permits_code_locator": false, "semantics": "Directed dependency.", "source_kinds": ["business_process", "contract", "jira_story", "pull_request", "repository", "requirement", "scenario", "service", "specification"], "target_kinds": ["business_process", "contract", "jira_story", "pull_request", "repository", "requirement", "scenario", "service", "specification"]},
     {"classification": "semantic", "kind": "references", "max_targets_per_source": null, "permits_code_locator": true, "semantics": "Non-owning reference.", "source_kinds": ["*"], "target_kinds": ["*"]},
     {"classification": "semantic", "kind": "owned_by", "max_targets_per_source": 1, "permits_code_locator": false, "semantics": "Single ownership assignment.", "source_kinds": ["adr", "business_process", "contract", "repository", "service", "specification"], "target_kinds": ["external_system", "service", "workspace"]},
@@ -44,21 +44,27 @@ means a complete locator (repository, revision, file, and symbol).
     {"classification": "structural", "kind": "contains", "source": "openspec-hierarchy", "unsupported_behavior": "diagnose-and-skip"},
     {"classification": "support", "kind": "asserts", "source": "openspec-assertion", "unsupported_behavior": "diagnose-and-skip"},
     {"classification": "non-confident", "kind": "references", "source": "openspec-related", "unsupported_behavior": "diagnose-and-skip"},
-    {"classification": "candidate", "kind": "touches", "source": "merged-pr-changed-symbol", "unsupported_behavior": "diagnose-and-skip"}
+    {"classification": "candidate", "kind": "touches", "source": "merged-pr-changed-symbol", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "declared", "kind": "references", "source": "pr-declared-association", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "observed", "kind": "touches", "source": "pr-observed-repository", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "candidate", "kind": "touches", "source": "pr-changed-symbol", "unsupported_behavior": "diagnose-and-skip"}
   ]
 }
 ```
 
 ## Source mapping, canonical persistence, and trust boundary
 
-OpenSpec hierarchy maps to structural `CONTAINS`. An OpenSpec assertion is
+OpenSpec hierarchy maps to structural `CONTAINS`. An explicit PR association
+maps to declared `PULL_REQUEST REFERENCES` an active/archived OpenSpec change
+or Jira story. The observed PR revision maps to `PULL_REQUEST TOUCHES` its
+canonical repository. An OpenSpec assertion is
 non-semantic `ASSERTS` support for derived `TRACES_TO`; uniquely resolved
 OpenSpec `related` maps to non-confident `REFERENCES`; and merged-PR changed
 symbols map to candidate `TOUCHES` claims. Unsupported source claims are
 diagnosed and skipped. No supported mapper emits `IMPLEMENTS`, `VERIFIED_BY`,
 `DEPENDS_ON`, `OWNED_BY`, or `PROVIDES`.
 
-Persistence and readback accept only revision 2's current canonical format.
+Persistence and readback accept only revision 3's current canonical format.
 Relationship aliases, reversed encodings (including `OWNS`), and historical
 candidate claim kinds fail with deterministic diagnostics; they are not
 converted, migrated, or backed up.
@@ -69,6 +75,17 @@ EKG has no historical deployment or persisted graph data. This catalog does
 not provide compatibility, migration, backup, or rollback behavior. Any future
 such work requires an explicit requirement backed by concrete evidence of
 pre-canonical data.
+
+## Pull-request evidence boundary
+
+A represented merged pull request is bounded by one canonical repository and
+complete immutable base/head revisions. Its PR source artifact is revision
+bounded by the head revision; the association source reference is retained
+separately. `PULL_REQUEST REFERENCES` an active/archived OpenSpec change or
+Jira story only when that association is explicitly source-backed. The
+`PULL_REQUEST TOUCHES REPOSITORY` relation is observed. Changed-symbol
+observations remain scoped, observed, and untrusted; they do not imply
+requirement coverage or emit `IMPLEMENTS`.
 
 Candidates, rejected claims, superseded claims, raw evidence, and `ASSERTS`
 support are never trusted semantic projections. Only an explicitly `trusted`

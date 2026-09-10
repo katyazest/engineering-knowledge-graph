@@ -12,7 +12,7 @@ observation support. PR/file observations and LLM-only inference remain
 auditable, non-trusted evidence. Valid conflicting support is retained; count,
 order, confidence, and merged PR state never select or promote a record.
 
-The catalog revision is `2`. Older persisted support records lacking these
+The catalog revision is `3`. Older persisted support records lacking these
 fields are rejected at readback: there is no legacy backfill or migration.
 
 ## EKG-41 verification matrix

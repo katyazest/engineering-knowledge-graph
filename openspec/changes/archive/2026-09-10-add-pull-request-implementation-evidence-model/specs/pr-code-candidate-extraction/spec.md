@@ -1,8 +1,5 @@
-# pr-code-candidate-extraction Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change extract-pr-code-candidates. Update Purpose after archive.
-## Requirements
 ### Requirement: Explicitly linked merged PR change sets are normalized at the adapter boundary
 The system SHALL admit a project-owned normalized input for a merged pull-request change set to candidate extraction only when it constructs complete PR implementation evidence with a payload-safe source-qualified PR identity, an existing canonical `REPOSITORY` node, immutable complete base and head revisions, an explicit PR source reference, complete provenance, and an explicitly asserted source-backed association to one existing `OPENSPEC_ACTIVE_CHANGE`, `OPENSPEC_ARCHIVED_CHANGE`, or `JIRA_STORY` intended-change subject. It SHALL retain one or more changed-symbol mapping records, each with its source file and either a complete deterministic symbol identity or a deterministic unresolved/malformed outcome. Provider-specific Bitbucket, Jira, and Graphify response models, source payloads, and URL-like external links SHALL not enter normalized records or the canonical graph. Identity fields SHALL accept a payload-safe opaque URI-shaped stable ID, including `urn:example.org/link-42`, but SHALL reject hierarchical or authority-bearing URL forms, including `https://…`, `custom://…`, and `https:host/path`, and payload-like values.
 
@@ -44,30 +41,7 @@ The system SHALL convert every unique, deterministically resolved changed-symbol
 - **THEN** the merged graph retains one record for each stable PR, association, observed repository relation, claim, observation, provenance evidence, and initial lifecycle identity
 - **THEN** serialized candidates and diagnostics have deterministic ordering
 
-### Requirement: Unresolved or ambiguous changed symbols are not guessed
-The system SHALL emit a code-link candidate only when the changed-symbol mapping supplies one complete deterministic `CodeLocator` identity. It SHALL not construct a candidate from a changed file alone, a line range, a symbol name without its deterministic identity, multiple ambiguous symbol matches, a branch name, or a mutable PR reference. It SHALL record a deterministic non-emission diagnostic and preserve admissible source provenance for each skipped mapping.
-
-#### Scenario: Changed file without resolved symbol is skipped
-- **WHEN** an eligible linked change set identifies a changed file but no deterministic symbol mapping
-- **THEN** extraction emits no claim or observation for that file
-- **THEN** extraction reports a deterministic unresolved-symbol diagnostic with the source mapping identity and provenance reference
-
-#### Scenario: Ambiguous symbol mapping is skipped
-- **WHEN** a changed-symbol mapping has more than one possible symbol target or lacks a complete immutable revision-qualified locator
-- **THEN** extraction emits no candidate for the mapping
-- **THEN** extraction reports a deterministic ambiguity or incomplete-locator diagnostic without selecting a target
-
-### Requirement: Candidate extraction reports payload-safe admission evidence and outcomes
-The reusable extraction result SHALL expose deterministic counts and diagnostics for accepted change sets, emitted candidates, and skipped inputs grouped by admission reason. Each emitted candidate SHALL be traceable through its observation and provenance evidence to the explicit engineering-change/PR association and source mapping identity. Result metadata and graph records SHALL exclude source code, diff bodies, symbol bodies, provider payloads, hierarchical or authority-bearing URL-like external links, credentials, tokens, and OpenLore analysis data. A payload-safe opaque URI-shaped stable identifier, including `urn:example.org/link-42`, is permitted only as an identifier and is not an external navigation link.
-
-#### Scenario: Mixed input has explainable admission results
-- **WHEN** extraction receives a deterministic mixture of eligible resolved mappings and skipped ineligible, unresolved, or ambiguous mappings
-- **THEN** its result reports stable accepted, emitted, and skipped counts and deterministically sorted diagnostics for every non-emission
-- **THEN** every emitted candidate can be traced to its asserted association and source mapping through retained evidence identifiers
-
-#### Scenario: Extraction is local and fixture-testable
-- **WHEN** extraction runs with normalized local fixtures while network access is unavailable
-- **THEN** it completes without calling Jira, Bitbucket, Graphify, OpenLore, or any external service
+## ADDED Requirements
 
 ### Requirement: Candidate extraction reports PR-evidence admission outcomes without coverage conclusions
 The reusable extraction result SHALL expose deterministic counts and reason-coded diagnostics for admitted PR evidence, declared associations, emitted PR-scoped candidates, and skipped inputs. Each emitted candidate SHALL be traceable through its PR reference, declared association, observation, and provenance evidence to the explicit association and source mapping identity. Result metadata and graph records SHALL exclude source code, diff bodies, symbol bodies, provider payloads, hierarchical or authority-bearing URL-like external links, credentials, tokens, and OpenLore analysis data. It SHALL not report requirement coverage or an implementation conclusion for a PR, changed file, or changed symbol.
@@ -76,4 +50,3 @@ The reusable extraction result SHALL expose deterministic counts and reason-code
 - **WHEN** extraction receives a deterministic mixture of eligible PR evidence and skipped ineligible, unresolved, ambiguous, or scope-inconsistent mappings
 - **THEN** its result reports stable admitted, declared, emitted, and skipped counts with deterministically sorted diagnostics for every non-emission
 - **THEN** every emitted candidate can be traced to its PR, asserted association, and source mapping through retained evidence identifiers without claiming requirement coverage or trusted implementation
-
