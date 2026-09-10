@@ -33,6 +33,10 @@ from engineering_kg.ontology import (
     SourceArtifactLocator,
     ProvenanceKind,
     ProvenanceRecord,
+    PullRequestImplementationEvidence,
+    PullRequestDeclaredAssociation,
+    PullRequestObservedRepositoryRelation,
+    project_pull_request_evidence,
     stable_id,
 )
 from engineering_kg.relationship_vocabulary import RelationshipKind
@@ -112,29 +116,6 @@ def _safe_relative_file(value: object) -> str:
 
 
 @dataclass(frozen=True)
-class EngineeringChangePrAssociation:
-    """An explicit, source-adapted association; no inferred links are represented."""
-
-    id: str
-    engineering_change_subject_id: str
-    pull_request_id: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "id", _safe_identity(self.id, "association.id"))
-        object.__setattr__(
-            self,
-            "engineering_change_subject_id",
-            _safe_identity(
-                self.engineering_change_subject_id,
-                "association.engineering_change_subject_id",
-            ),
-        )
-        object.__setattr__(
-            self, "pull_request_id", _safe_identity(self.pull_request_id, "association.pull_request_id")
-        )
-
-
-@dataclass(frozen=True)
 class ChangedSymbolMapping:
     """One Graphify-adapted changed-file/symbol mapping outcome."""
 
@@ -142,6 +123,8 @@ class ChangedSymbolMapping:
     file: str
     outcome: MappingOutcome | str
     symbol: str | None = None
+    repository: str | None = None
+    revision: str | None = None
 
     def __post_init__(self) -> None:
         mapping_id = _normalized_source_mapping_id(self.id)
@@ -171,87 +154,210 @@ class ChangedSymbolMapping:
             # Non-resolved records carry a classified outcome, never a
             # provider-provided candidate string or body.
             object.__setattr__(self, "symbol", None)
+        if self.repository is not None:
+            object.__setattr__(self, "repository", _safe_identity(self.repository, "mapping.repository"))
+        if self.revision is not None:
+            object.__setattr__(self, "revision", _safe_identity(self.revision, "mapping.revision"))
+            if not _immutable_revision(self.revision):
+                raise PrCodeCandidateValidationError("mapping.revision must be immutable")
 
 
 @dataclass(frozen=True)
-class MergedPrChangeSet:
-    """Immutable PR change-set identity and local mapping outcomes."""
+class NormalizedPullRequestEvidence:
+    """Provider-neutral enriched PR input admitted by the adapter boundary."""
 
-    association: EngineeringChangePrAssociation
-    pull_request_id: str
-    repository: str
-    merged_revision: str
+    pull_request: PullRequestImplementationEvidence
+    association: PullRequestDeclaredAssociation
+    repository_relation: PullRequestObservedRepositoryRelation
     mappings: tuple[ChangedSymbolMapping, ...]
-    merged: bool = True
-    observed_at: str = ""
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.association, EngineeringChangePrAssociation):
-            raise PrCodeCandidateValidationError("association must be an EngineeringChangePrAssociation")
-        object.__setattr__(
-            self, "pull_request_id", _safe_identity(self.pull_request_id, "change_set.pull_request_id")
-        )
-        object.__setattr__(self, "repository", _safe_repository(self.repository))
-        object.__setattr__(
-            self, "merged_revision", _safe_identity(self.merged_revision, "change_set.merged_revision")
-        )
-        if not _immutable_revision(self.merged_revision):
-            raise PrCodeCandidateValidationError(
-                "change_set.merged_revision must be an immutable revision"
-            )
-        if self.pull_request_id != self.association.pull_request_id:
-            raise PrCodeCandidateValidationError("change_set.pull_request_id must match association.pull_request_id")
-        if not isinstance(self.merged, bool) or not self.merged:
-            raise PrCodeCandidateValidationError("change_set must be merged")
-        if not isinstance(self.mappings, tuple) or not self.mappings:
-            raise PrCodeCandidateValidationError("change_set.mappings must be a non-empty tuple")
-        if not all(isinstance(item, ChangedSymbolMapping) for item in self.mappings):
-            raise PrCodeCandidateValidationError("change_set.mappings must contain ChangedSymbolMapping records")
-        _observed_at(self.observed_at)
+    evidence: tuple[Evidence, ...] = ()
+    provenance: tuple[ProvenanceRecord, ...] = ()
 
     @property
     def id(self) -> str:
-        return stable_id("pr-change-set", self.association.id, self.pull_request_id, self.repository, self.merged_revision)
+        return self.pull_request.id
+
+    def __post_init__(self) -> None:
+        if self.association.pull_request_evidence_id != self.pull_request.id:
+            raise PrCodeCandidateValidationError("association must reference pull_request evidence")
+        if self.repository_relation.pull_request_evidence_id != self.pull_request.id:
+            raise PrCodeCandidateValidationError("repository relation must reference pull_request evidence")
+        if self.repository_relation.repository_id != self.pull_request.repository_id:
+            raise PrCodeCandidateValidationError("repository relation must match pull_request repository")
+        if not isinstance(self.mappings, tuple) or not self.mappings:
+            raise PrCodeCandidateValidationError("pr evidence mappings must be a non-empty tuple")
+        if not all(isinstance(item, ChangedSymbolMapping) for item in self.mappings):
+            raise PrCodeCandidateValidationError("pr evidence mappings must contain ChangedSymbolMapping records")
+        object.__setattr__(self, "mappings", tuple(sorted(self.mappings, key=lambda item: item.id)))
 
 
-def normalize_merged_pr_change_set(value: Mapping[str, Any]) -> MergedPrChangeSet:
-    """Adapt a plain local fixture into project-owned records, dropping all payload fields."""
+def normalize_pull_request_evidence(value: Mapping[str, Any]) -> NormalizedPullRequestEvidence:
+    """Normalize identity-level PR evidence and discard provider payload fields."""
 
     if not isinstance(value, Mapping):
-        raise PrCodeCandidateValidationError("change_set must be a mapping")
-    try:
-        association_data = value["association"]
-        mappings_data = value["mappings"]
-    except KeyError as exc:
-        raise PrCodeCandidateValidationError(f"change_set.{exc.args[0]} is required") from None
-    if not isinstance(association_data, Mapping):
-        raise PrCodeCandidateValidationError("change_set.association must be a mapping")
-    if not isinstance(mappings_data, (list, tuple)):
-        raise PrCodeCandidateValidationError("change_set.mappings must be a list")
-    association = EngineeringChangePrAssociation(
-        id=association_data.get("id"),
-        engineering_change_subject_id=association_data.get("engineering_change_subject_id"),
-        pull_request_id=association_data.get("pull_request_id"),
+        raise PrCodeCandidateValidationError("pr evidence must be a mapping")
+    forbidden_input_keys = {
+        "provider_payload", "payload", "diff", "source_code", "title", "description",
+        "comments", "credentials", "token", "tokens",
+    }
+    forbidden = sorted(key for key in value if key in forbidden_input_keys)
+    if forbidden:
+        raise PrCodeCandidateValidationError(f"raw payload field is not allowed: {forbidden[0]}")
+    provenance_input = value.get("provenance", value.get("provenance_inputs"))
+    if not isinstance(provenance_input, Mapping) or not provenance_input:
+        raise PrCodeCandidateValidationError("provenance input is required")
+    if any(key in forbidden_input_keys for key in provenance_input):
+        raise PrCodeCandidateValidationError("raw provenance payload field is not allowed")
+    pull_request_id = value.get("pull_request_id", value.get("source_qualified_pr_id"))
+    repository_id = value.get(
+        "repository_node_id", value.get("repository_id", value.get("repository"))
     )
+    base_revision = value.get("base_revision")
+    head_revision = value.get("head_revision")
+    if "merged_revision" in value:
+        raise PrCodeCandidateValidationError(
+            "merged_revision-only input is unsupported; use base_revision and head_revision"
+        )
+    if not base_revision:
+        raise PrCodeCandidateValidationError("base_revision is required")
+    if not head_revision:
+        raise PrCodeCandidateValidationError("head_revision is required")
+    observed_at = value.get("observed_at", "")
+    observed_at = _observed_at(observed_at)
+    association_data = value.get("association")
+    if not isinstance(association_data, Mapping):
+        raise PrCodeCandidateValidationError("pr evidence.association is required")
+    intended_change_id = association_data.get(
+        "intended_change_id", association_data.get("engineering_change_subject_id")
+    )
+    intended_kind = association_data.get("intended_change_kind")
+    if intended_kind is not None and intended_kind not in {
+        "openspec-active-change", "openspec-archived-change", "jira_story",
+    }:
+        raise PrCodeCandidateValidationError("association intended-change endpoint kind is unsupported")
+    mappings_data = value.get("mappings")
+    if not isinstance(mappings_data, (list, tuple)):
+        raise PrCodeCandidateValidationError("pr evidence.mappings must be a list")
     mappings = tuple(
         ChangedSymbolMapping(
-            id=item.get("id") if isinstance(item, Mapping) else None,
-            file=item.get("file") if isinstance(item, Mapping) else None,
-            outcome=item.get("outcome") if isinstance(item, Mapping) else None,
-            symbol=item.get("symbol") if isinstance(item, Mapping) else None,
+            item.get("id") if isinstance(item, Mapping) else None,
+            item.get("file") if isinstance(item, Mapping) else None,
+            item.get("outcome") if isinstance(item, Mapping) else None,
+            item.get("symbol") if isinstance(item, Mapping) else None,
+            item.get("repository") if isinstance(item, Mapping) else None,
+            item.get("revision", item.get("head_revision")) if isinstance(item, Mapping) else None,
+        ) for item in mappings_data
+    )
+    pr_evidence_source, pr_evidence_provenance = _normalized_source_bundle(
+        value.get("pr_source_reference", value.get("pr_source")),
+        pull_request_id, repository_id, head_revision, observed_at, "pull-request",
+    )
+    association_source, association_provenance = _normalized_source_bundle(
+        association_data.get("source_reference", association_data.get("source")),
+        intended_change_id, repository_id, head_revision, observed_at, "pr-association",
+    )
+    repository_source, repository_provenance = _normalized_source_bundle(
+        value.get("repository_source_reference", value.get("repository_source")),
+        pull_request_id, repository_id, head_revision, observed_at, "pr-repository",
+    )
+    pull_request = PullRequestImplementationEvidence(
+        pull_request_id, repository_id, base_revision, head_revision, value.get("merged", False),
+        pr_evidence_source.id, pr_evidence_provenance.id,
+    )
+    association = PullRequestDeclaredAssociation(
+        pull_request.id, intended_change_id, association_source.id, association_provenance.id,
+    )
+    relation = PullRequestObservedRepositoryRelation(
+        pull_request.id, repository_id, repository_source.id, repository_provenance.id,
+    )
+    mapping_evidence: list[Evidence] = []
+    mapping_provenance: list[ProvenanceRecord] = []
+    for mapping in mappings:
+        if not mapping.id:
+            continue
+        evidence, provenance = _normalized_source_bundle(
+            mapping.id, mapping.id, repository_id, head_revision, observed_at, "pull-request-mapping",
         )
-        for item in mappings_data
+        mapping_evidence.append(evidence)
+        mapping_provenance.append(provenance)
+    return NormalizedPullRequestEvidence(
+        pull_request, association, relation, mappings,
+        (pr_evidence_source, association_source, repository_source, *mapping_evidence),
+        (pr_evidence_provenance, association_provenance, repository_provenance, *mapping_provenance),
     )
-    change_set = MergedPrChangeSet(
-        association=association,
-        pull_request_id=value.get("pull_request_id"),
-        repository=value.get("repository"),
-        merged_revision=value.get("merged_revision"),
-        mappings=mappings,
-        merged=value.get("merged", False),
-        observed_at=value.get("observed_at", ""),
+
+
+# Clear aliases for callers that use the capability name rather than the
+# historical candidate-extraction name.
+normalize_pr_implementation_evidence = normalize_pull_request_evidence
+PullRequestEvidenceInput = NormalizedPullRequestEvidence
+
+
+def _normalized_source_bundle(
+    reference: object,
+    identity_value: object,
+    repository_id: object,
+    revision: object,
+    observed_at: str,
+    artifact_type: str,
+) -> tuple[Evidence, ProvenanceRecord]:
+    if reference is None:
+        raise PrCodeCandidateValidationError("source reference is required")
+    if isinstance(reference, Mapping):
+        allowed_keys = {"source_type", "source_identity", "stable_locator", "revision_or_version", "evidence_id"}
+        unknown = sorted(key for key in reference if key not in allowed_keys)
+        if unknown:
+            raise PrCodeCandidateValidationError(f"raw source reference field is not allowed: {unknown[0]}")
+        source_type = reference.get("source_type", "normalized-source")
+        source_identity = reference.get("source_identity", identity_value)
+        stable_locator = reference.get("stable_locator")
+        if stable_locator is None:
+            stable_locator = f"references/{stable_id('source', identity_value, artifact_type).replace(':', '-') }"
+        revision_value = reference.get("revision_or_version", revision)
+        if artifact_type == "pull-request" and "revision_or_version" in reference:
+            if not isinstance(revision_value, str) or not _immutable_revision(revision_value):
+                raise PrCodeCandidateValidationError(
+                    "pull-request source reference revision_or_version must be immutable"
+                )
+            if revision_value != revision:
+                raise PrCodeCandidateValidationError(
+                    "pull-request source reference revision_or_version must match head_revision"
+                )
+        evidence_id = reference.get("evidence_id")
+    else:
+        source_type = "normalized-source"
+        source_identity = reference
+        stable_locator = f"references/{stable_id('source', reference, artifact_type).replace(':', '-') }"
+        revision_value = revision
+        evidence_id = None
+    try:
+        source_identity = safe_identity(source_identity, "source_reference.source_identity")
+        source_type = safe_identity(source_type, "source_reference.source_type")
+        stable_locator = safe_relative_file(stable_locator, "source_reference.stable_locator")
+        revision_value = safe_identity(revision_value, "source_reference.revision_or_version")
+    except ValueError as exc:
+        raise PrCodeCandidateValidationError(str(exc)) from None
+    identity = SourceArtifactIdentity(source_type, source_identity, artifact_type, revision_value, stable_locator)
+    provenance = ProvenanceRecord(
+        ProvenanceKind.EXTERNAL,
+        observed_at,
+        "sha256",
+        hashlib.sha256(json.dumps({"identity": identity.id, "repository": repository_id, "revision": revision, "artifact_type": artifact_type}, sort_keys=True).encode()).hexdigest(),
+        STRATEGY_ID,
+        "2",
+        identity,
     )
-    return change_set
+    resolved_evidence_id = evidence_id or stable_id("evidence", identity.id)
+    if resolved_evidence_id != stable_id("evidence", identity.id):
+        raise PrCodeCandidateValidationError("source reference evidence_id must match its identity")
+    evidence = Evidence(
+        resolved_evidence_id,
+        STRATEGY_ID,
+        SourceArtifactLocator(identity, {}),
+        {"pull_request_id": str(identity_value), "repository": str(repository_id)},
+        (provenance.id,),
+    )
+    return evidence, provenance
 
 
 @dataclass(frozen=True)
@@ -278,9 +384,12 @@ class PrCodeCandidateExtractionMetadata:
     skipped_reason_counts: dict[str, int] = field(default_factory=dict)
     diagnostics: tuple[PrCodeCandidateDiagnostic, ...] = ()
     graph_counts: dict[str, int] = field(default_factory=dict)
+    admitted_pr_evidence_count: int = 0
+    declared_association_count: int = 0
+    observed_repository_relation_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
-        return {"accepted_change_set_count": self.accepted_change_set_count, "diagnostics": [item.as_dict() for item in self.diagnostics], "emitted_candidate_count": self.emitted_candidate_count, "graph_counts": dict(sorted(self.graph_counts.items())), "skipped_input_count": self.skipped_input_count, "skipped_reason_counts": dict(sorted(self.skipped_reason_counts.items()))}
+        return {"accepted_change_set_count": self.accepted_change_set_count, "admitted_pr_evidence_count": self.admitted_pr_evidence_count, "declared_association_count": self.declared_association_count, "diagnostics": [item.as_dict() for item in self.diagnostics], "emitted_candidate_count": self.emitted_candidate_count, "graph_counts": dict(sorted(self.graph_counts.items())), "observed_repository_relation_count": self.observed_repository_relation_count, "skipped_input_count": self.skipped_input_count, "skipped_reason_counts": dict(sorted(self.skipped_reason_counts.items()))}
 
 
 @dataclass(frozen=True)
@@ -290,128 +399,195 @@ class PrCodeCandidateExtractionResult:
 
 
 def extract_pr_code_candidates(
-    change_sets: tuple[MergedPrChangeSet, ...], subject_graph: GraphSnapshot
+    change_sets: tuple[NormalizedPullRequestEvidence, ...], subject_graph: GraphSnapshot
 ) -> PrCodeCandidateExtractionResult:
     """Produce observed candidates only; neither edges nor trusted projections are emitted."""
 
+    if not all(isinstance(item, NormalizedPullRequestEvidence) for item in change_sets):
+        raise PrCodeCandidateValidationError(
+            "legacy merged-revision-only PR change-set input is unsupported"
+        )
+    return extract_pull_request_implementation_evidence(tuple(change_sets), subject_graph)
+
+
+def extract_pull_request_implementation_evidence(
+    inputs: tuple[NormalizedPullRequestEvidence, ...], subject_graph: GraphSnapshot,
+) -> PrCodeCandidateExtractionResult:
+    """Admit enriched PR evidence and association-scoped observed candidates."""
+
     diagnostics: list[PrCodeCandidateDiagnostic] = []
-    evidence: list[Evidence] = []
+    accepted: list[NormalizedPullRequestEvidence] = []
+    subjects = {node.id: node for node in subject_graph.nodes}
+    repository_nodes = {
+        node.id for node in subject_graph.nodes if str(getattr(node.kind, "value", node.kind)) == "repository"
+    }
+    by_id: dict[str, list[NormalizedPullRequestEvidence]] = {}
+    for item in inputs:
+        by_id.setdefault(item.id, []).append(item)
+    for evidence_id in sorted(by_id):
+        records = sorted(
+            by_id[evidence_id],
+            key=lambda item: (
+                json.dumps(item.association.as_dict(), sort_keys=True),
+                tuple(
+                    (mapping.id, mapping.file, mapping.outcome.value, mapping.symbol or "",
+                     mapping.repository or "", mapping.revision or "")
+                    for mapping in item.mappings
+                ),
+            ),
+        )
+        pr_identities = {
+            json.dumps(item.pull_request.as_dict(), sort_keys=True)
+            for item in records
+        }
+        if len(pr_identities) > 1:
+            diagnostics.append(PrCodeCandidateDiagnostic("conflicting-pr-evidence-identity", evidence_id))
+            continue
+        for item in records:
+            if item.association.intended_change_id not in subjects:
+                diagnostics.append(PrCodeCandidateDiagnostic("missing-intended-change", item.id))
+                continue
+            intended_kind = str(getattr(subjects[item.association.intended_change_id].kind, "value", subjects[item.association.intended_change_id].kind))
+            if intended_kind not in {"openspec-active-change", "openspec-archived-change", "jira_story"}:
+                diagnostics.append(PrCodeCandidateDiagnostic("ineligible-intended-change-kind", item.id))
+                continue
+            if item.pull_request.repository_id not in repository_nodes:
+                diagnostics.append(PrCodeCandidateDiagnostic("missing-repository", item.id))
+                continue
+            accepted.append(item)
+
+    # A source mapping ID is an immutable identity.  If an adapter supplies
+    # the same ID with different locator identity, neither occurrence is safe
+    # to coalesce: reject that mapping while retaining other associations and
+    # mappings for the same PR.
+    mapping_locators: dict[str, tuple[str, str, str | None, str | None, str | None]] = {}
+    conflicting_mapping_ids: set[str] = set()
+    for item in accepted:
+        for mapping in item.mappings:
+            if not mapping.id:
+                continue
+            locator = (
+                mapping.file,
+                mapping.outcome.value,
+                mapping.symbol,
+                mapping.repository,
+                mapping.revision,
+            )
+            previous = mapping_locators.get(mapping.id)
+            if previous is None:
+                mapping_locators[mapping.id] = locator
+            elif previous != locator:
+                conflicting_mapping_ids.add(mapping.id)
+    for mapping_id in sorted(conflicting_mapping_ids):
+        diagnostics.append(PrCodeCandidateDiagnostic(
+            "conflicting-source-mapping-identity",
+            min(item.id for item in accepted if any(mapping.id == mapping_id for mapping in item.mappings)),
+            mapping_id,
+        ))
+
+    all_prs: list[PullRequestImplementationEvidence] = []
+    all_associations: list[PullRequestDeclaredAssociation] = []
+    all_relations: list[PullRequestObservedRepositoryRelation] = []
+    all_evidence: list[Evidence] = []
+    all_provenance: list[ProvenanceRecord] = []
     claims: list[CrossGraphLinkClaim] = []
     observations: list[CrossGraphLinkEvidence] = []
     lifecycle: list[CrossGraphLinkLifecycle] = []
-    provenance_records: list[ProvenanceRecord] = []
-    accepted = 0
-    subjects = {node.id: node for node in subject_graph.nodes}
-    change_sets_by_id = _change_sets_by_id(change_sets)
-    conflicting_change_set_ids = {
-        change_set_id
-        for change_set_id, duplicates in change_sets_by_id.items()
-        if len({_change_set_identity(item) for item in duplicates}) > 1
-    }
-    for change_set_id in sorted(change_sets_by_id):
-        duplicates = change_sets_by_id[change_set_id]
-        # `MergedPrChangeSet.id` intentionally case-normalizes its identity
-        # parts. Select a canonical representative rather than accepting the
-        # caller's first spelling of those parts, so equivalent duplicate input
-        # cannot make graph output or conflict provenance order-dependent.
-        canonical_change_set = min(duplicates, key=_change_set_sort_key)
-        if change_set_id in conflicting_change_set_ids:
-            # The immutable change-set identity must identify one normalized record.
-            # Retain only identity-level, payload-safe conflict provenance; admitting
-            # either record would make candidate output depend on input ordering.
-            provenance = _change_set_conflict_provenance(canonical_change_set)
-            evidence.append(provenance)
-            diagnostics.append(
-                PrCodeCandidateDiagnostic(
-                    "conflicting-change-set-identity",
-                    change_set_id,
-                    provenance_evidence_id=provenance.id,
-                )
-            )
-            continue
-        change_set = canonical_change_set
-        if change_set.association.engineering_change_subject_id not in subjects:
-            diagnostics.append(PrCodeCandidateDiagnostic("missing-subject", change_set.id))
-            continue
-        if subjects[change_set.association.engineering_change_subject_id].kind != "jira_story":
-            diagnostics.append(
-                PrCodeCandidateDiagnostic("ineligible-subject-kind", change_set.id)
-            )
-            continue
-        accepted += 1
-        conflicting_mapping_ids = {
-            mapping_id
-            for mapping_id, identities in _mapping_identities(change_set.mappings).items()
-            if len(identities) > 1
+    for item in accepted:
+        all_prs.append(item.pull_request)
+        all_associations.append(item.association)
+        all_relations.append(item.repository_relation)
+        all_evidence.extend(item.evidence)
+        all_provenance.extend(item.provenance)
+        provenance_by_mapping_id = {
+            evidence.properties.get("pull_request_id"): evidence
+            for evidence in item.evidence
+            if evidence.properties.get("pull_request_id") in {mapping.id for mapping in item.mappings}
         }
-        reported_conflicts: set[str] = set()
-        for mapping in sorted(change_set.mappings, key=lambda item: item.id):
+        for mapping in sorted(item.mappings, key=lambda value: value.id):
             if not mapping.id:
-                diagnostics.append(
-                    PrCodeCandidateDiagnostic("invalid-mapping-identity", change_set.id)
-                )
+                diagnostics.append(PrCodeCandidateDiagnostic("invalid-mapping-identity", item.id))
                 continue
-            provenance, record = _mapping_provenance(change_set, mapping)
-            evidence.append(provenance)
-            provenance_records.append(record)
             if mapping.id in conflicting_mapping_ids:
-                # A source mapping must identify one outcome.  Conflicting adapted
-                # records cannot be safely resolved by processing order, so retain
-                # their safe provenance but admit no target for that source identity.
-                if mapping.id not in reported_conflicts:
-                    diagnostics.append(PrCodeCandidateDiagnostic(
-                        "conflicting-mapping-identity", change_set.id, mapping.id, provenance.id
-                    ))
-                    reported_conflicts.add(mapping.id)
                 continue
+            source_evidence = provenance_by_mapping_id.get(mapping.id)
             if mapping.outcome is not MappingOutcome.RESOLVED:
-                reason_code = (
-                    "unsupported-source-mapping"
-                    if mapping.outcome is MappingOutcome.UNSUPPORTED
-                    else f"{mapping.outcome.value}-symbol"
-                )
-                diagnostics.append(PrCodeCandidateDiagnostic(
-                    reason_code, change_set.id, mapping.id, provenance.id
-                ))
+                reason = "unsupported-source-mapping" if mapping.outcome is MappingOutcome.UNSUPPORTED else f"{mapping.outcome.value}-symbol"
+                diagnostics.append(PrCodeCandidateDiagnostic(reason, item.id, mapping.id, source_evidence.id if source_evidence else ""))
                 continue
-            # Constructors protect complete strings; this guard preserves behavior for
-            # deliberately malformed records supplied by a future adapter.
             if not mapping.symbol:
-                diagnostics.append(PrCodeCandidateDiagnostic(
-                    "incomplete-locator", change_set.id, mapping.id, provenance.id
-                ))
+                diagnostics.append(PrCodeCandidateDiagnostic("incomplete-locator", item.id, mapping.id, source_evidence.id if source_evidence else ""))
                 continue
-            target = CodeLocator(change_set.repository, change_set.merged_revision, mapping.file, mapping.symbol)
-            claim = CrossGraphLinkClaim(change_set.association.engineering_change_subject_id, RELATION_KIND, target)
-            lifecycle_provenance, lifecycle_records = _initial_candidate_lifecycle_provenance(claim, record)
-            evidence.append(lifecycle_provenance)
-            provenance_records.extend(lifecycle_records)
+            if mapping.repository is not None and mapping.repository != item.pull_request.repository_id:
+                diagnostics.append(PrCodeCandidateDiagnostic("repository-mismatch", item.id, mapping.id, source_evidence.id if source_evidence else ""))
+                continue
+            if mapping.revision is not None and mapping.revision != item.pull_request.head_revision:
+                diagnostics.append(PrCodeCandidateDiagnostic("revision-mismatch", item.id, mapping.id, source_evidence.id if source_evidence else ""))
+                continue
+            if source_evidence is None:
+                diagnostics.append(PrCodeCandidateDiagnostic("missing-mapping-source", item.id, mapping.id))
+                continue
+            target = CodeLocator(item.pull_request.repository_id, item.pull_request.head_revision, mapping.file, mapping.symbol)
+            claim = CrossGraphLinkClaim(item.association.intended_change_id, RELATION_KIND, target)
+            mapping_provenance = next(
+                (record for record in item.provenance if record.id in source_evidence.provenance_ids),
+                None,
+            )
+            if mapping_provenance is None:
+                diagnostics.append(PrCodeCandidateDiagnostic("missing-mapping-provenance", item.id, mapping.id, source_evidence.id))
+                continue
+            lifecycle_evidence, lifecycle_provenance = _initial_candidate_lifecycle_provenance(
+                claim, mapping_provenance
+            )
+            all_evidence.append(lifecycle_evidence)
+            all_provenance.extend(lifecycle_provenance)
             claims.append(claim)
             observations.append(CrossGraphLinkEvidence(
-                claim.id, STRATEGY_ID, mapping.id, provenance.id,
+                claim.id, STRATEGY_ID, mapping.id, source_evidence.id,
                 CrossGraphEvidenceOrigin.OBSERVED, CrossGraphEvidenceStatus.AUTHORITATIVE,
                 "pr-changed-symbol", CrossGraphTrustDisposition.UNTRUSTED,
+                item.pull_request.id, item.association.id,
             ))
-            # Lifecycle revisions are claim-wide.  PR mapping provenance belongs to
-            # its observation; a claim-scoped initialization record lets separately
-            # extracted observations of the same claim merge without revision-one
-            # provenance conflicts.
             lifecycle.append(CrossGraphLinkLifecycle(
-                claim.id, 1, CrossGraphLinkLifecycleState.CANDIDATE, lifecycle_provenance.id,
+                claim.id, 1, CrossGraphLinkLifecycleState.CANDIDATE, lifecycle_evidence.id,
                 CrossGraphEvidenceOrigin.OBSERVED, CrossGraphEvidenceStatus.DERIVED,
                 "candidate-initialization", CrossGraphTrustDisposition.UNTRUSTED,
             ))
+    projected = project_pull_request_evidence(
+        tuple({item.id: item for item in all_prs}.values()),
+        tuple({item.id: item for item in all_associations}.values()),
+        tuple({item.id: item for item in all_relations}.values()),
+    )
     graph = GraphSnapshot(
-        evidence=tuple({item.id: item for item in evidence}.values()),
+        nodes=projected.nodes,
+        edges=projected.edges,
+        evidence=tuple(sorted({item.id: item for item in all_evidence}.values(), key=lambda item: item.id)),
         cross_graph_link_claims=tuple({item.id: item for item in claims}.values()),
         cross_graph_link_evidence=tuple({item.id: item for item in observations}.values()),
         cross_graph_link_lifecycle=tuple({item.id: item for item in lifecycle}.values()),
-        provenance=tuple({item.id: item for item in provenance_records}.values()),
+        provenance=tuple(sorted({item.id: item for item in all_provenance}.values(), key=lambda item: item.id)),
+        pull_request_evidence=projected.pull_request_evidence,
+        pull_request_declared_associations=projected.pull_request_declared_associations,
+        pull_request_observed_repository_relations=projected.pull_request_observed_repository_relations,
     )
-    # Validate/collapse duplicate records against subjects without leaking those subjects into output.
     subject_graph.merged_with(graph)
-    ordered_diagnostics = tuple(sorted(diagnostics, key=lambda item: (item.reason_code, item.change_set_id, item.mapping_id, item.provenance_evidence_id)))
-    metadata = PrCodeCandidateExtractionMetadata(accepted, len(graph.cross_graph_link_claims), len(ordered_diagnostics), dict(Counter(item.reason_code for item in ordered_diagnostics)), ordered_diagnostics, {"cross_graph_link_claim_count": graph.cross_graph_link_claim_count, "cross_graph_link_evidence_count": graph.cross_graph_link_evidence_count, "cross_graph_link_lifecycle_count": graph.cross_graph_link_lifecycle_count, "evidence_count": graph.evidence_count})
+    ordered = tuple(sorted(diagnostics, key=lambda value: (value.reason_code, value.change_set_id, value.mapping_id, value.provenance_evidence_id)))
+    metadata = PrCodeCandidateExtractionMetadata(
+        len(accepted), len(graph.cross_graph_link_claims), len(ordered),
+        dict(Counter(item.reason_code for item in ordered)), ordered,
+        {
+            "cross_graph_link_claim_count": graph.cross_graph_link_claim_count,
+            "cross_graph_link_evidence_count": graph.cross_graph_link_evidence_count,
+            "cross_graph_link_lifecycle_count": graph.cross_graph_link_lifecycle_count,
+            "evidence_count": graph.evidence_count,
+            "pull_request_evidence_count": graph.pull_request_evidence_count,
+            "pull_request_declared_association_count": graph.pull_request_declared_association_count,
+            "pull_request_observed_repository_relation_count": graph.pull_request_observed_repository_relation_count,
+        },
+        graph.pull_request_evidence_count,
+        graph.pull_request_declared_association_count,
+        graph.pull_request_observed_repository_relation_count,
+    )
     return PrCodeCandidateExtractionResult(graph, metadata)
 
 
@@ -457,159 +633,6 @@ def _normalized_source_mapping_id(value: object) -> str | None:
     if len(normalized) > 256 or not _QUALIFIED_SOURCE_MAPPING_IDENTITY.fullmatch(normalized):
         return None
     return normalized
-
-
-def _mapping_identities(
-    mappings: tuple[ChangedSymbolMapping, ...],
-) -> dict[str, set[tuple[str, MappingOutcome, str | None]]]:
-    """Group normalized mapping identities by their source mapping identifier."""
-
-    identities: dict[str, set[tuple[str, MappingOutcome, str | None]]] = {}
-    for mapping in mappings:
-        identities.setdefault(mapping.id, set()).add(
-            (mapping.file, mapping.outcome, mapping.symbol)
-        )
-    return identities
-
-
-def _change_sets_by_id(
-    change_sets: tuple[MergedPrChangeSet, ...],
-) -> dict[str, tuple[MergedPrChangeSet, ...]]:
-    """Group normalized inputs before deduplicating their immutable identities."""
-
-    grouped: dict[str, list[MergedPrChangeSet]] = {}
-    for change_set in change_sets:
-        grouped.setdefault(change_set.id, []).append(change_set)
-    return {change_set_id: tuple(items) for change_set_id, items in grouped.items()}
-
-
-def _change_set_identity(
-    change_set: MergedPrChangeSet,
-) -> tuple[
-    str,
-    str,
-    str,
-    str,
-    str,
-    tuple[tuple[str, str, MappingOutcome, str | None], ...],
-]:
-    """Return normalized record content aligned with ``MergedPrChangeSet.id``."""
-
-    return (
-        _normalized_change_set_identity_part(change_set.association.id),
-        _normalized_change_set_identity_part(
-            change_set.association.engineering_change_subject_id
-        ),
-        _normalized_change_set_identity_part(change_set.association.pull_request_id),
-        _normalized_change_set_identity_part(change_set.repository),
-        _normalized_change_set_identity_part(change_set.merged_revision),
-        tuple(
-            sorted(
-                (mapping.id, mapping.file, mapping.outcome, mapping.symbol)
-                for mapping in change_set.mappings
-            )
-        ),
-    )
-
-
-def _change_set_sort_key(
-    change_set: MergedPrChangeSet,
-) -> tuple[
-    tuple[
-        str,
-        str,
-        str,
-        str,
-        str,
-        tuple[tuple[str, str, MappingOutcome, str | None], ...],
-    ],
-    tuple[str, str, str, str, str, tuple[tuple[str, str, str, str], ...]],
-]:
-    """Order duplicate inputs canonically, including raw spelling as a tie-breaker."""
-
-    return (
-        _change_set_identity(change_set),
-        (
-            change_set.association.id,
-            change_set.association.engineering_change_subject_id,
-            change_set.association.pull_request_id,
-            change_set.repository,
-            change_set.merged_revision,
-            tuple(
-                sorted(
-                    (
-                        mapping.id,
-                        mapping.file,
-                        mapping.outcome.value,
-                        mapping.symbol or "",
-                    )
-                    for mapping in change_set.mappings
-                )
-            ),
-        ),
-    )
-
-
-def _normalized_change_set_identity_part(value: str) -> str:
-    """Mirror ``stable_id`` normalization used by ``MergedPrChangeSet.id``."""
-
-    return " ".join(value.strip().lower().split())
-
-
-def _change_set_conflict_provenance(change_set: MergedPrChangeSet) -> Evidence:
-    """Return safe provenance for a conflicting normalized change-set identity."""
-
-    provenance_id = stable_id(
-        "evidence", STRATEGY_ID, "change-set-conflict", change_set.id
-    )
-    return Evidence(
-        provenance_id,
-        STRATEGY_ID,
-        f"pr-change-set:{change_set.id}:conflict",
-        {
-            "association_id": change_set.association.id,
-            "merged_revision": change_set.merged_revision,
-            "pull_request_id": change_set.pull_request_id,
-            "repository": change_set.repository,
-        },
-    )
-
-
-def _mapping_provenance(change_set: MergedPrChangeSet, mapping: ChangedSymbolMapping) -> tuple[Evidence, ProvenanceRecord]:
-    """Return payload-safe provenance for one admissible source mapping."""
-
-    artifact_identity = SourceArtifactIdentity(
-        source_type="graphify",
-        source_identity=change_set.repository,
-        artifact_type="pull-request-mapping",
-        revision_or_version=change_set.merged_revision,
-        stable_locator=f"pr-change-set:{change_set.id}:mapping:{mapping.id}",
-    )
-    record = ProvenanceRecord(
-        ProvenanceKind.EXTERNAL, change_set.observed_at, "sha256",
-        hashlib.sha256(json.dumps({"mapping_id": mapping.id, "outcome": mapping.outcome.value, "file": mapping.file, "symbol": mapping.symbol}, sort_keys=True).encode()).hexdigest(),
-        STRATEGY_ID, "1", artifact_identity,
-    )
-    evidence_id = stable_id("evidence", artifact_identity.id)
-    return Evidence(
-        evidence_id,
-        STRATEGY_ID,
-        SourceArtifactLocator(
-            artifact_identity,
-            {
-                "association_id": change_set.association.id,
-                "pull_request_id": change_set.pull_request_id,
-                "source_mapping_id": mapping.id,
-            },
-        ),
-        {
-            "association_id": change_set.association.id,
-            "merged_revision": change_set.merged_revision,
-            "pull_request_id": change_set.pull_request_id,
-            "repository": change_set.repository,
-            "source_mapping_id": mapping.id,
-        }, (record.id,),
-    ), record
 
 
 def _initial_candidate_lifecycle_provenance(

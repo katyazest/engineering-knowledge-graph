@@ -20,8 +20,14 @@ from engineering_kg.ontology import (
     OpenSpecLocator,
     ProvenanceKind,
     ProvenanceRecord,
+    PullRequestImplementationEvidence,
+    PullRequestDeclaredAssociation,
+    PullRequestObservedRepositoryRelation,
+    pull_request_projection_edge,
     SourceArtifactLocator,
     _has_complete_provenance,
+    pull_request_source_artifact_error,
+    pull_request_relation_provenance_error,
     provenance_association_error,
     source_artifact_identity_error,
     openspec_requirement_id,
@@ -29,7 +35,7 @@ from engineering_kg.ontology import (
     openspec_specification_id,
     stable_id,
 )
-from engineering_kg.relationship_vocabulary import eligible_for_trusted_cross_graph_projection, relationship_error
+from engineering_kg.relationship_vocabulary import eligible_for_trusted_cross_graph_projection, relationship_error, pull_request_relationship_error
 
 
 SEVERITY_ORDER = {"error": 0, "warning": 1, "info": 2}
@@ -119,6 +125,9 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-claim", snapshot.cross_graph_link_claims))
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-evidence", snapshot.cross_graph_link_evidence))
     diagnostics.extend(_duplicate_conflict_diagnostics("cross-graph-link-lifecycle", snapshot.cross_graph_link_lifecycle))
+    diagnostics.extend(_duplicate_conflict_diagnostics("pull-request-evidence", snapshot.pull_request_evidence))
+    diagnostics.extend(_duplicate_conflict_diagnostics("pull-request-declared-association", snapshot.pull_request_declared_associations))
+    diagnostics.extend(_duplicate_conflict_diagnostics("pull-request-observed-repository-relation", snapshot.pull_request_observed_repository_relations))
 
     nodes_by_id = {node.id: node for node in snapshot.nodes}
     evidence_by_id = {item.id: item for item in snapshot.evidence}
@@ -132,6 +141,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_source_artifact_identity_diagnostics(snapshot))
     diagnostics.extend(_provenance_diagnostics(snapshot))
+    diagnostics.extend(_pull_request_diagnostics(snapshot, nodes_by_id, evidence_by_id))
 
     sorted_diagnostics = tuple(sorted(diagnostics, key=_diagnostic_sort_key))
     severity_counts = Counter(item.severity for item in sorted_diagnostics)
@@ -148,6 +158,9 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
             "cross_graph_link_claim_count": snapshot.cross_graph_link_claim_count,
             "cross_graph_link_evidence_count": snapshot.cross_graph_link_evidence_count,
             "cross_graph_link_lifecycle_count": snapshot.cross_graph_link_lifecycle_count,
+            "pull_request_evidence_count": snapshot.pull_request_evidence_count,
+            "pull_request_declared_association_count": snapshot.pull_request_declared_association_count,
+            "pull_request_observed_repository_relation_count": snapshot.pull_request_observed_repository_relation_count,
             "node_count": snapshot.node_count,
         },
     )
@@ -181,6 +194,175 @@ def _provenance_diagnostics(snapshot: GraphSnapshot) -> list[GraphValidationDiag
             for input_id in record.input_provenance_ids:
                 if input_id not in by_id:
                     diagnostics.append(GraphValidationDiagnostic("error", "derived-provenance-input-exists", record.id, f"Derived provenance references absent input provenance: {input_id}"))
+    return diagnostics
+
+
+def _pull_request_diagnostics(
+    snapshot: GraphSnapshot,
+    nodes_by_id: dict[str, Node],
+    evidence_by_id: dict[str, object],
+) -> list[GraphValidationDiagnostic]:
+    """Validate typed PR records and their graph/cross-graph boundaries."""
+
+    diagnostics: list[GraphValidationDiagnostic] = []
+    prs = {item.id: item for item in snapshot.pull_request_evidence}
+    associations = {item.id: item for item in snapshot.pull_request_declared_associations}
+    relations = {item.id: item for item in snapshot.pull_request_observed_repository_relations}
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
+    for item in snapshot.pull_request_evidence:
+        try:
+            expected = PullRequestImplementationEvidence(
+                item.pull_request_id, item.repository_id, item.base_revision,
+                item.head_revision, item.merged, item.source_evidence_id,
+                item.provenance_evidence_id,
+            )
+            if expected.id != item.id:
+                raise ValueError("stable identity does not match immutable fields")
+        except (AttributeError, ValueError) as exc:
+            diagnostics.append(_cross_error("pr-evidence-identity", item.id, f"Invalid PR evidence: {exc}"))
+            continue
+        repository = nodes_by_id.get(item.repository_id)
+        if repository is None or _value(repository.kind) != NodeKind.REPOSITORY.value:
+            diagnostics.append(_cross_error("pr-repository-exists", item.id, "PR evidence repository does not reference a canonical REPOSITORY node."))
+        evidence = evidence_by_id.get(item.source_evidence_id)
+        if evidence is None:
+            diagnostics.append(_cross_error("pr-source-evidence-exists", item.id, "PR evidence source_evidence_id is absent."))
+        elif not _has_complete_provenance(evidence, provenance_by_id):
+            diagnostics.append(_cross_error("pr-source-provenance-complete", item.id, "PR evidence source evidence lacks complete provenance."))
+        if item.provenance_evidence_id not in provenance_by_id:
+            diagnostics.append(_cross_error("pr-provenance-exists", item.id, "PR evidence provenance reference is absent."))
+        if error := pull_request_source_artifact_error(item, evidence_by_id, provenance_by_id):
+            diagnostics.append(_cross_error("pr-source-artifact-binding", item.id, error + "."))
+        node = nodes_by_id.get(item.node_id)
+        if node is None or _value(node.kind) != NodeKind.PULL_REQUEST.value:
+            diagnostics.append(_cross_error("pr-node-exists", item.id, "PR evidence has no canonical PULL_REQUEST node."))
+    for item in snapshot.pull_request_declared_associations:
+        pr = prs.get(item.pull_request_evidence_id)
+        subject = nodes_by_id.get(item.intended_change_id)
+        if pr is None:
+            diagnostics.append(_cross_error("pr-association-pr-exists", item.id, "Declared PR association references absent PR evidence."))
+        if subject is None or _value(subject.kind) not in {NodeKind.OPENSPEC_ACTIVE_CHANGE.value, NodeKind.OPENSPEC_ARCHIVED_CHANGE.value, NodeKind.JIRA_STORY.value}:
+            diagnostics.append(_cross_error("pr-association-endpoint-contract", item.id, "Declared PR association target is not an eligible intended-change node."))
+        evidence = evidence_by_id.get(item.source_evidence_id)
+        if evidence is None or not _has_complete_provenance(evidence, provenance_by_id):
+            diagnostics.append(_cross_error("pr-association-source-complete", item.id, "Declared association source evidence is absent or incomplete."))
+        if item.provenance_evidence_id not in provenance_by_id:
+            diagnostics.append(_cross_error("pr-association-provenance-exists", item.id, "Declared association provenance reference is absent."))
+        if error := pull_request_relation_provenance_error(
+            item.source_evidence_id, item.provenance_evidence_id,
+            evidence_by_id, provenance_by_id,
+        ):
+            diagnostics.append(_cross_error("pr-association-provenance-binding", item.id, error + "."))
+    for item in snapshot.pull_request_observed_repository_relations:
+        pr = prs.get(item.pull_request_evidence_id)
+        repository = nodes_by_id.get(item.repository_id)
+        if pr is None:
+            diagnostics.append(_cross_error("pr-relation-pr-exists", item.id, "Observed PR repository relation references absent PR evidence."))
+        elif item.repository_id != pr.repository_id:
+            diagnostics.append(_cross_error("pr-relation-repository-match", item.id, "Observed PR repository relation disagrees with PR evidence."))
+        if repository is None or _value(repository.kind) != NodeKind.REPOSITORY.value:
+            diagnostics.append(_cross_error("pr-relation-repository-exists", item.id, "Observed PR repository relation target is not a REPOSITORY node."))
+        evidence = evidence_by_id.get(item.source_evidence_id)
+        if evidence is None or not _has_complete_provenance(evidence, provenance_by_id):
+            diagnostics.append(_cross_error("pr-relation-source-complete", item.id, "Observed repository relation source evidence is absent or incomplete."))
+        if item.provenance_evidence_id not in provenance_by_id:
+            diagnostics.append(_cross_error("pr-relation-provenance-exists", item.id, "Observed repository relation provenance reference is absent."))
+        if error := pull_request_relation_provenance_error(
+            item.source_evidence_id, item.provenance_evidence_id,
+            evidence_by_id, provenance_by_id,
+        ):
+            diagnostics.append(_cross_error("pr-relation-provenance-binding", item.id, error + "."))
+
+    # Typed PR relations are the source of truth for their canonical edge
+    # projections.  Validate the inverse as well as the existing edge-to-record
+    # direction, including the source-evidence binding carried by the edge.
+    expected_projection_edges = {}
+    for association in snapshot.pull_request_declared_associations:
+        pr = prs.get(association.pull_request_evidence_id)
+        if pr is None:
+            continue
+        expected_projection_edges[association.id] = pull_request_projection_edge(pr, association)
+    for relation in snapshot.pull_request_observed_repository_relations:
+        pr = prs.get(relation.pull_request_evidence_id)
+        if pr is None:
+            continue
+        expected_projection_edges[relation.id] = pull_request_projection_edge(pr, relation)
+
+    edges_by_id = {edge.id: edge for edge in snapshot.edges}
+    for relation_id, expected in sorted(expected_projection_edges.items()):
+        actual = edges_by_id.get(expected.id)
+        if actual is None:
+            rule_id = (
+                "pr-declared-association-projection"
+                if expected.kind is EdgeKind.REFERENCES
+                else "pr-observed-repository-projection"
+            )
+            diagnostics.append(_cross_error(
+                rule_id, relation_id,
+                "Typed PR relation lacks its exact projected edge.",
+            ))
+        elif actual.as_dict() != expected.as_dict():
+            rule_id = (
+                "pr-declared-association-projection"
+                if expected.kind is EdgeKind.REFERENCES
+                else "pr-observed-repository-projection"
+            )
+            diagnostics.append(_cross_error(
+                rule_id, relation_id,
+                "Typed PR relation projection disagrees on endpoint, kind, or source evidence.",
+            ))
+
+    for observation in snapshot.cross_graph_link_evidence:
+        if observation.pull_request_evidence_id is None:
+            if observation.strategy_id == "pr-code-candidate-extraction":
+                diagnostics.append(_cross_error(
+                    "pr-observation-scope", observation.id,
+                    "PR candidate observation requires explicit PR evidence and association.",
+                ))
+            continue
+        pr = prs.get(observation.pull_request_evidence_id)
+        association = associations.get(observation.declared_association_id or "")
+        claim = next((item for item in snapshot.cross_graph_link_claims if item.id == observation.claim_id), None)
+        if pr is None or association is None:
+            diagnostics.append(_cross_error("pr-observation-scope", observation.id, "PR-scoped observation references absent PR evidence or declared association."))
+            continue
+        if association.pull_request_evidence_id != pr.id or claim is None or claim.subject_id != association.intended_change_id:
+            diagnostics.append(_cross_error("pr-observation-association-scope", observation.id, "PR-scoped observation disagrees with declared association scope."))
+        elif claim.target.repository != pr.repository_id or claim.target.revision != pr.head_revision:
+            diagnostics.append(_cross_error("pr-observation-revision-scope", observation.id, "PR-scoped observation locator disagrees with PR repository/head revision."))
+    for edge in snapshot.edges:
+        source = nodes_by_id.get(edge.source_id)
+        if source is None or _value(source.kind) != NodeKind.PULL_REQUEST.value:
+            continue
+        target = nodes_by_id.get(edge.target_id)
+        error = pull_request_relationship_error(edge.kind, source, target)
+        if error:
+            diagnostics.append(_cross_error(error, edge.id, "Pull-request edge does not satisfy the typed relationship catalog."))
+            continue
+        expected = next(
+            (candidate for candidate in expected_projection_edges.values() if candidate.id == edge.id),
+            None,
+        )
+        if expected is None:
+            rule_id = (
+                "pr-declared-association-record"
+                if _value(edge.kind) == EdgeKind.REFERENCES.value
+                else "pr-observed-repository-record"
+            )
+            diagnostics.append(_cross_error(
+                rule_id, edge.id,
+                "PR projection edge lacks a matching typed relation record.",
+            ))
+        elif edge.as_dict() != expected.as_dict():
+            rule_id = (
+                "pr-declared-association-projection"
+                if _value(edge.kind) == EdgeKind.REFERENCES.value
+                else "pr-observed-repository-projection"
+            )
+            diagnostics.append(_cross_error(
+                rule_id, edge.id,
+                "PR projection edge disagrees with its typed relation endpoint, kind, or source evidence.",
+            ))
     return diagnostics
 
 
@@ -289,6 +471,9 @@ def _duplicate_counts(snapshot: GraphSnapshot) -> dict[str, int]:
         "cross_graph_link_claim": _duplicate_id_count(snapshot.cross_graph_link_claims),
         "cross_graph_link_evidence": _duplicate_id_count(snapshot.cross_graph_link_evidence),
         "cross_graph_link_lifecycle": _duplicate_id_count(snapshot.cross_graph_link_lifecycle),
+        "pull_request_evidence": _duplicate_id_count(snapshot.pull_request_evidence),
+        "pull_request_declared_association": _duplicate_id_count(snapshot.pull_request_declared_associations),
+        "pull_request_observed_repository_relation": _duplicate_id_count(snapshot.pull_request_observed_repository_relations),
     }
 
 
@@ -428,7 +613,9 @@ def _classified_support_diagnostics(
         if isinstance(support, CrossGraphLinkEvidence):
             CrossGraphLinkEvidence(support.claim_id, support.strategy_id, support.observation_id,
                                    support.provenance_evidence_id, support.origin, support.status,
-                                   support.confidence, support.trust_disposition)
+                                   support.confidence, support.trust_disposition,
+                                   support.pull_request_evidence_id,
+                                   support.declared_association_id)
         else:
             CrossGraphLinkLifecycle(support.claim_id, support.revision, support.state,
                                     support.provenance_evidence_id, support.origin, support.status,

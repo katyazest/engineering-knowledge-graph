@@ -14,10 +14,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from engineering_kg.ingest.pr_code_candidates import (
-    MergedPrChangeSet,
-    EngineeringChangePrAssociation,
     MappingOutcome,
     extract_pr_code_candidates,
+    normalize_pull_request_evidence,
 )
 import engineering_kg.openlore_bridge as openlore_bridge_module
 from engineering_kg.ontology import GraphSnapshot, Node, NodeKind, CodeLocator
@@ -1034,25 +1033,49 @@ class OpenLoreSemanticBridgeTest(unittest.TestCase):
         self.assertEqual([item.id for item in mappings], ["graphify:m1", "graphify:m2", "graphify:m3", "graphify:m4"])
         self.assertEqual(mappings[-1].outcome, MappingOutcome.UNSUPPORTED)
         subject = Node("story-1", NodeKind.JIRA_STORY, "EKG-1")
-        change_set = MergedPrChangeSet(
-            EngineeringChangePrAssociation("link:1", subject.id, "pr:1"),
-            "pr:1", "payment-service", REVISION, mappings, observed_at="2026-09-01T12:00:00+00:00",
-        )
-        extracted = extract_pr_code_candidates((change_set,), GraphSnapshot(nodes=(subject,)))
+        repository = Node("payment-service", NodeKind.REPOSITORY, "payment-service")
+        raw_mappings = [{
+            "id": item.id,
+            "file": item.file,
+            "outcome": item.outcome.value,
+            "symbol": item.symbol,
+            "repository": repository.id,
+            "revision": REVISION,
+        } for item in mappings]
+        change_set = normalize_pull_request_evidence({
+            "pull_request_id": "pr:1", "repository_node_id": repository.id,
+            "base_revision": "a" * 40, "head_revision": REVISION, "merged": True,
+            "observed_at": "2026-09-01T12:00:00+00:00", "provenance": {"pr": "complete"},
+            "pr_source_reference": "urn:example.org/pr-1",
+            "repository_source_reference": "urn:example.org/repository-1",
+            "association": {"id": "link:1", "intended_change_id": subject.id,
+                             "intended_change_kind": "jira_story",
+                             "source_reference": "urn:example.org/link-1"},
+            "mappings": raw_mappings,
+        })
+        extracted = extract_pr_code_candidates((change_set,), GraphSnapshot(nodes=(subject, repository)))
         self.assertEqual(extracted.metadata.emitted_candidate_count, 1)
         self.assertEqual(extracted.graph.cross_graph_link_claims[0].target.symbol, "module.Alpha")
         self.assertEqual(extracted.graph.trusted_cross_graph_links, ())
-        self.assertEqual(extracted.graph.edges, ())
+        self.assertFalse(any(edge.kind == "implements" for edge in extracted.graph.edges))
 
         failed = self.stage_bridge(FakeProvider(error=ProviderUnavailableError())).resolve(
             _request(files=(ChangedFileReference("graphify:m1", "src/a.py"),))
         )
         failed_mappings = adapt_resolution_to_changed_symbol_mappings(failed)
-        failed_set = MergedPrChangeSet(
-            EngineeringChangePrAssociation("link:2", subject.id, "pr:2"),
-            "pr:2", "payment-service", REVISION, failed_mappings, observed_at="2026-09-01T12:00:00+00:00",
-        )
-        failed_extracted = extract_pr_code_candidates((failed_set,), GraphSnapshot(nodes=(subject,)))
+        failed_set = normalize_pull_request_evidence({
+            "pull_request_id": "pr:2", "repository_node_id": repository.id,
+            "base_revision": "a" * 40, "head_revision": REVISION, "merged": True,
+            "observed_at": "2026-09-01T12:00:00+00:00", "provenance": {"pr": "complete"},
+            "pr_source_reference": "urn:example.org/pr-2",
+            "repository_source_reference": "urn:example.org/repository-2",
+            "association": {"id": "link:2", "intended_change_id": subject.id,
+                             "intended_change_kind": "jira_story",
+                             "source_reference": "urn:example.org/link-2"},
+            "mappings": [{"id": item.id, "file": item.file, "outcome": item.outcome.value}
+                         for item in failed_mappings],
+        })
+        failed_extracted = extract_pr_code_candidates((failed_set,), GraphSnapshot(nodes=(subject, repository)))
         self.assertEqual(failed_extracted.metadata.emitted_candidate_count, 0)
 
     def test_bridge_is_ephemeral_and_serializers_are_allowlisted(self):

@@ -15,7 +15,8 @@ from engineering_kg.ingest.openspec import (
     validate_openspec_store_source,
 )
 from engineering_kg.ingest.pr_code_candidates import (
-    MergedPrChangeSet,
+    NormalizedPullRequestEvidence,
+    PrCodeCandidateValidationError,
     PrCodeCandidateExtractionResult,
     extract_pr_code_candidates,
 )
@@ -107,7 +108,7 @@ def run_pipeline(
     persistence_path: str | Path | None = None,
     openspec_stores: tuple[RegisteredOpenSpecStore, ...] | None = None,
     openspec_store_id: str | None = None,
-    pr_change_sets: tuple[MergedPrChangeSet, ...] | None = None,
+    pr_change_sets: tuple[NormalizedPullRequestEvidence, ...] | None = None,
     engineering_change_subject_graph: GraphSnapshot | None = None,
 ) -> PipelineResult:
     """Start the MVP pipeline, optionally persisting a graph snapshot."""
@@ -257,7 +258,7 @@ def _configured_stages(
 
 def _validate_candidate_stage_order(
     stages: tuple[str, ...],
-    change_sets: tuple[MergedPrChangeSet, ...] | None,
+    change_sets: tuple[NormalizedPullRequestEvidence, ...] | None,
 ) -> None:
     if "pr-code-candidate-extraction" not in stages:
         return
@@ -285,16 +286,16 @@ def _validate_candidate_stage_order(
 
 
 def _validate_candidate_subject_availability(
-    change_sets: tuple[MergedPrChangeSet, ...], graph: GraphSnapshot
+    change_sets: tuple[NormalizedPullRequestEvidence, ...], graph: GraphSnapshot
 ) -> None:
     """Require every explicit candidate subject to exist in the graph at this stage."""
 
     available_subject_ids = {node.id for node in graph.nodes}
     missing_subject_ids = sorted(
         {
-            change_set.association.engineering_change_subject_id
+            _change_subject_id(change_set)
             for change_set in change_sets
-            if change_set.association.engineering_change_subject_id not in available_subject_ids
+            if _change_subject_id(change_set) not in available_subject_ids
         }
     )
     if missing_subject_ids:
@@ -302,3 +303,11 @@ def _validate_candidate_subject_availability(
             "pr-code-candidate-extraction requires available prior graph subjects: "
             + ", ".join(missing_subject_ids)
         )
+
+
+def _change_subject_id(change_set: NormalizedPullRequestEvidence) -> str:
+    if not isinstance(change_set, NormalizedPullRequestEvidence):
+        raise PrCodeCandidateValidationError(
+            "legacy merged-revision-only PR change-set input is unsupported"
+        )
+    return change_set.association.intended_change_id

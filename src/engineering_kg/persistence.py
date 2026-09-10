@@ -29,6 +29,9 @@ from engineering_kg.ontology import (
     ProvenanceRecord,
     SourceArtifactIdentity,
     SourceArtifactLocator,
+    PullRequestImplementationEvidence,
+    PullRequestDeclaredAssociation,
+    PullRequestObservedRepositoryRelation,
     ProvenanceKind,
     evidence_requires_source_artifact_identity,
     source_artifact_identity_error,
@@ -239,6 +242,9 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
             snapshot.nodes, snapshot.edges, snapshot.evidence,
             snapshot.cross_graph_link_claims, snapshot.cross_graph_link_evidence,
             snapshot.cross_graph_link_lifecycle, snapshot.provenance,
+            snapshot.pull_request_evidence,
+            snapshot.pull_request_declared_associations,
+            snapshot.pull_request_observed_repository_relations,
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -261,6 +267,16 @@ def _require_current_catalog_revision(data: dict[str, Any]) -> None:
     """Reject historical formats rather than converting them on readback."""
     revision = data.get("catalog_revision")
     if revision == CATALOG_REVISION:
+        legacy_candidates = any(
+            isinstance(record, dict)
+            and record.get("strategy_id") == "pr-code-candidate-extraction"
+            for record in (data.get("cross_graph_link_evidence") or {}).values()
+            if isinstance(data.get("cross_graph_link_evidence") or {}, dict)
+        )
+        if legacy_candidates and "pull_request_evidence" not in data:
+            raise PersistenceIntegrityError(
+                "legacy-pr-candidate-unsupported: missing base/head revisions and explicit association"
+            )
         return
     if revision is None:
         raise PersistenceIntegrityError("missing-catalog-revision")
@@ -352,13 +368,18 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, in
         cross_graph_link_claims=snapshot.cross_graph_link_claims,
         cross_graph_link_evidence=tuple(CrossGraphLinkEvidence(
             item.claim_id, item.strategy_id, item.observation_id,
-            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
+            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id),
+            item.origin, item.status, item.confidence, item.trust_disposition,
+            item.pull_request_evidence_id, item.declared_association_id,
         ) for item in snapshot.cross_graph_link_evidence),
         cross_graph_link_lifecycle=tuple(CrossGraphLinkLifecycle(
             item.claim_id, item.revision, item.state,
             evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
         ) for item in snapshot.cross_graph_link_lifecycle),
         provenance=tuple(sorted({item.id: item for item in provenance}.values(), key=lambda item: item.id)),
+        pull_request_evidence=snapshot.pull_request_evidence,
+        pull_request_declared_associations=snapshot.pull_request_declared_associations,
+        pull_request_observed_repository_relations=snapshot.pull_request_observed_repository_relations,
     ), migrated
 
 
@@ -480,6 +501,12 @@ def _empty_graph_data() -> dict[str, dict[str, Any]]:
         "cross_graph_link_evidence_order": [],
         "cross_graph_link_lifecycle": {},
         "cross_graph_link_lifecycle_order": [],
+        "pull_request_evidence": {},
+        "pull_request_evidence_order": [],
+        "pull_request_declared_associations": {},
+        "pull_request_declared_association_order": [],
+        "pull_request_observed_repository_relations": {},
+        "pull_request_observed_repository_relation_order": [],
         "node_order": [],
         "nodes": {},
     }
@@ -510,6 +537,12 @@ def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
         "cross_graph_link_evidence_order": [],
         "cross_graph_link_lifecycle": {},
         "cross_graph_link_lifecycle_order": [],
+        "pull_request_evidence": {},
+        "pull_request_evidence_order": [],
+        "pull_request_declared_associations": {},
+        "pull_request_declared_association_order": [],
+        "pull_request_observed_repository_relations": {},
+        "pull_request_observed_repository_relation_order": [],
         "node_order": [],
         "nodes": {},
     }
@@ -535,6 +568,15 @@ def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
     for lifecycle in snapshot.cross_graph_link_lifecycle:
         merged["cross_graph_link_lifecycle"][lifecycle.id] = lifecycle.as_dict()
         merged["cross_graph_link_lifecycle_order"].append(lifecycle.id)
+    for item in snapshot.pull_request_evidence:
+        merged["pull_request_evidence"][item.id] = item.as_dict()
+        merged["pull_request_evidence_order"].append(item.id)
+    for item in snapshot.pull_request_declared_associations:
+        merged["pull_request_declared_associations"][item.id] = item.as_dict()
+        merged["pull_request_declared_association_order"].append(item.id)
+    for item in snapshot.pull_request_observed_repository_relations:
+        merged["pull_request_observed_repository_relations"][item.id] = item.as_dict()
+        merged["pull_request_observed_repository_relation_order"].append(item.id)
 
     return merged
 
@@ -589,8 +631,30 @@ def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = Fals
             _expect_string_tuple(data.get("cross_graph_link_lifecycle_order", []), "cross_graph_link_lifecycle_order"),
         )
     )
+    pull_request_evidence = tuple(
+        _pull_request_evidence_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("pull_request_evidence", {}), "pull_request_evidence"),
+            _expect_string_tuple(data.get("pull_request_evidence_order", []), "pull_request_evidence_order"),
+        )
+    )
+    associations = tuple(
+        _pull_request_association_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("pull_request_declared_associations", {}), "pull_request_declared_associations"),
+            _expect_string_tuple(data.get("pull_request_declared_association_order", []), "pull_request_declared_association_order"),
+        )
+    )
+    repository_relations = tuple(
+        _pull_request_repository_relation_from_dict(item)
+        for item in _ordered_records(
+            _expect_mapping(data.get("pull_request_observed_repository_relations", {}), "pull_request_observed_repository_relations"),
+            _expect_string_tuple(data.get("pull_request_observed_repository_relation_order", []), "pull_request_observed_repository_relation_order"),
+        )
+    )
     snapshot = GraphSnapshot(
         nodes, edges, evidence, claims, observations, lifecycle, provenance,
+        pull_request_evidence, associations, repository_relations,
         allow_legacy_evidence=allow_legacy_evidence,
     )
     if not allow_legacy_evidence:
@@ -693,6 +757,13 @@ def _cross_graph_link_claim_from_dict(data: dict[str, Any]) -> CrossGraphLinkCla
 
 
 def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLinkEvidence:
+    if data.get("strategy_id") == "pr-code-candidate-extraction" and (
+        data.get("pull_request_evidence_id") is None
+        or data.get("declared_association_id") is None
+    ):
+        raise PersistenceIntegrityError(
+            "legacy-pr-candidate-readback-unsupported: PR candidate lacks explicit PR evidence and association"
+        )
     try:
         record = CrossGraphLinkEvidence(
             _expect_string(data.get("claim_id"), "cross_graph_link_evidence.claim_id"),
@@ -703,6 +774,8 @@ def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLink
             _expect_string(data.get("status"), "cross_graph_link_evidence.status"),
             _expect_string(data.get("confidence"), "cross_graph_link_evidence.confidence"),
             _expect_string(data.get("trust_disposition"), "cross_graph_link_evidence.trust_disposition"),
+            _expect_optional_string(data.get("pull_request_evidence_id"), "cross_graph_link_evidence.pull_request_evidence_id"),
+            _expect_optional_string(data.get("declared_association_id"), "cross_graph_link_evidence.declared_association_id"),
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -727,6 +800,57 @@ def _cross_graph_link_lifecycle_from_dict(data: dict[str, Any]) -> CrossGraphLin
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
     _expect_record_id(data, record.id, "cross_graph_link_lifecycle")
+    return record
+
+
+def _pull_request_evidence_from_dict(data: dict[str, Any]) -> PullRequestImplementationEvidence:
+    try:
+        record = PullRequestImplementationEvidence(
+            _expect_string(data.get("pull_request_id"), "pull_request_evidence.pull_request_id"),
+            _expect_string(data.get("repository_id"), "pull_request_evidence.repository_id"),
+            _expect_string(data.get("base_revision"), "pull_request_evidence.base_revision"),
+            _expect_string(data.get("head_revision"), "pull_request_evidence.head_revision"),
+            data.get("merged"),
+            _expect_string(data.get("source_evidence_id"), "pull_request_evidence.source_evidence_id"),
+            _expect_string(data.get("provenance_evidence_id"), "pull_request_evidence.provenance_evidence_id"),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "pull_request_evidence")
+    if data.get("node_id") != record.node_id:
+        raise PersistenceIntegrityError("pull_request_evidence.node_id does not match its stable identity")
+    return record
+
+
+def _pull_request_association_from_dict(data: dict[str, Any]) -> PullRequestDeclaredAssociation:
+    try:
+        record = PullRequestDeclaredAssociation(
+            _expect_string(data.get("pull_request_evidence_id"), "pull_request_declared_association.pull_request_evidence_id"),
+            _expect_string(data.get("intended_change_id"), "pull_request_declared_association.intended_change_id"),
+            _expect_string(data.get("source_evidence_id"), "pull_request_declared_association.source_evidence_id"),
+            _expect_string(data.get("provenance_evidence_id"), "pull_request_declared_association.provenance_evidence_id"),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "pull_request_declared_association")
+    if data.get("origin") != "declared":
+        raise PersistenceIntegrityError("pull_request_declared_association.origin must be declared")
+    return record
+
+
+def _pull_request_repository_relation_from_dict(data: dict[str, Any]) -> PullRequestObservedRepositoryRelation:
+    try:
+        record = PullRequestObservedRepositoryRelation(
+            _expect_string(data.get("pull_request_evidence_id"), "pull_request_observed_repository_relation.pull_request_evidence_id"),
+            _expect_string(data.get("repository_id"), "pull_request_observed_repository_relation.repository_id"),
+            _expect_string(data.get("source_evidence_id"), "pull_request_observed_repository_relation.source_evidence_id"),
+            _expect_string(data.get("provenance_evidence_id"), "pull_request_observed_repository_relation.provenance_evidence_id"),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _expect_record_id(data, record.id, "pull_request_observed_repository_relation")
+    if data.get("origin") != "observed":
+        raise PersistenceIntegrityError("pull_request_observed_repository_relation.origin must be observed")
     return record
 
 

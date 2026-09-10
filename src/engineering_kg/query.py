@@ -210,6 +210,67 @@ class EngineeringKgQuery:
         ]
         return [self._change_result(node).as_dict() for node in _sort_nodes(changes)]
 
+    def list_pull_request_implementation_evidence(
+        self,
+        pull_request_id: str | None = None,
+        *,
+        intended_change_id: str | None = None,
+        require_validation: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return represented PR evidence without inferring implementation."""
+
+        if require_validation:
+            validation = self.validation or validate_graph_integrity(self.snapshot)
+            _raise_if_invalid(validation)
+        associations = {
+            item.id: item for item in self.snapshot.pull_request_declared_associations
+        }
+        relations = self.snapshot.pull_request_observed_repository_relations
+        results: list[dict[str, Any]] = []
+        for evidence in self.snapshot.pull_request_evidence:
+            if pull_request_id is not None and evidence.pull_request_id not in {pull_request_id, evidence.id, evidence.node_id}:
+                continue
+            linked_associations = [
+                item for item in associations.values()
+                if item.pull_request_evidence_id == evidence.id
+                and (intended_change_id is None or item.intended_change_id == intended_change_id)
+            ]
+            results.append({
+                "base_revision": evidence.base_revision,
+                "declared_associations": [
+                    {
+                        "id": item.id,
+                        "intended_change_id": item.intended_change_id,
+                        "origin": item.origin,
+                        "provenance_evidence_id": item.provenance_evidence_id,
+                        "source_evidence_id": item.source_evidence_id,
+                    }
+                    for item in sorted(linked_associations, key=lambda value: value.id)
+                ],
+                "head_revision": evidence.head_revision,
+                "observed_repository_relations": [
+                    {
+                        "id": item.id,
+                        "origin": item.origin,
+                        "provenance_evidence_id": item.provenance_evidence_id,
+                        "repository_id": item.repository_id,
+                        "source_evidence_id": item.source_evidence_id,
+                    }
+                    for item in sorted(relations, key=lambda value: value.id)
+                    if item.pull_request_evidence_id == evidence.id
+                ],
+                "provenance_evidence_id": evidence.provenance_evidence_id,
+                "pull_request_evidence_id": evidence.id,
+                "pull_request_id": evidence.pull_request_id,
+                "repository_id": evidence.repository_id,
+                "source_evidence_id": evidence.source_evidence_id,
+                "observed_candidates": self._pr_candidates_for(evidence.id, linked_associations),
+            })
+        return results
+
+    get_pull_request_implementation_evidence = list_pull_request_implementation_evidence
+    list_pr_implementation_evidence = list_pull_request_implementation_evidence
+
     def get_traceability(
         self,
         object_id: str,
@@ -294,6 +355,11 @@ class EngineeringKgQuery:
         properties["missing_traceability_spec_ids"] = [
             item for item in touched if item not in set(traced)
         ]
+        properties["represented_pull_request_ids"] = sorted({
+            item.pull_request_evidence_id
+            for item in self.snapshot.pull_request_declared_associations
+            if item.intended_change_id == node.id
+        })
         return QueryNodeResult(
             id=node.id,
             kind=str(_value(node.kind)),
@@ -303,6 +369,28 @@ class EngineeringKgQuery:
             locators=self._locators_for(node.evidence_ids),
             provenance=self._provenance_for(node.evidence_ids),
         )
+
+    def _pr_candidates_for(self, pull_request_evidence_id: str, associations: list[Any]) -> list[dict[str, Any]]:
+        association_ids = {item.id for item in associations}
+        results: list[dict[str, Any]] = []
+        for claim in self.snapshot.cross_graph_link_claims:
+            for observation in self.snapshot.cross_graph_link_evidence:
+                if (
+                    observation.claim_id == claim.id
+                    and observation.pull_request_evidence_id == pull_request_evidence_id
+                    and observation.declared_association_id in association_ids
+                ):
+                    results.append({
+                        "claim_id": claim.id,
+                        "declared_association_id": observation.declared_association_id,
+                        "observation_id": observation.id,
+                        "origin": observation.origin.value,
+                        "provenance_evidence_id": observation.provenance_evidence_id,
+                        "relation_kind": claim.relation_kind,
+                        "target": claim.target.as_dict(),
+                        "trust_disposition": observation.trust_disposition.value,
+                    })
+        return sorted(results, key=lambda item: (item["claim_id"], item["observation_id"]))
 
     def _edge_result(self, edge: Edge) -> dict[str, Any]:
         data: dict[str, Any] = {

@@ -204,6 +204,8 @@ _NAVIGATION_DETAIL_SCHEMA = {
 }
 _SOURCE_ARTIFACT_EVIDENCE_METADATA_SCHEMA = {
     "association_id": str,
+    "base_revision": str,
+    "head_revision": str,
     "merged_revision": str,
     "pull_request_id": str,
     "related": tuple,
@@ -299,6 +301,16 @@ class SourceArtifactIdentity:
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROVENANCE_ID_RE = re.compile(r"^provenance:[0-9a-f]{16}$")
+_PULL_REQUEST_EVIDENCE_ID_RE = re.compile(r"^pull-request-evidence:[0-9a-f]{16}$")
+_PULL_REQUEST_ASSOCIATION_ID_RE = re.compile(
+    r"^pull-request-declared-association:[0-9a-f]{16}$"
+)
+_PULL_REQUEST_REPOSITORY_RELATION_ID_RE = re.compile(
+    r"^pull-request-observed-repository-relation:[0-9a-f]{16}$"
+)
+_SOURCE_QUALIFIED_PULL_REQUEST_ID_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9+.-]*:[A-Za-z0-9][A-Za-z0-9._/-]*$"
+)
 
 
 @dataclass(frozen=True)
@@ -548,16 +560,19 @@ def cross_graph_link_evidence_id(
     claim_id: str, strategy_id: str, observation_id: str, provenance_evidence_id: str,
     origin: CrossGraphEvidenceOrigin | str, status: CrossGraphEvidenceStatus | str,
     confidence: str, trust_disposition: CrossGraphTrustDisposition | str,
+    pull_request_evidence_id: str | None = None,
+    declared_association_id: str | None = None,
 ) -> str:
     """Return the stable identity of one attributable link observation."""
 
+    scope = (pull_request_evidence_id, declared_association_id) if pull_request_evidence_id is not None else ()
     return stable_id(
         "cross-graph-link-evidence",
         _required_text(claim_id, "claim_id"),
         _payload_safe_opaque_identifier(strategy_id, "strategy_id"),
         _payload_safe_opaque_identifier(observation_id, "observation_id"),
         _required_text(provenance_evidence_id, "provenance_evidence_id"),
-        *_classified_support_values(origin, status, confidence, trust_disposition),
+        *_classified_support_values(origin, status, confidence, trust_disposition), *scope,
     )
 
 
@@ -609,6 +624,8 @@ class CrossGraphLinkEvidence:
     status: CrossGraphEvidenceStatus | str
     confidence: str
     trust_disposition: CrossGraphTrustDisposition | str
+    pull_request_evidence_id: str | None = None
+    declared_association_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.claim_id, "claim_id")
@@ -621,9 +638,34 @@ class CrossGraphLinkEvidence:
             _payload_safe_opaque_identifier(self.observation_id, "observation_id"),
         )
         _required_text(self.provenance_evidence_id, "provenance_evidence_id")
+        for field_name in ("pull_request_evidence_id", "declared_association_id"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self, field_name,
+                    _payload_safe_opaque_identifier(value, field_name),
+                )
+        if (self.pull_request_evidence_id is None) != (self.declared_association_id is None):
+            raise ValueError(
+                "PR-scoped cross-graph evidence requires pull_request_evidence_id "
+                "and declared_association_id together"
+            )
+        if self.strategy_id == "pr-code-candidate-extraction" and (
+            self.pull_request_evidence_id is None or self.declared_association_id is None
+        ):
+            raise ValueError(
+                "pr-code-candidate-extraction observations require explicit PR evidence and association"
+            )
         origin, status, confidence, disposition = _classified_support_values(
             self.origin, self.status, self.confidence, self.trust_disposition
         )
+        if self.pull_request_evidence_id is not None and (
+            origin is not CrossGraphEvidenceOrigin.OBSERVED
+            or disposition is not CrossGraphTrustDisposition.UNTRUSTED
+        ):
+            raise ValueError(
+                "PR-scoped cross-graph evidence must be observed and untrusted"
+            )
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "confidence", confidence)
@@ -634,11 +676,22 @@ class CrossGraphLinkEvidence:
         # Construction validates this immutable shape. Retain a usable identity
         # if a malformed fixture bypasses construction so validation can report
         # a diagnostic instead of failing before its validation boundary.
-        return stable_id(
-            "cross-graph-link-evidence", self.claim_id, self.strategy_id,
-            self.observation_id, self.provenance_evidence_id, self.origin,
-            self.status, self.confidence, self.trust_disposition,
-        )
+        try:
+            return cross_graph_link_evidence_id(
+                self.claim_id, self.strategy_id, self.observation_id,
+                self.provenance_evidence_id, self.origin, self.status,
+                self.confidence, self.trust_disposition,
+                self.pull_request_evidence_id, self.declared_association_id,
+            )
+        except ValueError:
+            return stable_id(
+                "cross-graph-link-evidence", self.claim_id, self.strategy_id,
+                self.observation_id, self.provenance_evidence_id, self.origin,
+                self.status, self.confidence, self.trust_disposition,
+                *(() if self.pull_request_evidence_id is None else (
+                    self.pull_request_evidence_id, self.declared_association_id,
+                )),
+            )
 
     def as_dict(self) -> dict[str, str]:
         # Prevent records that bypass frozen construction from crossing any
@@ -647,8 +700,14 @@ class CrossGraphLinkEvidence:
             self.claim_id, self.strategy_id, self.observation_id,
             self.provenance_evidence_id, self.origin, self.status,
             self.confidence, self.trust_disposition,
+            self.pull_request_evidence_id, self.declared_association_id,
         )
-        return {"claim_id": validated.claim_id, "confidence": validated.confidence, "id": validated.id, "observation_id": validated.observation_id, "origin": validated.origin.value, "provenance_evidence_id": validated.provenance_evidence_id, "status": validated.status.value, "strategy_id": validated.strategy_id, "trust_disposition": validated.trust_disposition.value}
+        result = {"claim_id": validated.claim_id, "confidence": validated.confidence, "id": validated.id, "observation_id": validated.observation_id, "origin": validated.origin.value, "provenance_evidence_id": validated.provenance_evidence_id, "status": validated.status.value, "strategy_id": validated.strategy_id, "trust_disposition": validated.trust_disposition.value}
+        if validated.pull_request_evidence_id is not None:
+            result["pull_request_evidence_id"] = validated.pull_request_evidence_id
+        if validated.declared_association_id is not None:
+            result["declared_association_id"] = validated.declared_association_id
+        return result
 
 
 @dataclass(frozen=True)
@@ -793,6 +852,232 @@ class Evidence:
         }
 
 
+def pull_request_node_id(pull_request_evidence_id: str) -> str:
+    """Return the canonical node identity projected for PR evidence."""
+
+    return stable_id("node", NodeKind.PULL_REQUEST, _required_text(
+        pull_request_evidence_id, "pull_request_evidence_id"
+    ))
+
+
+@dataclass(frozen=True)
+class PullRequestImplementationEvidence:
+    """Immutable, payload-free evidence for one merged pull request."""
+
+    pull_request_id: str
+    repository_id: str
+    base_revision: str
+    head_revision: str
+    merged: bool
+    source_evidence_id: str
+    provenance_evidence_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("pull_request_id", "repository_id", "source_evidence_id", "provenance_evidence_id"):
+            object.__setattr__(self, name, _payload_safe_opaque_identifier(getattr(self, name), name))
+        if not _SOURCE_QUALIFIED_PULL_REQUEST_ID_RE.fullmatch(self.pull_request_id):
+            raise ValueError("pull_request_id must be source-qualified")
+        for name in ("base_revision", "head_revision"):
+            revision = getattr(self, name)
+            if not isinstance(revision, str) or not re.fullmatch(r"[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64}", revision):
+                raise ValueError(f"{name} must be a complete immutable Git revision")
+        if not isinstance(self.merged, bool) or not self.merged:
+            raise ValueError("pull-request evidence must be merged")
+
+    @property
+    def id(self) -> str:
+        return stable_id("pull-request-evidence", self.pull_request_id, self.repository_id)
+
+    @property
+    def node_id(self) -> str:
+        return pull_request_node_id(self.id)
+
+    @property
+    def repository_node_id(self) -> str:
+        return self.repository_id
+
+    @property
+    def source_artifact_evidence_id(self) -> str:
+        return self.source_evidence_id
+
+    @property
+    def provenance_id(self) -> str:
+        return self.provenance_evidence_id
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "base_revision": self.base_revision,
+            "head_revision": self.head_revision,
+            "id": self.id,
+            "merged": self.merged,
+            "node_id": self.node_id,
+            "provenance_evidence_id": self.provenance_evidence_id,
+            "pull_request_id": self.pull_request_id,
+            "repository_id": self.repository_id,
+            "source_evidence_id": self.source_evidence_id,
+        }
+
+
+@dataclass(frozen=True)
+class PullRequestDeclaredAssociation:
+    """A source-backed, declared PR-to-intended-change association."""
+
+    pull_request_evidence_id: str
+    intended_change_id: str
+    source_evidence_id: str
+    provenance_evidence_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "pull_request_evidence_id", "intended_change_id",
+            "source_evidence_id", "provenance_evidence_id",
+        ):
+            object.__setattr__(self, name, _payload_safe_opaque_identifier(getattr(self, name), name))
+
+    @property
+    def id(self) -> str:
+        return stable_id(
+            "pull-request-declared-association", self.pull_request_evidence_id,
+            self.intended_change_id, self.source_evidence_id,
+        )
+
+    @property
+    def origin(self) -> str:
+        return "declared"
+
+    @property
+    def pr_evidence_id(self) -> str:
+        return self.pull_request_evidence_id
+
+    @property
+    def intended_change_node_id(self) -> str:
+        return self.intended_change_id
+
+    @property
+    def provenance_id(self) -> str:
+        return self.provenance_evidence_id
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "intended_change_id": self.intended_change_id,
+            "origin": self.origin,
+            "provenance_evidence_id": self.provenance_evidence_id,
+            "pull_request_evidence_id": self.pull_request_evidence_id,
+            "source_evidence_id": self.source_evidence_id,
+        }
+
+
+@dataclass(frozen=True)
+class PullRequestObservedRepositoryRelation:
+    """Observed PR-to-repository revision evidence."""
+
+    pull_request_evidence_id: str
+    repository_id: str
+    source_evidence_id: str
+    provenance_evidence_id: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "pull_request_evidence_id", "repository_id",
+            "source_evidence_id", "provenance_evidence_id",
+        ):
+            object.__setattr__(self, name, _payload_safe_opaque_identifier(getattr(self, name), name))
+
+    @property
+    def id(self) -> str:
+        return stable_id(
+            "pull-request-observed-repository-relation",
+            self.pull_request_evidence_id, self.repository_id, self.source_evidence_id,
+        )
+
+    @property
+    def origin(self) -> str:
+        return "observed"
+
+    @property
+    def pr_evidence_id(self) -> str:
+        return self.pull_request_evidence_id
+
+    @property
+    def provenance_id(self) -> str:
+        return self.provenance_evidence_id
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "origin": self.origin,
+            "provenance_evidence_id": self.provenance_evidence_id,
+            "pull_request_evidence_id": self.pull_request_evidence_id,
+            "repository_id": self.repository_id,
+            "source_evidence_id": self.source_evidence_id,
+        }
+
+
+def pull_request_source_artifact_error(
+    pull_request: PullRequestImplementationEvidence,
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> str | None:
+    """Validate that PR source evidence is revision-bounded by its head."""
+
+    evidence = evidence_by_id.get(pull_request.source_evidence_id)
+    if evidence is None:
+        return "PR source evidence is absent"
+    if not isinstance(evidence.locator, SourceArtifactLocator):
+        return "PR source evidence must use a SourceArtifactLocator"
+    identity = evidence.locator.source_artifact_identity
+    if identity.artifact_type != "pull-request":
+        return "PR source artifact must have artifact_type pull-request"
+    if identity.revision_or_version != pull_request.head_revision:
+        return "PR source artifact revision_or_version must match head_revision"
+    if pull_request.provenance_evidence_id not in evidence.provenance_ids:
+        return "PR source evidence must reference its PR provenance"
+    provenance = provenance_by_id.get(pull_request.provenance_evidence_id)
+    if provenance is None:
+        return "PR provenance reference is absent"
+    if provenance.source_artifact_identity != identity:
+        return "PR provenance source-artifact identity must match PR source evidence"
+    return None
+
+
+def pull_request_relation_provenance_error(
+    source_evidence_id: str,
+    provenance_evidence_id: str,
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> str | None:
+    """Validate that a typed PR relation's provenance belongs to its source."""
+
+    source_evidence = evidence_by_id.get(source_evidence_id)
+    if source_evidence is None:
+        return "relation source evidence is absent"
+    if provenance_evidence_id not in source_evidence.provenance_ids:
+        return "relation provenance is not referenced by its source evidence"
+    provenance = provenance_by_id.get(provenance_evidence_id)
+    if provenance is None:
+        return "relation provenance is absent"
+    locator = source_evidence.locator
+    source_identity = (
+        locator.source_artifact_identity
+        if isinstance(locator, (SourceArtifactLocator, OpenSpecLocator))
+        else None
+    )
+    if source_identity is None:
+        return "relation source evidence must use an explicit source-artifact identity"
+    if error := source_artifact_identity_error(source_evidence):
+        return f"relation source-artifact identity is invalid: {error}"
+    if provenance.kind is not ProvenanceKind.EXTERNAL:
+        return "relation source-artifact evidence cannot use derived provenance"
+    if provenance.source_artifact_identity != source_identity:
+        return "relation provenance source-artifact identity does not match source evidence"
+    return None
+
+
+PullRequestImplementationEvidenceAssociation = PullRequestDeclaredAssociation
+PullRequestRepositoryRelation = PullRequestObservedRepositoryRelation
+
+
 # These records describe local pipeline output or test fixtures rather than an
 # authoritative external artifact. Every other evidence source is treated as
 # authoritative and must carry the shared identity at graph boundaries.
@@ -905,6 +1190,29 @@ class Edge:
         return data
 
 
+def pull_request_projection_edge(
+    pull_request: PullRequestImplementationEvidence,
+    relation: PullRequestDeclaredAssociation | PullRequestObservedRepositoryRelation,
+) -> Edge:
+    """Build the sole canonical edge projection for a typed PR relation."""
+
+    if isinstance(relation, PullRequestDeclaredAssociation):
+        kind = EdgeKind.REFERENCES
+        target_id = relation.intended_change_id
+    elif isinstance(relation, PullRequestObservedRepositoryRelation):
+        kind = EdgeKind.TOUCHES
+        target_id = relation.repository_id
+    else:
+        raise ValueError("unsupported pull-request relation record")
+    return Edge(
+        stable_id("edge", kind, pull_request.node_id, target_id, relation.id),
+        kind,
+        pull_request.node_id,
+        target_id,
+        evidence_ids=(relation.source_evidence_id,),
+    )
+
+
 @dataclass(frozen=True)
 class GraphSnapshot:
     nodes: tuple[Node, ...] = ()
@@ -914,6 +1222,9 @@ class GraphSnapshot:
     cross_graph_link_evidence: tuple[CrossGraphLinkEvidence, ...] = ()
     cross_graph_link_lifecycle: tuple[CrossGraphLinkLifecycle, ...] = ()
     provenance: tuple[ProvenanceRecord, ...] = ()
+    pull_request_evidence: tuple[PullRequestImplementationEvidence, ...] = ()
+    pull_request_declared_associations: tuple[PullRequestDeclaredAssociation, ...] = ()
+    pull_request_observed_repository_relations: tuple[PullRequestObservedRepositoryRelation, ...] = ()
     # Legacy persistence decoding explicitly opts in before guarded migration.
     allow_legacy_evidence: bool = field(default=False, repr=False, compare=False)
 
@@ -923,6 +1234,7 @@ class GraphSnapshot:
                 item.claim_id, item.strategy_id, item.observation_id,
                 item.provenance_evidence_id, item.origin, item.status,
                 item.confidence, item.trust_disposition,
+                item.pull_request_evidence_id, item.declared_association_id,
             )
         for item in self.cross_graph_link_lifecycle:
             CrossGraphLinkLifecycle(
@@ -930,6 +1242,15 @@ class GraphSnapshot:
                 item.provenance_evidence_id, item.origin, item.status,
                 item.confidence, item.trust_disposition,
             )
+        for item in self.pull_request_evidence:
+            if not isinstance(item, PullRequestImplementationEvidence):
+                raise ValueError("pull_request_evidence must contain PullRequestImplementationEvidence records")
+        for item in self.pull_request_declared_associations:
+            if not isinstance(item, PullRequestDeclaredAssociation):
+                raise ValueError("pull_request_declared_associations must contain association records")
+        for item in self.pull_request_observed_repository_relations:
+            if not isinstance(item, PullRequestObservedRepositoryRelation):
+                raise ValueError("pull_request_observed_repository_relations must contain repository relation records")
         if not self.allow_legacy_evidence:
             for item in self.evidence:
                 if error := source_artifact_identity_error(item):
@@ -964,6 +1285,9 @@ class GraphSnapshot:
         object.__setattr__(self, "provenance", tuple(sorted(self.provenance, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_evidence", tuple(sorted(self.cross_graph_link_evidence, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_lifecycle", tuple(sorted(self.cross_graph_link_lifecycle, key=lambda item: (item.claim_id, item.revision))))
+        object.__setattr__(self, "pull_request_evidence", tuple(sorted(self.pull_request_evidence, key=lambda item: item.id)))
+        object.__setattr__(self, "pull_request_declared_associations", tuple(sorted(self.pull_request_declared_associations, key=lambda item: item.id)))
+        object.__setattr__(self, "pull_request_observed_repository_relations", tuple(sorted(self.pull_request_observed_repository_relations, key=lambda item: item.id)))
 
     @property
     def node_count(self) -> int:
@@ -992,6 +1316,30 @@ class GraphSnapshot:
     @property
     def cross_graph_link_lifecycle_count(self) -> int:
         return len(self.cross_graph_link_lifecycle)
+
+    @property
+    def pull_request_evidence_count(self) -> int:
+        return len(self.pull_request_evidence)
+
+    @property
+    def pull_request_declared_association_count(self) -> int:
+        return len(self.pull_request_declared_associations)
+
+    @property
+    def pull_request_observed_repository_relation_count(self) -> int:
+        return len(self.pull_request_observed_repository_relations)
+
+    @property
+    def pull_request_implementation_evidence(self) -> tuple[PullRequestImplementationEvidence, ...]:
+        return self.pull_request_evidence
+
+    @property
+    def pull_request_declared_association(self) -> tuple[PullRequestDeclaredAssociation, ...]:
+        return self.pull_request_declared_associations
+
+    @property
+    def pull_request_observed_repository_relation(self) -> tuple[PullRequestObservedRepositoryRelation, ...]:
+        return self.pull_request_observed_repository_relations
 
     @property
     def trusted_cross_graph_links(self) -> tuple[TrustedCrossGraphLink, ...]:
@@ -1051,6 +1399,12 @@ class GraphSnapshot:
             "cross_graph_link_evidence": [_serialize_value(item) for item in self.cross_graph_link_evidence],
             "cross_graph_link_lifecycle_count": self.cross_graph_link_lifecycle_count,
             "cross_graph_link_lifecycle": [_serialize_value(item) for item in self.cross_graph_link_lifecycle],
+            "pull_request_evidence_count": self.pull_request_evidence_count,
+            "pull_request_evidence": [_serialize_value(item) for item in self.pull_request_evidence],
+            "pull_request_declared_association_count": self.pull_request_declared_association_count,
+            "pull_request_declared_associations": [_serialize_value(item) for item in self.pull_request_declared_associations],
+            "pull_request_observed_repository_relation_count": self.pull_request_observed_repository_relation_count,
+            "pull_request_observed_repository_relations": [_serialize_value(item) for item in self.pull_request_observed_repository_relations],
             "node_count": self.node_count,
             "nodes": [_serialize_value(node) for node in self.nodes],
         }
@@ -1069,25 +1423,89 @@ class GraphSnapshot:
         claims = _merge_records(self.cross_graph_link_claims, other.cross_graph_link_claims)
         observations = _merge_records(self.cross_graph_link_evidence, other.cross_graph_link_evidence)
         lifecycle = _merge_records(self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle)
+        pull_request_evidence = _merge_records(self.pull_request_evidence, other.pull_request_evidence)
+        associations = _merge_records(
+            self.pull_request_declared_associations,
+            other.pull_request_declared_associations,
+        )
+        repository_relations = _merge_records(
+            self.pull_request_observed_repository_relations,
+            other.pull_request_observed_repository_relations,
+        )
         _validate_cross_graph_claim_references(
-            nodes, evidence, provenance, claims, observations, lifecycle
+            nodes, edges, evidence, provenance, claims, observations, lifecycle,
+            pull_request_evidence, associations, repository_relations,
         )
         return GraphSnapshot(
-            nodes, edges, evidence, claims, observations, lifecycle, provenance
+            nodes, edges, evidence, claims, observations, lifecycle, provenance,
+            pull_request_evidence, associations, repository_relations,
         )
+
+
+def project_pull_request_evidence(
+    pull_requests: tuple[PullRequestImplementationEvidence, ...] = (),
+    associations: tuple[PullRequestDeclaredAssociation, ...] = (),
+    repository_relations: tuple[PullRequestObservedRepositoryRelation, ...] = (),
+) -> GraphSnapshot:
+    """Project typed PR evidence into payload-free canonical nodes and edges."""
+
+    nodes = tuple(
+        Node(
+            item.node_id,
+            NodeKind.PULL_REQUEST,
+            item.pull_request_id,
+            {
+                "base_revision": item.base_revision,
+                "head_revision": item.head_revision,
+                "merged": item.merged,
+                "pull_request_evidence_id": item.id,
+                "provenance_evidence_id": item.provenance_evidence_id,
+                "repository_id": item.repository_id,
+                "source_evidence_id": item.source_evidence_id,
+            },
+            (item.source_evidence_id,),
+        )
+        for item in sorted(pull_requests, key=lambda value: value.id)
+    )
+    edges: list[Edge] = []
+    pr_by_id = {item.id: item for item in pull_requests}
+    for association in sorted(associations, key=lambda value: value.id):
+        if association.pull_request_evidence_id not in pr_by_id:
+            continue
+        edges.append(pull_request_projection_edge(
+            pr_by_id[association.pull_request_evidence_id], association,
+        ))
+    for relation in sorted(repository_relations, key=lambda value: value.id):
+        if relation.pull_request_evidence_id not in pr_by_id:
+            continue
+        edges.append(pull_request_projection_edge(
+            pr_by_id[relation.pull_request_evidence_id], relation,
+        ))
+    return GraphSnapshot(
+        nodes=nodes,
+        edges=tuple(edges),
+        pull_request_evidence=tuple(pull_requests),
+        pull_request_declared_associations=tuple(associations),
+        pull_request_observed_repository_relations=tuple(repository_relations),
+    )
 
 
 def _validate_cross_graph_claim_references(
     nodes: tuple[Node, ...],
+    edges: tuple[Edge, ...],
     evidence: tuple[Evidence, ...],
     provenance: tuple[ProvenanceRecord, ...],
     claims: tuple[CrossGraphLinkClaim, ...],
     observations: tuple[CrossGraphLinkEvidence, ...],
     lifecycle: tuple[CrossGraphLinkLifecycle, ...],
+    pull_request_evidence: tuple[PullRequestImplementationEvidence, ...] = (),
+    associations: tuple[PullRequestDeclaredAssociation, ...] = (),
+    repository_relations: tuple[PullRequestObservedRepositoryRelation, ...] = (),
 ) -> None:
     """Reject merged cross-graph records with dangling claim or provenance references."""
 
-    node_ids = {node.id for node in nodes}
+    node_by_id = {node.id: node for node in nodes}
+    node_ids = set(node_by_id)
     claim_ids = {claim.id for claim in claims}
     evidence_ids = {item.id for item in evidence}
     provenance_ids = {item.id for item in provenance}
@@ -1103,6 +1521,123 @@ def _validate_cross_graph_claim_references(
             )
     evidence_by_id = {item.id: item for item in evidence}
     provenance_by_id = {item.id: item for item in provenance}
+    pull_requests = {item.id: item for item in pull_request_evidence}
+    association_by_id = {item.id: item for item in associations}
+    relation_by_id = {item.id: item for item in repository_relations}
+    eligible_intended_change_kinds = {
+        NodeKind.OPENSPEC_ACTIVE_CHANGE.value,
+        NodeKind.OPENSPEC_ARCHIVED_CHANGE.value,
+        NodeKind.JIRA_STORY.value,
+    }
+
+    def node_kind(node_id: str) -> str | None:
+        node = node_by_id.get(node_id)
+        if node is None:
+            return None
+        return getattr(node.kind, "value", node.kind)
+
+    for item in pull_request_evidence:
+        if node_kind(item.repository_id) != NodeKind.REPOSITORY.value:
+            raise ValueError(
+                "Pull-request evidence repository endpoint is absent or not a REPOSITORY node: "
+                f"{item.id}: {item.repository_id}"
+            )
+        if node_kind(item.node_id) != NodeKind.PULL_REQUEST.value:
+            raise ValueError(
+                "Pull-request evidence PR-node endpoint is absent or not a PULL_REQUEST node: "
+                f"{item.id}: {item.node_id}"
+            )
+        if error := pull_request_source_artifact_error(item, evidence_by_id, provenance_by_id):
+            raise ValueError(f"Pull-request source artifact invalid: {item.id}: {error}")
+    for item in associations:
+        if item.pull_request_evidence_id not in pull_requests:
+            raise ValueError(
+                f"Pull-request association references absent PR evidence: {item.id}"
+            )
+        if node_kind(item.intended_change_id) not in eligible_intended_change_kinds:
+            raise ValueError(
+                "Pull-request association intended-change endpoint is absent or ineligible: "
+                f"{item.id}: {item.intended_change_id}"
+            )
+        if item.source_evidence_id not in evidence_ids or item.provenance_evidence_id not in provenance_ids:
+            raise ValueError(
+                f"Pull-request association references absent source evidence: {item.id}"
+            )
+        if error := pull_request_relation_provenance_error(
+            item.source_evidence_id, item.provenance_evidence_id,
+            evidence_by_id, provenance_by_id,
+        ):
+            raise ValueError(
+                f"Pull-request association provenance binding invalid: {item.id}: {error}"
+            )
+    for item in repository_relations:
+        pr = pull_requests.get(item.pull_request_evidence_id)
+        if pr is None:
+            raise ValueError(
+                f"Pull-request repository relation references absent PR evidence: {item.id}"
+            )
+        if item.repository_id != pr.repository_id:
+            raise ValueError(f"Pull-request repository relation disagrees with PR evidence: {item.id}")
+        if node_kind(item.repository_id) != NodeKind.REPOSITORY.value:
+            raise ValueError(
+                "Pull-request repository relation repository endpoint is absent or not a REPOSITORY node: "
+                f"{item.id}: {item.repository_id}"
+            )
+        if item.source_evidence_id not in evidence_ids or item.provenance_evidence_id not in provenance_ids:
+            raise ValueError(
+                f"Pull-request repository relation references absent source evidence: {item.id}"
+            )
+        if error := pull_request_relation_provenance_error(
+            item.source_evidence_id, item.provenance_evidence_id,
+            evidence_by_id, provenance_by_id,
+        ):
+            raise ValueError(
+                f"Pull-request repository relation provenance binding invalid: {item.id}: {error}"
+            )
+
+    # Typed PR relations and their graph projections are one invariant, not
+    # two independently mergeable representations.  Check both directions:
+    # every typed record must have its exact projection, and every PR edge must
+    # be explained by exactly one typed record with the same endpoint, kind,
+    # and source-evidence binding.
+    expected_projection_edges: dict[str, Edge] = {}
+    for association in associations:
+        expected = pull_request_projection_edge(
+            pull_requests[association.pull_request_evidence_id], association,
+        )
+        expected_projection_edges[expected.id] = expected
+    for relation in repository_relations:
+        expected = pull_request_projection_edge(
+            pull_requests[relation.pull_request_evidence_id], relation,
+        )
+        expected_projection_edges[expected.id] = expected
+    edges_by_id = {edge.id: edge for edge in edges}
+    for expected in sorted(expected_projection_edges.values(), key=lambda item: item.id):
+        actual = edges_by_id.get(expected.id)
+        if actual is None:
+            raise ValueError(
+                "Pull-request typed relation lacks its exact projected edge: "
+                f"{expected.id}"
+            )
+        if actual.as_dict() != expected.as_dict():
+            raise ValueError(
+                "Pull-request projected edge does not match its typed relation "
+                f"endpoint, kind, or source evidence: {expected.id}"
+            )
+    for edge in sorted(edges, key=lambda item: item.id):
+        if node_kind(edge.source_id) != NodeKind.PULL_REQUEST.value:
+            continue
+        expected = expected_projection_edges.get(edge.id)
+        if expected is None:
+            raise ValueError(
+                "Pull-request edge lacks a matching typed relation record: "
+                f"{edge.id}"
+            )
+        if edge.as_dict() != expected.as_dict():
+            raise ValueError(
+                "Pull-request edge does not exactly match its typed relation "
+                f"projection: {edge.id}"
+            )
     for observation in sorted(observations, key=lambda item: item.id):
         if observation.claim_id not in claim_ids:
             raise ValueError(
@@ -1114,10 +1649,30 @@ def _validate_cross_graph_claim_references(
                 "Cross-graph evidence references absent provenance evidence: "
                 f"{observation.provenance_evidence_id}"
             )
-        elif not _has_complete_provenance(
+        if observation.strategy_id == "pr-code-candidate-extraction" and (
+            observation.pull_request_evidence_id is None
+            or observation.declared_association_id is None
+        ):
+            raise ValueError(
+                "pr-code-candidate-extraction observation lacks explicit PR scope: "
+                f"{observation.id}"
+            )
+        if not _has_complete_provenance(
             evidence_by_id[observation.provenance_evidence_id], provenance_by_id
         ):
             raise ValueError(f"Cross-graph evidence requires complete provenance: {observation.id}")
+        if observation.pull_request_evidence_id is not None:
+            pr = pull_requests.get(observation.pull_request_evidence_id)
+            association = association_by_id.get(observation.declared_association_id or "")
+            claim = next((item for item in claims if item.id == observation.claim_id), None)
+            if pr is None or association is None:
+                raise ValueError(f"Cross-graph evidence references absent PR scope: {observation.id}")
+            if association.pull_request_evidence_id != pr.id:
+                raise ValueError(f"Cross-graph evidence PR association mismatch: {observation.id}")
+            if claim is None or claim.subject_id != association.intended_change_id:
+                raise ValueError(f"Cross-graph evidence intended-change scope mismatch: {observation.id}")
+            if not isinstance(claim.target, CodeLocator) or claim.target.repository != pr.repository_id or claim.target.revision != pr.head_revision:
+                raise ValueError(f"Cross-graph evidence repository/head mismatch: {observation.id}")
     for entry in sorted(lifecycle, key=lambda item: item.id):
         if entry.claim_id not in claim_ids:
             raise ValueError(

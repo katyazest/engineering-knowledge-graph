@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from engineering_kg.ontology import CodeLocator, Node
 
 
-CATALOG_REVISION = "2"
+CATALOG_REVISION = "3"
 
 
 class RelationshipKind(StrEnum):
@@ -64,15 +64,15 @@ class SourceMapping:
 _ANY = frozenset({"*"})
 _CHANGE = frozenset({"openspec-active-change", "openspec-archived-change"})
 _TRACE = _CHANGE | frozenset({"requirement", "scenario", "jira_story"})
-_IMPLEMENTER = frozenset({"jira_story", "pull_request", "service", "repository", "contract", "business_process"})
-_DEPENDENCY = _IMPLEMENTER | frozenset({"specification", "requirement", "scenario"})
+_IMPLEMENTER = frozenset({"jira_story", "service", "repository", "contract", "business_process"})
+_DEPENDENCY = _IMPLEMENTER | frozenset({"pull_request", "specification", "requirement", "scenario"})
 
 RELATIONSHIP_CATALOG: tuple[RelationshipDefinition, ...] = (
     RelationshipDefinition(RelationshipKind.CONTAINS, "Structural containment.", frozenset({"specification", "requirement"}) | _CHANGE, frozenset({"requirement", "scenario", "openspec-artifact"}), classification="structural"),
     RelationshipDefinition(RelationshipKind.TRACES_TO, "Traceability relationship.", _TRACE, frozenset({"specification", "requirement", "scenario", "jira_story"})),
     RelationshipDefinition(RelationshipKind.IMPLEMENTS, "Implementation relationship.", _IMPLEMENTER, frozenset({"service", "repository", "contract", "business_process"}), True),
     RelationshipDefinition(RelationshipKind.VERIFIED_BY, "Verification relationship.", frozenset({"requirement", "scenario", "jira_story", "contract", "service", "business_process"}), frozenset({"scenario", "pull_request", "contract"}), True),
-    RelationshipDefinition(RelationshipKind.TOUCHES, "Change touches an implementation target.", frozenset({"jira_story", "pull_request"}), frozenset({"service", "repository", "contract", "business_process"}), True),
+    RelationshipDefinition(RelationshipKind.TOUCHES, "Change touches an implementation target.", frozenset({"jira_story", "pull_request", "openspec-active-change", "openspec-archived-change"}), frozenset({"service", "repository", "contract", "business_process"}), True),
     RelationshipDefinition(RelationshipKind.DEPENDS_ON, "Directed dependency.", _DEPENDENCY, _DEPENDENCY),
     RelationshipDefinition(RelationshipKind.REFERENCES, "Non-owning reference.", _ANY, _ANY, True),
     RelationshipDefinition(RelationshipKind.OWNED_BY, "Single ownership assignment.", frozenset({"service", "repository", "contract", "business_process", "specification", "adr"}), frozenset({"workspace", "service", "external_system"}), max_targets_per_source=1),
@@ -86,6 +86,9 @@ SOURCE_MAPPINGS = (
     SourceMapping("openspec-assertion", "asserts", "support"),
     SourceMapping("openspec-related", "references", "non-confident"),
     SourceMapping("merged-pr-changed-symbol", "touches", "candidate"),
+    SourceMapping("pr-declared-association", "references", "declared"),
+    SourceMapping("pr-observed-repository", "touches", "observed"),
+    SourceMapping("pr-changed-symbol", "touches", "candidate"),
 )
 
 
@@ -107,6 +110,14 @@ def relationship_error(kind: object, source: "Node | None", target: "Node | Code
     # arbitrary adapter-provided string.
     if source_kind not in _CANONICAL_NODE_KINDS:
         return "relationship-endpoint-contract"
+    if source_kind == "pull_request" and value == RelationshipKind.REFERENCES.value:
+        target_kind = getattr(getattr(target, "kind", None), "value", getattr(target, "kind", None))
+        if target_kind not in {"openspec-active-change", "openspec-archived-change", "jira_story"}:
+            return "pr-declared-association-endpoint-contract"
+    if source_kind == "pull_request" and value == RelationshipKind.TOUCHES.value:
+        target_kind = getattr(getattr(target, "kind", None), "value", getattr(target, "kind", None))
+        if target_kind != "repository":
+            return "pr-observed-repository-endpoint-contract"
     if "*" not in entry.source_kinds and source_kind not in entry.source_kinds:
         return "relationship-endpoint-contract"
     # CodeLocator has no node kind and is deliberately only admitted where explicit.
@@ -126,6 +137,27 @@ def relationship_error(kind: object, source: "Node | None", target: "Node | Code
         }:
             return "relationship-endpoint-contract"
     return None
+
+
+def pull_request_relationship_error(
+    kind: object, source: "Node | None", target: "Node | CodeLocator | None",
+) -> str | None:
+    """Validate the narrower typed PR relationship contract."""
+
+    value = getattr(kind, "value", kind)
+    source_kind = getattr(getattr(source, "kind", None), "value", getattr(source, "kind", None))
+    target_kind = getattr(getattr(target, "kind", None), "value", getattr(target, "kind", None))
+    if value == RelationshipKind.REFERENCES.value:
+        if source_kind != "pull_request" or target_kind not in {
+            "openspec-active-change", "openspec-archived-change", "jira_story",
+        }:
+            return "pr-declared-association-endpoint-contract"
+        return None
+    if value == RelationshipKind.TOUCHES.value:
+        if source_kind != "pull_request" or target_kind != "repository":
+            return "pr-observed-repository-endpoint-contract"
+        return None
+    return "pr-relationship-kind"
 
 
 # Kept local to avoid an ontology import cycle: vocabulary is imported by the

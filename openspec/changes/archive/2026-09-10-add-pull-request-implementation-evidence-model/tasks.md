@@ -1,0 +1,31 @@
+## 1. Canonical PR evidence model
+
+- [x] 1.1 Add immutable, payload-safe `PullRequestImplementationEvidence`, declared-association, and observed-repository-relation models with deterministic stable IDs, complete base/head revision validation, repository/intent endpoint references, and typed declared/observed origins. Verify equivalent records coalesce and conflicting immutable records fail deterministically.
+- [x] 1.2 Project admitted PR evidence into a stable `PULL_REQUEST` node plus directed `REFERENCES` and `TOUCHES` edges without using display values as identity or overloading generic edge confidence/properties. Verify the PR node/relations contain no provider payload, URL, diff, source, credential, or token fields.
+- [x] 1.3 Extend `GraphSnapshot` collections, deterministic serialization, counts, and merge/reference validation for PR evidence and relation records. Verify a new-format snapshot without PR evidence remains constructible and an invalid dangling or conflicting PR reference emits no partial merged snapshot.
+- [x] 1.4 Extend source-artifact locator/navigation validation and external provenance construction for PR source evidence, association source references, and changed-symbol sources. Verify complete payload-safe PR identity/provenance is admitted while unsafe URLs/payloads and missing source/provenance fields are rejected before graph emission.
+
+## 2. Relationship and normalized-adapter boundaries
+
+- [x] 2.1 Advance the executable relationship catalog and published relationship-vocabulary reference with the declared `PULL_REQUEST REFERENCES intended-change`, observed `PULL_REQUEST TOUCHES REPOSITORY`, and OpenSpec/Jira `TOUCHES` code-locator endpoint rules. Verify catalog serialization, direction, source mappings, unknown/reversed endpoint rejection, and absence of a PR-to-`IMPLEMENTS` mapping.
+- [x] 2.2 Replace the merged-revision-only PR candidate normalized input with revision-bounded PR evidence: source-qualified PR identity, repository, immutable base/head, merged state, source references, provenance inputs, explicit association, and mapping outcomes. Verify the adapter remains provider-neutral/local and rejects branches, tags, abbreviated commits, missing/unsupported intent endpoints, inferred links, unsafe identities, and raw payload fields.
+- [x] 2.3 Update the PR candidate extractor to emit PR evidence, declared association, observed repository relation, and only association-scoped observed/untrusted `TOUCHES` candidates whose locator repository/head matches the PR. Verify resolved mappings produce all attributable references once, while unresolved/ambiguous/mismatched/association-less mappings produce reason-coded non-admission without partial claims or lifecycle entries.
+- [x] 2.4 Update PR candidate result metadata and fixtures for admitted PRs, declared associations, observed relations, candidates, and skipped reasons. Verify repeated/reordered equivalent input is deterministic and no metadata asserts requirement coverage, implementation, or trusted status.
+
+## 3. Cross-graph trust and integrity enforcement
+
+- [x] 3.1 Extend PR-derived `CrossGraphLinkEvidence` with immutable references to its PR evidence and declared association while preserving existing claim identity and non-PR observation behavior. Verify a PR-scoped observation cannot be constructed with a missing/non-PR reference, different intended-change scope, or locator repository/head mismatch.
+- [x] 3.2 Extend graph-integrity validation with deterministic diagnostics for PR identity, merged/base/head state, source-artifact/provenance resolution, relation origin/endpoint, association scope, repository relation, and cross-graph PR reference consistency. Verify invalid snapshots block validation-required persistence/query boundaries without repair, inference, or promotion.
+- [x] 3.3 Add trust-boundary regressions covering a PR associated with multiple changed files/symbols and an OpenSpec change containing multiple requirements. Verify only supplied resolved candidates remain observed/untrusted and no `IMPLEMENTS`, requirement-to-code relation, automatic lifecycle promotion, or trusted projection is created.
+
+## 4. Persistence and pipeline integration
+
+- [x] 4.1 Extend persistence serialization/deserialization, ordering, and readback validation for the PR evidence collections and scoped observation fields; advance the persisted catalog revision. Verify equivalent write/read/merge cycles are stable and preserve PR/repository/base/head/origin/provenance data without payload leakage.
+- [x] 4.2 Enforce the current-format compatibility boundary. Verify new-format empty PR-evidence collections read successfully, while an earlier catalog or prior merged-revision-only candidate is rejected deterministically with no base/head or declared association backfill/migration.
+- [x] 4.3 Update the opt-in `pr-code-candidate-extraction` pipeline API/stage to receive enriched normalized PR evidence and report only safe deterministic metadata. Verify invalid input fails before graph mutation, unconfigured/bootstrap runs remain unchanged, and the stage performs no live Jira, Bitbucket, Graphify, OpenLore, or other external call.
+
+## 5. Query, documentation, and end-to-end verification
+
+- [x] 5.1 Add deterministic local PR implementation-evidence query projections/operation and extend relevant change/traceability projections with represented PR references. Verify responses distinguish declared association from observed repository/candidate evidence and never return URLs, payloads, source code, requirement coverage, or trusted implementation conclusions.
+- [x] 5.2 Update the relationship vocabulary and engineering-KG documentation to explain the base/head revision boundary, explicit association/source-reference requirements, declared versus observed relations, and the non-implementation candidate rule. Verify the published vocabulary exactly matches executable catalog serialization.
+- [x] 5.3 Implement fixture-based unit/integration coverage for every row of the EKG-44 verification matrix across model, adapter, extraction, merge, validation, persistence/readback, query, and pipeline boundaries. Run the complete local test suite and verify no test requires live external infrastructure.
