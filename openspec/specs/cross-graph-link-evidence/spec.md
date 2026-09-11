@@ -34,7 +34,7 @@ The system SHALL represent candidate link evidence as an attributable observatio
 - **THEN** the system rejects the conflicting graph data rather than selecting one observation
 
 ### Requirement: Candidate evidence and trusted semantic links are distinct
-The system SHALL preserve candidate evidence separately from a trusted semantic link. A claim in the `candidate`, `rejected`, or `superseded` lifecycle state SHALL not be emitted or interpreted as a trusted semantic relationship; only a claim explicitly in the `trusted` lifecycle state SHALL be available as a trusted semantic link, with the claim's attributable evidence retained as support.
+The system SHALL preserve candidate evidence separately from a trusted semantic link. A claim in the `candidate`, `rejected`, or `superseded` lifecycle state SHALL not be emitted or interpreted as a trusted semantic relationship; only a claim explicitly in the `trusted` lifecycle state SHALL be available as a trusted semantic link, with the claim's attributable evidence retained as support. The existing declared-authoritative and explicit-lifecycle eligibility rules SHALL determine only trusted cross-graph projection eligibility after a valid graph merge; they SHALL NOT resolve a conflicting same-identity canonical assertion, discard independently valid declared/observed/inferred support, or override conflict-aware merge diagnostics.
 
 #### Scenario: Candidate claim is not a semantic relationship
 - **WHEN** a snapshot contains a claim with one or more active candidate-evidence observations and lifecycle state `candidate`
@@ -48,6 +48,11 @@ The system SHALL preserve candidate evidence separately from a trusted semantic 
 - **WHEN** a claim moves to `rejected` or `superseded`
 - **THEN** its locator identity and accumulated evidence remain serializable for audit
 - **THEN** it is not exposed as a trusted semantic link
+
+#### Scenario: Authority eligibility does not repair an assertion conflict
+- **WHEN** a claim has support eligible for trusted projection but another same-identity canonical assertion cohort is unresolved
+- **THEN** the conflict-aware merge rejects the graph before trusted projection is exposed
+- **THEN** the trusted lifecycle does not choose or rewrite a conflicting canonical record
 
 ### Requirement: Link lifecycle is explicit and valid
 The system SHALL retain an ordered lifecycle history for each link claim and derive its current lifecycle state from the highest lifecycle revision. The permitted states SHALL be `candidate`, `trusted`, `rejected`, and `superseded`; the system SHALL reject unknown states, duplicate conflicting revisions, and histories without a determinable current revision. It SHALL not infer promotion to `trusted` from evidence count, strategy name, confidence, or any OpenLore result.

@@ -90,6 +90,20 @@ class PullRequestImplementationEvidenceTest(unittest.TestCase):
         self.assertEqual(len(merged.cross_graph_link_claims), 1)
         self.assertEqual(len(merged.cross_graph_link_evidence), 1)
 
+    def test_same_pull_request_identity_with_different_revisions_conflicts(self) -> None:
+        first = PullRequestImplementationEvidence(
+            "bitbucket:pr-42", self.repository.id, "a" * 40, "b" * 40,
+            True, "source-evidence", "provenance-evidence",
+        )
+        second = PullRequestImplementationEvidence(
+            "bitbucket:pr-42", self.repository.id, "c" * 40, "d" * 40,
+            True, "source-evidence", "provenance-evidence",
+        )
+        with self.assertRaisesRegex(ValueError, "Conflicting graph record values"):
+            GraphSnapshot(pull_request_evidence=(first,)).merged_with(
+                GraphSnapshot(pull_request_evidence=(second,))
+            )
+
     def test_distinct_associations_for_one_pr_merge_readback_and_query_isolate_candidates(self) -> None:
         second_change = Node("change-2", NodeKind.OPENSPEC_ARCHIVED_CHANGE, "add-refunds")
         first = normalize_pull_request_evidence(self.raw)

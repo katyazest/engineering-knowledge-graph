@@ -48,7 +48,7 @@ class GraphIntegrityValidationTest(unittest.TestCase):
         second = Node(
             specification_id,
             NodeKind.SPECIFICATION,
-            "Payments specification",
+            "Payments",
             {"repository_id": "requirements", "capability": "payments"},
             ("second-evidence",),
         )
@@ -71,6 +71,22 @@ class GraphIntegrityValidationTest(unittest.TestCase):
         result = validate_graph_integrity(GraphSnapshot(nodes=(node,)))
         self.assertEqual(result.status, "invalid")
         self.assertEqual(result.metadata.diagnostics[0].rule_id, "canonical-natural-key-identity")
+
+    def test_conflict_diagnostic_is_stable_and_payload_free_for_direct_duplicates(self) -> None:
+        first = Node("shared", NodeKind.REPOSITORY, "provider payload one", {"revision": "one"}, ("evidence-one",))
+        second = Node("shared", NodeKind.REPOSITORY, "provider payload two", {"revision": "two"}, ("evidence-two",))
+        evidence = (Evidence("evidence-one", "fixture", "one"), Evidence("evidence-two", "fixture", "two"))
+
+        forward = validate_graph_integrity(GraphSnapshot(nodes=(first, second), evidence=evidence))
+        reverse = validate_graph_integrity(GraphSnapshot(nodes=(second, first), evidence=evidence[::-1]))
+        forward_conflict = next(item for item in forward.metadata.diagnostics if item.rule_id == "duplicate-identity-conflict")
+        reverse_conflict = next(item for item in reverse.metadata.diagnostics if item.rule_id == "duplicate-identity-conflict")
+
+        self.assertEqual(forward.status, "invalid")
+        self.assertEqual(forward_conflict.as_dict(), reverse_conflict.as_dict())
+        self.assertEqual(forward_conflict.contributor_evidence_ids, ("evidence-one", "evidence-two"))
+        self.assertNotIn("provider payload", forward_conflict.message)
+        self.assertNotIn("revision", forward_conflict.message)
 
 
 if __name__ == "__main__":
