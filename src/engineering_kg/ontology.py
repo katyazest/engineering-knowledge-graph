@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import defaultdict
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -1343,6 +1344,8 @@ class GraphSnapshot:
 
     @property
     def trusted_cross_graph_links(self) -> tuple[TrustedCrossGraphLink, ...]:
+        if graph_merge_conflicts(self):
+            return ()
         lifecycles: dict[str, CrossGraphLinkLifecycle] = {}
         invalid_claims: set[str] = set()
         for entry in self.cross_graph_link_lifecycle:
@@ -1413,25 +1416,40 @@ class GraphSnapshot:
         return json.dumps(self.as_dict(), sort_keys=True)
 
     def merged_with(self, other: "GraphSnapshot") -> "GraphSnapshot":
-        nodes = _merge_records(self.nodes, other.nodes)
-        edges = _merge_records(self.edges, other.edges)
-        evidence = _merge_records(self.evidence, other.evidence)
-        provenance = _merge_records(self.provenance, other.provenance)
+        collection_values = (
+            ("node", self.nodes, other.nodes),
+            ("edge", self.edges, other.edges),
+            ("evidence", self.evidence, other.evidence),
+            ("provenance", self.provenance, other.provenance),
+            ("cross-graph-link-claim", self.cross_graph_link_claims, other.cross_graph_link_claims),
+            ("cross-graph-link-evidence", self.cross_graph_link_evidence, other.cross_graph_link_evidence),
+            ("cross-graph-link-lifecycle", self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle),
+            ("pull-request-evidence", self.pull_request_evidence, other.pull_request_evidence),
+            ("pull-request-declared-association", self.pull_request_declared_associations, other.pull_request_declared_associations),
+            ("pull-request-observed-repository-relation", self.pull_request_observed_repository_relations, other.pull_request_observed_repository_relations),
+        )
+        merged_by_collection: dict[str, tuple[Any, ...]] = {}
+        conflicts: list[GraphMergeConflict] = []
+        for collection, left, right in collection_values:
+            merged, collection_conflicts = _evaluate_record_cohort(collection, (*left, *right))
+            merged_by_collection[collection] = merged
+            conflicts.extend(collection_conflicts)
+        if conflicts:
+            raise GraphMergeConflictError(conflicts)
+
+        nodes = merged_by_collection["node"]
+        edges = merged_by_collection["edge"]
+        evidence = merged_by_collection["evidence"]
+        provenance = merged_by_collection["provenance"]
         for item in evidence:
             if error := source_artifact_identity_error(item):
                 raise ValueError(f"invalid-source-artifact-identity: {error}: {item.id}")
-        claims = _merge_records(self.cross_graph_link_claims, other.cross_graph_link_claims)
-        observations = _merge_records(self.cross_graph_link_evidence, other.cross_graph_link_evidence)
-        lifecycle = _merge_records(self.cross_graph_link_lifecycle, other.cross_graph_link_lifecycle)
-        pull_request_evidence = _merge_records(self.pull_request_evidence, other.pull_request_evidence)
-        associations = _merge_records(
-            self.pull_request_declared_associations,
-            other.pull_request_declared_associations,
-        )
-        repository_relations = _merge_records(
-            self.pull_request_observed_repository_relations,
-            other.pull_request_observed_repository_relations,
-        )
+        claims = merged_by_collection["cross-graph-link-claim"]
+        observations = merged_by_collection["cross-graph-link-evidence"]
+        lifecycle = merged_by_collection["cross-graph-link-lifecycle"]
+        pull_request_evidence = merged_by_collection["pull-request-evidence"]
+        associations = merged_by_collection["pull-request-declared-association"]
+        repository_relations = merged_by_collection["pull-request-observed-repository-relation"]
         _validate_cross_graph_claim_references(
             nodes, edges, evidence, provenance, claims, observations, lifecycle,
             pull_request_evidence, associations, repository_relations,
@@ -1810,50 +1828,143 @@ def _trusted_claim_has_eligible_evidence(
     )
 
 
-def _merge_records(left: tuple[Any, ...], right: tuple[Any, ...]) -> tuple[Any, ...]:
-    records: dict[str, Any] = {}
-    order: list[str] = []
-    for item in (*left, *right):
-        existing = records.get(item.id)
-        if existing is None:
-            records[item.id] = item
-            order.append(item.id)
-        else:
-            records[item.id] = _merge_record(existing, item)
-    return tuple(records[item_id] for item_id in order)
+@dataclass(frozen=True)
+class GraphMergeConflict:
+    """Payload-free description of one unresolved same-identity cohort."""
+
+    rule_id: str
+    collection: str
+    canonical_id: str
+    contributor_record_ids: tuple[str, ...] = ()
+    contributor_evidence_ids: tuple[str, ...] = ()
+    contributor_provenance_ids: tuple[str, ...] = ()
+
+    @property
+    def affected_object_id(self) -> str:
+        return self.canonical_id
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "canonical_id": self.canonical_id,
+            "collection": self.collection,
+            "contributor_evidence_ids": list(self.contributor_evidence_ids),
+            "contributor_provenance_ids": list(self.contributor_provenance_ids),
+            "contributor_record_ids": list(self.contributor_record_ids),
+            "rule_id": self.rule_id,
+        }
 
 
-def _merge_record(left: Any, right: Any) -> Any:
-    if type(left) is not type(right):
-        raise ValueError(f"Conflicting graph record types for ID: {left.id}")
-    if isinstance(left, (Node, Edge)):
-        left_data = left.as_dict()
-        right_data = right.as_dict()
-        left_data.pop("evidence_ids")
-        right_data.pop("evidence_ids")
-        if isinstance(left, Node):
-            left_data.pop("name")
-            right_data.pop("name")
-        if left_data != right_data:
-            raise ValueError(f"Conflicting graph record values for ID: {left.id}")
-        evidence_ids = tuple(sorted(set(left.evidence_ids) | set(right.evidence_ids)))
-        if isinstance(left, Node):
-            return dataclass_replace(left, name=min(left.name, right.name), evidence_ids=evidence_ids)
-        return dataclass_replace(left, evidence_ids=evidence_ids)
-    if isinstance(left, Evidence):
-        left_data = left.as_dict()
-        right_data = right.as_dict()
-        left_data.pop("provenance_ids")
-        right_data.pop("provenance_ids")
-        if left_data != right_data:
-            raise ValueError(f"Conflicting graph record values for ID: {left.id}")
-        return dataclass_replace(
-            left,
-            provenance_ids=tuple(sorted(set(left.provenance_ids) | set(right.provenance_ids))),
+class GraphMergeConflictError(ValueError):
+    """Raised when a complete assertion cohort cannot be safely coalesced."""
+
+    def __init__(self, conflicts: tuple[GraphMergeConflict, ...] | list[GraphMergeConflict]) -> None:
+        self.conflicts = tuple(sorted(conflicts, key=_graph_merge_conflict_sort_key))
+        details = "; ".join(
+            "collection={collection}, id={canonical_id}, records={records}, evidence={evidence}, provenance={provenance}".format(
+                collection=item.collection,
+                canonical_id=item.canonical_id,
+                records=",".join(item.contributor_record_ids),
+                evidence=",".join(item.contributor_evidence_ids),
+                provenance=",".join(item.contributor_provenance_ids),
+            )
+            for item in self.conflicts
         )
-    if left.as_dict() != right.as_dict():
-        raise ValueError(f"Conflicting graph record values for ID: {left.id}")
-    return left
+        super().__init__(f"Conflicting graph record values: {details}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "conflicts": [item.as_dict() for item in self.conflicts],
+            "message": str(self),
+        }
+
+
+def graph_merge_conflicts(snapshot: GraphSnapshot) -> tuple[GraphMergeConflict, ...]:
+    """Return deterministic conflicts in a directly constructed snapshot."""
+
+    collections = (
+        ("node", snapshot.nodes),
+        ("edge", snapshot.edges),
+        ("evidence", snapshot.evidence),
+        ("provenance", snapshot.provenance),
+        ("cross-graph-link-claim", snapshot.cross_graph_link_claims),
+        ("cross-graph-link-evidence", snapshot.cross_graph_link_evidence),
+        ("cross-graph-link-lifecycle", snapshot.cross_graph_link_lifecycle),
+        ("pull-request-evidence", snapshot.pull_request_evidence),
+        ("pull-request-declared-association", snapshot.pull_request_declared_associations),
+        ("pull-request-observed-repository-relation", snapshot.pull_request_observed_repository_relations),
+    )
+    conflicts: list[GraphMergeConflict] = []
+    for collection, records in collections:
+        _, collection_conflicts = _evaluate_record_cohort(collection, records)
+        conflicts.extend(collection_conflicts)
+    return tuple(sorted(conflicts, key=_graph_merge_conflict_sort_key))
+
+
+def _evaluate_record_cohort(
+    collection: str, records: tuple[Any, ...]
+) -> tuple[tuple[Any, ...], tuple[GraphMergeConflict, ...]]:
+    cohorts: dict[str, list[Any]] = defaultdict(list)
+    for item in records:
+        cohorts[item.id].append(item)
+
+    merged: list[Any] = []
+    conflicts: list[GraphMergeConflict] = []
+    for canonical_id, cohort in cohorts.items():
+        baseline = cohort[0]
+        if any(
+            type(candidate) is not type(baseline)
+            or _record_comparison_data(candidate) != _record_comparison_data(baseline)
+            for candidate in cohort[1:]
+        ):
+            conflicts.append(_cohort_conflict(collection, canonical_id, cohort))
+            continue
+        merged.append(_coalesce_compatible_records(cohort))
+    return tuple(merged), tuple(sorted(conflicts, key=_graph_merge_conflict_sort_key))
+
+
+def _coalesce_compatible_records(cohort: list[Any]) -> Any:
+    result = cohort[0]
+    if isinstance(result, (Node, Edge)):
+        references = tuple(sorted({reference for item in cohort for reference in item.evidence_ids}))
+        return dataclass_replace(result, evidence_ids=references)
+    if isinstance(result, Evidence):
+        references = tuple(sorted({reference for item in cohort for reference in item.provenance_ids}))
+        return dataclass_replace(result, provenance_ids=references)
+    return result
+
+
+def _record_comparison_data(record: Any) -> Any:
+    serialized = record.as_dict()
+    if isinstance(record, (Node, Edge)):
+        serialized.pop("evidence_ids", None)
+    elif isinstance(record, Evidence):
+        serialized.pop("provenance_ids", None)
+    return serialized
+
+
+def _cohort_conflict(collection: str, canonical_id: str, cohort: list[Any]) -> GraphMergeConflict:
+    evidence_ids: set[str] = set()
+    provenance_ids: set[str] = set()
+    for item in cohort:
+        evidence_ids.update(getattr(item, "evidence_ids", ()))
+        evidence_ids.update(
+            value for name in ("source_evidence_id", "provenance_evidence_id")
+            if isinstance(value := getattr(item, name, None), str)
+        )
+        provenance_ids.update(getattr(item, "provenance_ids", ()))
+        provenance_ids.update(getattr(item, "input_provenance_ids", ()))
+    return GraphMergeConflict(
+        rule_id="duplicate-identity-conflict",
+        collection=collection,
+        canonical_id=canonical_id,
+        contributor_record_ids=tuple(sorted({item.id for item in cohort})),
+        contributor_evidence_ids=tuple(sorted(evidence_ids)),
+        contributor_provenance_ids=tuple(sorted(provenance_ids)),
+    )
+
+
+def _graph_merge_conflict_sort_key(item: GraphMergeConflict) -> tuple[str, str, str]:
+    return item.rule_id, item.collection, item.canonical_id
 
 
 def dataclass_replace(value: Any, **changes: Any) -> Any:

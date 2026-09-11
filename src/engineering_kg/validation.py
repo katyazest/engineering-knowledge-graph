@@ -23,6 +23,7 @@ from engineering_kg.ontology import (
     PullRequestImplementationEvidence,
     PullRequestDeclaredAssociation,
     PullRequestObservedRepositoryRelation,
+    _evaluate_record_cohort,
     pull_request_projection_edge,
     SourceArtifactLocator,
     _has_complete_provenance,
@@ -69,10 +70,16 @@ class GraphValidationDiagnostic:
     rule_id: str
     affected_object_id: str
     message: str
+    contributor_record_ids: tuple[str, ...] = ()
+    contributor_evidence_ids: tuple[str, ...] = ()
+    contributor_provenance_ids: tuple[str, ...] = ()
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "affected_object_id": self.affected_object_id,
+            "contributor_evidence_ids": list(self.contributor_evidence_ids),
+            "contributor_provenance_ids": list(self.contributor_provenance_ids),
+            "contributor_record_ids": list(self.contributor_record_ids),
             "message": self.message,
             "rule_id": self.rule_id,
             "severity": self.severity,
@@ -486,44 +493,30 @@ def _duplicate_conflict_diagnostics(
     collection: str,
     items: tuple[Any, ...],
 ) -> list[GraphValidationDiagnostic]:
-    by_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for item in items:
-        try:
-            serialized = item.as_dict()
-        except (AttributeError, ValueError):
-            # Classified support that bypassed frozen construction must be
-            # diagnosed by _classified_support_diagnostics, not serialized
-            # while checking duplicate identities.
-            if collection in {
-                "cross-graph-link-evidence", "cross-graph-link-lifecycle",
-            }:
-                continue
-            raise
-        if collection in {"node", "edge"}:
-            serialized.pop("evidence_ids")
-        if collection == "node" and _value(item.kind) in {
-            NodeKind.SPECIFICATION.value,
-            NodeKind.REQUIREMENT.value,
-            NodeKind.SCENARIO.value,
-        }:
-            serialized.pop("name")
-        by_id[item.id].append(serialized)
-
-    diagnostics: list[GraphValidationDiagnostic] = []
-    for item_id, serialized_items in sorted(by_id.items()):
-        unique_items = {
-            repr(_canonical_dict(serialized_item)) for serialized_item in serialized_items
-        }
-        if len(unique_items) > 1:
-            diagnostics.append(
-                GraphValidationDiagnostic(
-                    severity="error",
-                    rule_id="duplicate-identity-conflict",
-                    affected_object_id=item_id,
-                    message=f"{collection} ID has conflicting serialized values: {item_id}",
-                )
-            )
-    return diagnostics
+    try:
+        _, conflicts = _evaluate_record_cohort(collection, items)
+    except (AttributeError, ValueError):
+        # Classified support that bypassed frozen construction must be
+        # diagnosed by _classified_support_diagnostics, not serialized while
+        # checking duplicate identities.
+        if collection in {"cross-graph-link-evidence", "cross-graph-link-lifecycle"}:
+            return []
+        raise
+    return [
+        GraphValidationDiagnostic(
+            severity="error",
+            rule_id=conflict.rule_id,
+            affected_object_id=conflict.canonical_id,
+            message=(
+                "Conflicting same-identity assertion cohort: "
+                f"collection={conflict.collection}, id={conflict.canonical_id}"
+            ),
+            contributor_record_ids=conflict.contributor_record_ids,
+            contributor_evidence_ids=conflict.contributor_evidence_ids,
+            contributor_provenance_ids=conflict.contributor_provenance_ids,
+        )
+        for conflict in conflicts
+    ]
 
 
 def _cross_graph_link_diagnostics(

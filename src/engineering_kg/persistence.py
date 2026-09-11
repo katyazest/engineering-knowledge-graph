@@ -36,6 +36,8 @@ from engineering_kg.ontology import (
     evidence_requires_source_artifact_identity,
     source_artifact_identity_error,
     EdgeKind,
+    GraphMergeConflict,
+    GraphMergeConflictError,
     NodeKind,
     openspec_requirement_id,
     openspec_scenario_id,
@@ -90,6 +92,18 @@ class PersistenceReadError(PersistenceError):
 
 class PersistenceIntegrityError(PersistenceError):
     """Raised when persisted graph data cannot be reconstructed safely."""
+
+    def __init__(
+        self, message: str, conflicts: tuple[GraphMergeConflict, ...] = ()
+    ) -> None:
+        self.conflicts = tuple(conflicts)
+        super().__init__(message)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "conflicts": [item.as_dict() for item in self.conflicts],
+            "message": str(self),
+        }
 
 
 @dataclass(frozen=True)
@@ -157,6 +171,8 @@ class LadybugDbStore:
             )
             try:
                 prospective = current.merged_with(snapshot)
+            except GraphMergeConflictError as exc:
+                raise PersistenceIntegrityError(str(exc), exc.conflicts) from exc
             except ValueError as exc:
                 raise PersistenceIntegrityError(str(exc)) from exc
             # Validate the full prospective graph, including constraints that
@@ -515,6 +531,8 @@ def _empty_graph_data() -> dict[str, dict[str, Any]]:
 def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, Any]:
     try:
         merged_snapshot = _snapshot_from_data(data).merged_with(snapshot)
+    except GraphMergeConflictError as exc:
+        raise PersistenceIntegrityError(str(exc), exc.conflicts) from exc
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
     return _snapshot_data(merged_snapshot)

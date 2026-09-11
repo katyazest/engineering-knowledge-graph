@@ -82,6 +82,29 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             result = store.write_snapshot(GraphSnapshot(nodes=(node("second"),), evidence=(Evidence("second", "fixture", "two"),)))
         self.assertEqual(result.nodes[0].evidence_ids, ("first", "second"))
 
+    def test_conflicting_write_preserves_prior_snapshot_and_exposes_safe_diagnostic(self) -> None:
+        node_id = stable_id("node", NodeKind.REPOSITORY, "payments")
+        prior = GraphSnapshot(nodes=(Node(node_id, NodeKind.REPOSITORY, "payments", {"revision": "prior"}),))
+        incoming = GraphSnapshot(nodes=(Node(node_id, NodeKind.REPOSITORY, "provider payload", {"revision": "incoming"}),))
+
+        diagnostics = []
+        for stored, conflicting in ((prior, incoming), (incoming, prior)):
+            with self.subTest(stored=stored.nodes[0].properties["revision"]), tempfile.TemporaryDirectory() as tmp:
+                store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
+                store.write_snapshot(stored)
+                original = store._graph_file.read_text(encoding="utf-8")
+
+                with self.assertRaises(PersistenceIntegrityError) as raised:
+                    store.write_snapshot(conflicting)
+
+                diagnostics.append(raised.exception.as_dict())
+                self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
+                self.assertEqual(store.read_snapshot().as_dict(), stored.as_dict())
+                self.assertTrue(raised.exception.conflicts)
+                self.assertNotIn("provider payload", str(raised.exception))
+                self.assertNotIn("incoming", str(raised.exception))
+        self.assertEqual(diagnostics[0], diagnostics[1])
+
     def test_readback_rejects_legacy_openspec_records_without_conversion(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("spec-evidence",))
         legacy_requirement = Node("legacy-requirement", "openspec-requirement", "Payment is submitted", {"capability": "payments"}, ("requirement-evidence",))

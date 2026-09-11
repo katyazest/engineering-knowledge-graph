@@ -156,6 +156,41 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
         self.assertEqual([item.claim_id for item in graph.trusted_cross_graph_links], [self.claim.id])
 
+    def test_trusted_projection_is_blocked_by_generic_canonical_conflict(self) -> None:
+        conflicting_subject = Node(self.subject.id, NodeKind.JIRA_STORY, "conflicting subject")
+        graph = GraphSnapshot(
+            nodes=(self.subject, conflicting_subject),
+            evidence=(self.external_evidence, self.derived_evidence),
+            provenance=(self.external, self.derived),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(self.support(),),
+            cross_graph_link_lifecycle=(self.support(observation=False),),
+        )
+
+        self.assertEqual(graph.trusted_cross_graph_links, ())
+        result = validate_graph_integrity(graph)
+        self.assertEqual(result.status, "invalid")
+        self.assertIn(
+            "duplicate-identity-conflict",
+            [item.rule_id for item in result.metadata.diagnostics],
+        )
+
+    def test_same_lifecycle_revision_conflict_is_not_resolved_by_state_order(self) -> None:
+        candidate = CrossGraphLinkLifecycle(
+            self.claim.id, 1, "candidate", self.external_evidence.id,
+            "declared", "authoritative", "explicit", "trusted",
+        )
+        trusted = CrossGraphLinkLifecycle(
+            self.claim.id, 1, "trusted", self.external_evidence.id,
+            "declared", "authoritative", "explicit", "trusted",
+        )
+        for first, second in ((candidate, trusted), (trusted, candidate)):
+            with self.subTest(first=first.state, second=second.state):
+                with self.assertRaisesRegex(ValueError, "Conflicting graph record values"):
+                    GraphSnapshot(cross_graph_link_lifecycle=(first,)).merged_with(
+                        GraphSnapshot(cross_graph_link_lifecycle=(second,))
+                    )
+
     def test_observed_and_inferred_implementation_never_project(self) -> None:
         lifecycle = self.support(origin="observed", trust="trusted", observation=False)
         observed = self.snapshot((self.support(origin="observed", trust="untrusted"),), lifecycle)
