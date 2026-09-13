@@ -105,10 +105,16 @@ class ChangedFileReference:
 
     stable_file_id: str
     file: str
+    source_evidence_id: str = ""
+    source_provenance_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stable_file_id", _safe(self.stable_file_id, "changed_file.stable_file_id", safe_identity))
         object.__setattr__(self, "file", _safe(self.file, "changed_file.file", safe_relative_file))
+        if self.source_evidence_id:
+            object.__setattr__(self, "source_evidence_id", _safe(self.source_evidence_id, "changed_file.source_evidence_id", safe_identity))
+        if self.source_provenance_id:
+            object.__setattr__(self, "source_provenance_id", _safe(self.source_provenance_id, "changed_file.source_provenance_id", safe_identity))
 
     @property
     def id(self) -> str:
@@ -117,7 +123,12 @@ class ChangedFileReference:
         return self.stable_file_id
 
     def as_dict(self) -> dict[str, str]:
-        return {"file": self.file, "stable_file_id": self.stable_file_id}
+        result = {"file": self.file, "stable_file_id": self.stable_file_id}
+        if self.source_evidence_id:
+            result["source_evidence_id"] = self.source_evidence_id
+        if self.source_provenance_id:
+            result["source_provenance_id"] = self.source_provenance_id
+        return result
 
 
 @dataclass(frozen=True)
@@ -127,18 +138,29 @@ class ImplementationEvidenceContext:
     evidence_id: str
     repository: str
     revision: str
+    source_evidence_id: str = ""
+    source_provenance_id: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_id", _safe(self.evidence_id, "evidence_id", safe_identity))
         object.__setattr__(self, "repository", _safe(self.repository, "evidence.repository", safe_repository))
         object.__setattr__(self, "revision", _safe(self.revision, "evidence.revision", safe_identity))
+        if self.source_evidence_id:
+            object.__setattr__(self, "source_evidence_id", _safe(self.source_evidence_id, "evidence.source_evidence_id", safe_identity))
+        if self.source_provenance_id:
+            object.__setattr__(self, "source_provenance_id", _safe(self.source_provenance_id, "evidence.source_provenance_id", safe_identity))
 
     def as_dict(self) -> dict[str, str]:
-        return {
+        result = {
             "evidence_id": self.evidence_id,
             "repository": self.repository,
             "revision": self.revision,
         }
+        if self.source_evidence_id:
+            result["source_evidence_id"] = self.source_evidence_id
+        if self.source_provenance_id:
+            result["source_provenance_id"] = self.source_provenance_id
+        return result
 
     @property
     def implementation_evidence_id(self) -> str:
@@ -246,7 +268,13 @@ class ProviderResolutionRequest:
         object.__setattr__(
             self,
             "changed_files",
-            tuple(ChangedFileReference(item.stable_file_id, item.file) for item in self.changed_files),
+            tuple(
+                ChangedFileReference(
+                    item.stable_file_id, item.file,
+                    item.source_evidence_id, item.source_provenance_id,
+                )
+                for item in self.changed_files
+            ),
         )
 
     def as_dict(self) -> dict[str, object]:

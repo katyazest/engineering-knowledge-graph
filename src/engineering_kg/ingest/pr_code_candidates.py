@@ -125,6 +125,8 @@ class ChangedSymbolMapping:
     symbol: str | None = None
     repository: str | None = None
     revision: str | None = None
+    source_evidence_id: str | None = None
+    source_provenance_id: str | None = None
 
     def __post_init__(self) -> None:
         mapping_id = _normalized_source_mapping_id(self.id)
@@ -160,6 +162,10 @@ class ChangedSymbolMapping:
             object.__setattr__(self, "revision", _safe_identity(self.revision, "mapping.revision"))
             if not _immutable_revision(self.revision):
                 raise PrCodeCandidateValidationError("mapping.revision must be immutable")
+        if self.source_evidence_id is not None:
+            object.__setattr__(self, "source_evidence_id", _safe_identity(self.source_evidence_id, "mapping.source_evidence_id"))
+        if self.source_provenance_id is not None:
+            object.__setattr__(self, "source_provenance_id", _safe_identity(self.source_provenance_id, "mapping.source_provenance_id"))
 
 
 @dataclass(frozen=True)
@@ -499,6 +505,20 @@ def extract_pull_request_implementation_evidence(
         all_relations.append(item.repository_relation)
         all_evidence.extend(item.evidence)
         all_provenance.extend(item.provenance)
+        evidence_by_id: dict[str, Evidence] = {}
+        conflicting_evidence_ids: set[str] = set()
+        for evidence in item.evidence:
+            previous = evidence_by_id.get(evidence.id)
+            if previous is not None and previous != evidence:
+                conflicting_evidence_ids.add(evidence.id)
+            evidence_by_id[evidence.id] = evidence
+        provenance_by_id: dict[str, ProvenanceRecord] = {}
+        conflicting_provenance_ids: set[str] = set()
+        for provenance in item.provenance:
+            previous = provenance_by_id.get(provenance.id)
+            if previous is not None and previous != provenance:
+                conflicting_provenance_ids.add(provenance.id)
+            provenance_by_id[provenance.id] = provenance
         provenance_by_mapping_id = {
             evidence.properties.get("pull_request_id"): evidence
             for evidence in item.evidence
@@ -510,7 +530,11 @@ def extract_pull_request_implementation_evidence(
                 continue
             if mapping.id in conflicting_mapping_ids:
                 continue
-            source_evidence = provenance_by_mapping_id.get(mapping.id)
+            source_evidence = (
+                evidence_by_id.get(mapping.source_evidence_id)
+                if mapping.source_evidence_id is not None
+                else provenance_by_mapping_id.get(mapping.id)
+            )
             if mapping.outcome is not MappingOutcome.RESOLVED:
                 reason = "unsupported-source-mapping" if mapping.outcome is MappingOutcome.UNSUPPORTED else f"{mapping.outcome.value}-symbol"
                 diagnostics.append(PrCodeCandidateDiagnostic(reason, item.id, mapping.id, source_evidence.id if source_evidence else ""))
@@ -527,14 +551,52 @@ def extract_pull_request_implementation_evidence(
             if source_evidence is None:
                 diagnostics.append(PrCodeCandidateDiagnostic("missing-mapping-source", item.id, mapping.id))
                 continue
+            if mapping.source_evidence_id is not None and (
+                source_evidence.id in conflicting_evidence_ids
+                or any(
+                    provenance_id in conflicting_provenance_ids
+                    for provenance_id in source_evidence.provenance_ids
+                )
+            ):
+                diagnostics.append(PrCodeCandidateDiagnostic(
+                    "invalid-mapping-source", item.id, mapping.id, source_evidence.id,
+                ))
+                continue
+            if (
+                mapping.source_provenance_id is not None
+                and mapping.source_provenance_id not in source_evidence.provenance_ids
+            ):
+                diagnostics.append(PrCodeCandidateDiagnostic(
+                    "mapping-provenance-mismatch", item.id, mapping.id, source_evidence.id,
+                ))
+                continue
             target = CodeLocator(item.pull_request.repository_id, item.pull_request.head_revision, mapping.file, mapping.symbol)
             claim = CrossGraphLinkClaim(item.association.intended_change_id, RELATION_KIND, target)
-            mapping_provenance = next(
-                (record for record in item.provenance if record.id in source_evidence.provenance_ids),
-                None,
+            mapping_provenance = (
+                next(
+                    (record for record in item.provenance if record.id == mapping.source_provenance_id),
+                    None,
+                )
+                if mapping.source_provenance_id is not None
+                else next(
+                    (record for record in item.provenance if record.id in source_evidence.provenance_ids),
+                    None,
+                )
             )
             if mapping_provenance is None:
                 diagnostics.append(PrCodeCandidateDiagnostic("missing-mapping-provenance", item.id, mapping.id, source_evidence.id))
+                continue
+            if mapping.source_evidence_id is not None and mapping.source_provenance_id in conflicting_provenance_ids:
+                diagnostics.append(PrCodeCandidateDiagnostic(
+                    "invalid-mapping-source", item.id, mapping.id, source_evidence.id,
+                ))
+                continue
+            if mapping.source_evidence_id is not None and not _is_exact_changed_file_mapping_source(
+                mapping, item.pull_request, source_evidence, mapping_provenance,
+            ):
+                diagnostics.append(PrCodeCandidateDiagnostic(
+                    "invalid-mapping-source", item.id, mapping.id, source_evidence.id,
+                ))
                 continue
             lifecycle_evidence, lifecycle_provenance = _initial_candidate_lifecycle_provenance(
                 claim, mapping_provenance
@@ -594,6 +656,56 @@ def extract_pull_request_implementation_evidence(
 def _immutable_revision(value: str) -> bool:
     """Accept only complete Git object IDs, never abbreviated references."""
     return is_immutable_revision(value)
+
+
+def _is_exact_changed_file_mapping_source(
+    mapping: ChangedSymbolMapping,
+    pull_request: PullRequestImplementationEvidence,
+    evidence: Evidence,
+    provenance: ProvenanceRecord,
+) -> bool:
+    """Do not let an explicit mapping ID borrow another file's evidence."""
+
+    if not isinstance(evidence.locator, SourceArtifactLocator):
+        return False
+    artifact = evidence.locator.source_artifact_identity
+    if artifact.artifact_type != "changed-file" or artifact.revision_or_version != pull_request.head_revision:
+        return False
+    properties = evidence.properties
+    if (
+        properties.get("source_mapping_id") != mapping.id
+        or properties.get("file") != mapping.file
+        or properties.get("pull_request_id") != pull_request.pull_request_id
+        or properties.get("repository") != pull_request.repository_id
+        or properties.get("head_revision") != pull_request.head_revision
+    ):
+        return False
+    if provenance.id not in evidence.provenance_ids:
+        return False
+    if provenance.source_artifact_identity != artifact:
+        return False
+    # Evidence properties are mutable metadata.  Bind the path to the
+    # immutable external provenance representation as well as checking the
+    # copied properties, so genuine IDs cannot be reused with a substituted
+    # file path.
+    expected_representation = json.dumps(
+        {
+            "artifact": artifact.as_dict(),
+            "context": {
+                "file": mapping.file,
+                "head_revision": pull_request.head_revision,
+                "pull_request_id": pull_request.pull_request_id,
+                "repository": pull_request.repository_id,
+                "source_mapping_id": mapping.id,
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        provenance.content_hash_algorithm == "sha256"
+        and provenance.content_hash == hashlib.sha256(expected_representation.encode()).hexdigest()
+    )
 
 
 def _observed_at(value: object) -> str:

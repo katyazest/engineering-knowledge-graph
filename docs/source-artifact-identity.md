@@ -46,6 +46,15 @@ include provider responses, source bodies, credentials, tokens, or navigation
 URLs. A display name cannot substitute for `source_identity`, and an absolute
 path cannot substitute for `stable_locator`.
 
+The reusable Bitbucket boundary follows this rule through an injected
+`BitbucketSourcePort`. Its PR artifact is revision-bounded by the exact head
+commit, its observed repository relation and structured declarations each have
+separate source/provenance references, and changed-file observations remain
+ephemeral inputs to the OpenLore bridge. The live `bitbucket-mcp` pipeline
+placeholder remains unconfigured; no network acquisition is added to ordinary
+pipeline runs. Textual PR metadata and changed paths cannot infer traceability
+or implementation.
+
 ## Persistence and legacy evidence
 
 Persistence coalesces compatible records with the same source-artifact ID and
