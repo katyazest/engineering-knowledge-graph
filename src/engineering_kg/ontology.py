@@ -206,6 +206,7 @@ _NAVIGATION_DETAIL_SCHEMA = {
 _SOURCE_ARTIFACT_EVIDENCE_METADATA_SCHEMA = {
     "association_id": str,
     "base_revision": str,
+    "file": str,
     "head_revision": str,
     "merged_revision": str,
     "pull_request_id": str,

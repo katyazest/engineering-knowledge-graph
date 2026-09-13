@@ -59,7 +59,17 @@ and line ranges are navigation detail, not identity. See
 contract and legacy migration diagnostic.
 
 ## Pipeline
-Workspace Registry → Workspace OpenLore → OpenSpec Store → Jira MCP → Bitbucket MCP → Normalize → LadybugDB-compatible local store → Derive → Validate → MCP queries
+Workspace Registry → Workspace OpenLore → OpenSpec Store → Jira MCP (external placeholder) → Bitbucket MCP (external placeholder) → Normalize → LadybugDB-compatible local store → Derive → Validate → MCP queries
+
+`engineering_kg.ingest.bitbucket` is a reusable source boundary, not a configured
+pipeline stage. A caller supplies one selected PR through its injected
+`BitbucketSourcePort`; the adapter emits only merged, immutable base/head,
+head-bounded source evidence for an existing repository, exact structured
+declarations, and provenance-complete changed-file handoff inputs. It does not
+discover PRs, call MCP, retain payloads or URLs, parse diffs, infer symbols, or
+emit implementation claims. Changed-file observations are handed explicitly to
+the existing OpenLore bridge, while exact bridge outcomes remain subject to the
+existing candidate and trust boundaries.
 
 ## Index lifecycle
 Developer → OpenLore workspace analysis → Requirements repo validates configured workspace layout → EKG pipeline
