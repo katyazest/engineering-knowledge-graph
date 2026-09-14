@@ -20,7 +20,7 @@ from engineering_kg.ontology import (
     ProvenanceRecord,
     SourceArtifactIdentity,
 )
-from engineering_kg.relationship_vocabulary import CATALOG_REVISION, catalog_as_dict
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION, catalog_as_dict, relationship_error
 from engineering_kg.validation import validate_graph_integrity
 
 
@@ -29,7 +29,7 @@ class RelationshipVocabularyTest(unittest.TestCase):
         catalog = catalog_as_dict()
         self.assertEqual(catalog["revision"], CATALOG_REVISION)
         self.assertEqual([item["kind"] for item in catalog["relationships"]], [
-            "contains", "traces_to", "implements", "verified_by", "touches",
+            "contains", "traces_to", "implements", "verified_by", "executed_in", "validates", "touches",
             "depends_on", "references", "owned_by", "provides",
         ])
         self.assertEqual(
@@ -121,6 +121,12 @@ class RelationshipVocabularyTest(unittest.TestCase):
             [item.rule_id for item in missing_provenance.metadata.diagnostics],
             ["relationship-provenance-complete"],
         )
+
+    def test_pull_request_can_implement_a_code_locator(self) -> None:
+        pull_request = Node("pull-request", NodeKind.PULL_REQUEST, "pull request")
+        locator = CodeLocator("repo", "revision", "src/app.py", "app.run")
+
+        self.assertIsNone(relationship_error("implements", pull_request, locator))
 
     def test_references_rejects_noncanonical_endpoint_kinds(self) -> None:
         source = Node("source", "unrecognized-source", "source")

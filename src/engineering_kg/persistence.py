@@ -35,6 +35,7 @@ from engineering_kg.ontology import (
     ProvenanceKind,
     evidence_requires_source_artifact_identity,
     source_artifact_identity_error,
+    verification_payload_error,
     EdgeKind,
     GraphMergeConflict,
     GraphMergeConflictError,
@@ -62,14 +63,22 @@ FORBIDDEN_PERSISTENCE_FIELDS = frozenset(
         "credentials",
         "dependency_graph",
         "external_api_response",
+        "framework",
         "function_body",
+        "log",
+        "logs",
         "openlore_analysis",
+        "outcome",
         "page_content",
         "page_url",
         "source_code",
+        "test_output",
         "token",
         "tokens",
         "url",
+        "coverage",
+        "provider_payload",
+        "ci_payload",
     }
 )
 
@@ -166,6 +175,8 @@ class LadybugDbStore:
 
     def write_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         try:
+            if error := verification_payload_error(snapshot):
+                raise PersistenceIntegrityError(error)
             current = _snapshot_from_data(
                 self._migrate_raw_if_needed(self._read_raw())
             )
@@ -387,6 +398,7 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, in
             evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id),
             item.origin, item.status, item.confidence, item.trust_disposition,
             item.pull_request_evidence_id, item.declared_association_id,
+            item.verification_evidence_id,
         ) for item in snapshot.cross_graph_link_evidence),
         cross_graph_link_lifecycle=tuple(CrossGraphLinkLifecycle(
             item.claim_id, item.revision, item.state,
@@ -596,6 +608,7 @@ def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
         merged["pull_request_observed_repository_relations"][item.id] = item.as_dict()
         merged["pull_request_observed_repository_relation_order"].append(item.id)
 
+    _reject_forbidden_fields(merged)
     return merged
 
 
@@ -670,11 +683,14 @@ def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = Fals
             _expect_string_tuple(data.get("pull_request_observed_repository_relation_order", []), "pull_request_observed_repository_relation_order"),
         )
     )
-    snapshot = GraphSnapshot(
-        nodes, edges, evidence, claims, observations, lifecycle, provenance,
-        pull_request_evidence, associations, repository_relations,
-        allow_legacy_evidence=allow_legacy_evidence,
-    )
+    try:
+        snapshot = GraphSnapshot(
+            nodes, edges, evidence, claims, observations, lifecycle, provenance,
+            pull_request_evidence, associations, repository_relations,
+            allow_legacy_evidence=allow_legacy_evidence,
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
     if not allow_legacy_evidence:
         _validate_snapshot(snapshot)
     return snapshot
@@ -698,16 +714,27 @@ def _ordered_records(records: dict[str, Any], order: tuple[str, ...]) -> list[di
 
 
 def _node_from_dict(data: dict[str, Any]) -> Node:
-    return Node(
-        id=_expect_string(data.get("id"), "node.id"),
-        kind=_expect_string(data.get("kind"), "node.kind"),
-        name=_expect_string(data.get("name"), "node.name"),
-        properties=dict(_expect_mapping(data.get("properties", {}), "node.properties")),
-        evidence_ids=tuple(_expect_string_tuple(data.get("evidence_ids", []), "node.evidence_ids")),
+    _expect_allowed_record_keys(
+        set(data), {"evidence_ids", "id", "kind", "name", "properties"}, "node",
     )
+    try:
+        return Node(
+            id=_expect_string(data.get("id"), "node.id"),
+            kind=_expect_string(data.get("kind"), "node.kind"),
+            name=_expect_string(data.get("name"), "node.name"),
+            properties=dict(_expect_mapping(data.get("properties", {}), "node.properties")),
+            evidence_ids=tuple(_expect_string_tuple(data.get("evidence_ids", []), "node.evidence_ids")),
+        )
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
 
 
 def _edge_from_dict(data: dict[str, Any]) -> Edge:
+    _expect_allowed_record_keys(
+        set(data),
+        {"confidence", "evidence_ids", "id", "kind", "properties", "source_id", "target_id"},
+        "edge",
+    )
     return Edge(
         id=_expect_string(data.get("id"), "edge.id"),
         kind=_expect_string(data.get("kind"), "edge.kind"),
@@ -775,6 +802,15 @@ def _cross_graph_link_claim_from_dict(data: dict[str, Any]) -> CrossGraphLinkCla
 
 
 def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLinkEvidence:
+    _expect_allowed_record_keys(
+        set(data),
+        {
+            "claim_id", "confidence", "id", "observation_id", "origin",
+            "provenance_evidence_id", "status", "strategy_id", "trust_disposition",
+            "pull_request_evidence_id", "declared_association_id", "verification_evidence_id",
+        },
+        "cross_graph_link_evidence",
+    )
     if data.get("strategy_id") == "pr-code-candidate-extraction" and (
         data.get("pull_request_evidence_id") is None
         or data.get("declared_association_id") is None
@@ -794,6 +830,7 @@ def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLink
             _expect_string(data.get("trust_disposition"), "cross_graph_link_evidence.trust_disposition"),
             _expect_optional_string(data.get("pull_request_evidence_id"), "cross_graph_link_evidence.pull_request_evidence_id"),
             _expect_optional_string(data.get("declared_association_id"), "cross_graph_link_evidence.declared_association_id"),
+            _expect_optional_string(data.get("verification_evidence_id"), "cross_graph_link_evidence.verification_evidence_id"),
         )
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
@@ -958,8 +995,24 @@ def _expect_allowed_locator_keys(
         )
 
 
+def _expect_allowed_record_keys(
+    keys: set[str], allowed_keys: set[str], context: str,
+) -> None:
+    unknown_keys = sorted(keys - allowed_keys)
+    if unknown_keys:
+        raise PersistenceIntegrityError(
+            f"{context}.{unknown_keys[0]} is not allowed"
+        )
+
+
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
-    _reject_forbidden_fields(snapshot.as_dict())
+    if error := verification_payload_error(snapshot):
+        raise PersistenceIntegrityError(error)
+    try:
+        serialized = snapshot.as_dict()
+    except ValueError as exc:
+        raise PersistenceIntegrityError(str(exc)) from exc
+    _reject_forbidden_fields(serialized)
     validation = validate_graph_integrity(snapshot)
     errors = [item for item in validation.metadata.diagnostics if item.severity == "error"]
     if errors:
@@ -970,12 +1023,25 @@ def _reject_forbidden_fields(value: Any, path: str = "graph") -> None:
     if isinstance(value, dict):
         for key, nested in value.items():
             key_text = str(key)
-            if key_text in FORBIDDEN_PERSISTENCE_FIELDS:
+            if _is_forbidden_persistence_field(key_text):
                 raise PersistenceIntegrityError(f"{path}.{key_text} is not allowed in persistence")
             _reject_forbidden_fields(nested, f"{path}.{key_text}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             _reject_forbidden_fields(item, f"{path}[{index}]")
+
+
+def _is_forbidden_persistence_field(key: str) -> bool:
+    """Reject provider/framework/CI payload containers, including variants."""
+    folded = key.casefold().replace("-", "_")
+    normalized = "".join(
+        f"_{character.lower()}" if character.isupper() else character
+        for character in key
+    ).replace("-", "_").casefold()
+    tokens = set(folded.split("_")) | set(normalized.split("_"))
+    return folded in {field.casefold() for field in FORBIDDEN_PERSISTENCE_FIELDS} or bool(
+        tokens.intersection({"provider", "framework", "ci"})
+    )
 
 
 def _expect_mapping(value: Any, context: str) -> dict[str, Any]:

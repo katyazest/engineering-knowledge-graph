@@ -29,6 +29,10 @@ class NodeKind(StrEnum):
     OPENSPEC_ACTIVE_CHANGE = "openspec-active-change"
     OPENSPEC_ARCHIVED_CHANGE = "openspec-archived-change"
     OPENSPEC_ARTIFACT = "openspec-artifact"
+    TEST_CASE = "test_case"
+    TEST_SUITE = "test_suite"
+    TEST_RUN = "test_run"
+    VERIFICATION_EVIDENCE = "verification_evidence"
 
 
 class EdgeKind(StrEnum):
@@ -37,6 +41,8 @@ class EdgeKind(StrEnum):
     IMPLEMENTS = "implements"
     TRACES_TO = "traces_to"
     VERIFIED_BY = "verified_by"
+    EXECUTED_IN = "executed_in"
+    VALIDATES = "validates"
     TOUCHES = "touches"
     REFERENCES = "references"
     OWNED_BY = "owned_by"
@@ -78,6 +84,99 @@ def openspec_scenario_id(requirement_id: str, scenario_key: str) -> str:
     """Return the source-independent ID for an OpenSpec-backed scenario."""
 
     return stable_id("node", NodeKind.SCENARIO, requirement_id, scenario_key)
+
+
+_VERIFICATION_KEY_BY_KIND = {
+    NodeKind.TEST_CASE.value: "test_case_key",
+    NodeKind.TEST_SUITE.value: "test_suite_key",
+    NodeKind.TEST_RUN.value: "test_run_key",
+    NodeKind.VERIFICATION_EVIDENCE.value: "verification_evidence_key",
+}
+
+
+def _payload_safe_verification_identifier(value: object, field_name: str) -> str:
+    """Validate the compact, provider-neutral identity of a verification fact."""
+
+    try:
+        text = _required_text(value, field_name).strip()
+    except ValueError as exc:
+        raise ValueError(f"invalid-verification-identity: {field_name}") from exc
+    if (
+        len(text) > 256
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text)
+        or "/" in text
+        or "\\" in text
+        or _UNSAFE_IDENTITY_RE.search(text)
+    ):
+        raise ValueError(f"invalid-verification-identity: {field_name}")
+    return text
+
+
+def verification_node_identity(
+    kind: NodeKind | str, verification_scope_id: str, kind_specific_key: str,
+) -> tuple[str, str, str]:
+    """Return the stable identity tuple for one source-neutral verification fact."""
+
+    kind_value = getattr(kind, "value", kind)
+    key_name = _VERIFICATION_KEY_BY_KIND.get(kind_value)
+    if key_name is None:
+        raise ValueError("invalid-verification-kind")
+    scope = _payload_safe_verification_identifier(verification_scope_id, "verification_scope_id")
+    key = _payload_safe_verification_identifier(kind_specific_key, key_name)
+    return kind_value, scope, key
+
+
+def verification_node_id(
+    kind: NodeKind | str, verification_scope_id: str, kind_specific_key: str,
+) -> str:
+    """Return the deterministic ID for a verification node."""
+
+    kind_value, scope, key = verification_node_identity(kind, verification_scope_id, kind_specific_key)
+    return stable_id("node", kind_value, scope, key)
+
+
+def verification_node(
+    kind: NodeKind | str,
+    verification_scope_id: str,
+    kind_specific_key: str,
+    evidence_ids: tuple[str, ...] = (),
+) -> Node:
+    """Construct a payload-free canonical verification node.
+
+    Provider display values intentionally are not accepted by this factory. The
+    stable opaque key is both the generic node name and the only retained
+    identity property besides the verification scope.
+    """
+
+    kind_value, scope, key = verification_node_identity(kind, verification_scope_id, kind_specific_key)
+    return Node(
+        verification_node_id(kind_value, scope, key),
+        kind_value,
+        key,
+        {"verification_scope_id": scope, _VERIFICATION_KEY_BY_KIND[kind_value]: key},
+        tuple(sorted(set(evidence_ids))),
+    )
+
+
+def verification_identity_error(node: Node) -> str | None:
+    """Return a deterministic natural-key diagnostic for a verification node."""
+
+    kind_value = getattr(node.kind, "value", node.kind)
+    key_name = _VERIFICATION_KEY_BY_KIND.get(kind_value)
+    if key_name is None:
+        return None
+    properties = node.properties
+    if not isinstance(properties, dict):
+        return "verification-natural-key-properties"
+    if set(properties) != {"verification_scope_id", key_name}:
+        return "verification-natural-key-properties"
+    try:
+        expected = verification_node_id(kind_value, properties["verification_scope_id"], properties[key_name])
+    except (KeyError, TypeError, ValueError):
+        return "verification-natural-key-identity"
+    if not isinstance(node.name, str) or node.id != expected or node.name != properties[key_name]:
+        return "verification-natural-key-identity"
+    return None
 
 
 def _normalize_identity_part(part: object) -> str:
@@ -564,17 +663,22 @@ def cross_graph_link_evidence_id(
     confidence: str, trust_disposition: CrossGraphTrustDisposition | str,
     pull_request_evidence_id: str | None = None,
     declared_association_id: str | None = None,
+    verification_evidence_id: str | None = None,
 ) -> str:
     """Return the stable identity of one attributable link observation."""
 
     scope = (pull_request_evidence_id, declared_association_id) if pull_request_evidence_id is not None else ()
+    verification_scope = (
+        "verification", _required_text(verification_evidence_id, "verification_evidence_id"),
+    ) if verification_evidence_id is not None else ()
     return stable_id(
         "cross-graph-link-evidence",
         _required_text(claim_id, "claim_id"),
         _payload_safe_opaque_identifier(strategy_id, "strategy_id"),
         _payload_safe_opaque_identifier(observation_id, "observation_id"),
         _required_text(provenance_evidence_id, "provenance_evidence_id"),
-        *_classified_support_values(origin, status, confidence, trust_disposition), *scope,
+        *_classified_support_values(origin, status, confidence, trust_disposition),
+        *scope, *verification_scope,
     )
 
 
@@ -628,6 +732,7 @@ class CrossGraphLinkEvidence:
     trust_disposition: CrossGraphTrustDisposition | str
     pull_request_evidence_id: str | None = None
     declared_association_id: str | None = None
+    verification_evidence_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.claim_id, "claim_id")
@@ -640,13 +745,22 @@ class CrossGraphLinkEvidence:
             _payload_safe_opaque_identifier(self.observation_id, "observation_id"),
         )
         _required_text(self.provenance_evidence_id, "provenance_evidence_id")
-        for field_name in ("pull_request_evidence_id", "declared_association_id"):
+        for field_name in (
+            "pull_request_evidence_id", "declared_association_id", "verification_evidence_id",
+        ):
             value = getattr(self, field_name)
             if value is not None:
                 object.__setattr__(
                     self, field_name,
                     _payload_safe_opaque_identifier(value, field_name),
                 )
+        if self.verification_evidence_id is not None:
+            object.__setattr__(
+                self, "verification_evidence_id",
+                _payload_safe_opaque_identifier(
+                    self.verification_evidence_id, "verification_evidence_id",
+                ),
+            )
         if (self.pull_request_evidence_id is None) != (self.declared_association_id is None):
             raise ValueError(
                 "PR-scoped cross-graph evidence requires pull_request_evidence_id "
@@ -684,15 +798,17 @@ class CrossGraphLinkEvidence:
                 self.provenance_evidence_id, self.origin, self.status,
                 self.confidence, self.trust_disposition,
                 self.pull_request_evidence_id, self.declared_association_id,
+                self.verification_evidence_id,
             )
         except ValueError:
             return stable_id(
                 "cross-graph-link-evidence", self.claim_id, self.strategy_id,
-                self.observation_id, self.provenance_evidence_id, self.origin,
-                self.status, self.confidence, self.trust_disposition,
+                 self.observation_id, self.provenance_evidence_id, self.origin,
+                 self.status, self.confidence, self.trust_disposition,
                 *(() if self.pull_request_evidence_id is None else (
                     self.pull_request_evidence_id, self.declared_association_id,
                 )),
+                *(() if self.verification_evidence_id is None else (self.verification_evidence_id,)),
             )
 
     def as_dict(self) -> dict[str, str]:
@@ -703,12 +819,15 @@ class CrossGraphLinkEvidence:
             self.provenance_evidence_id, self.origin, self.status,
             self.confidence, self.trust_disposition,
             self.pull_request_evidence_id, self.declared_association_id,
+            self.verification_evidence_id,
         )
         result = {"claim_id": validated.claim_id, "confidence": validated.confidence, "id": validated.id, "observation_id": validated.observation_id, "origin": validated.origin.value, "provenance_evidence_id": validated.provenance_evidence_id, "status": validated.status.value, "strategy_id": validated.strategy_id, "trust_disposition": validated.trust_disposition.value}
         if validated.pull_request_evidence_id is not None:
             result["pull_request_evidence_id"] = validated.pull_request_evidence_id
         if validated.declared_association_id is not None:
             result["declared_association_id"] = validated.declared_association_id
+        if validated.verification_evidence_id is not None:
+            result["verification_evidence_id"] = validated.verification_evidence_id
         return result
 
 
@@ -1192,6 +1311,61 @@ class Edge:
         return data
 
 
+def verification_payload_error(snapshot: GraphSnapshot) -> str | None:
+    """Return a safe diagnostic for non-canonical verification payloads.
+
+    Verification records deliberately have no extensible property bag.  The
+    adapter boundary may retain provider/framework metadata, but canonical
+    verification nodes, edges, and their attached evidence retain only the
+    generic identity and provenance fields represented by this ontology.
+    """
+
+    verification_node_ids = {
+        node.id for node in snapshot.nodes
+        if getattr(node.kind, "value", node.kind) in _VERIFICATION_KEY_BY_KIND
+    }
+    restricted_edges: list[Edge] = []
+    for edge in snapshot.edges:
+        kind = getattr(edge.kind, "value", edge.kind)
+        if kind in {
+            EdgeKind.VERIFIED_BY.value,
+            EdgeKind.EXECUTED_IN.value,
+            EdgeKind.VALIDATES.value,
+        } or edge.source_id in verification_node_ids or edge.target_id in verification_node_ids:
+            restricted_edges.append(edge)
+
+    seen_edge_ids: set[str] = set()
+    for edge in restricted_edges:
+        if edge.id in seen_edge_ids:
+            continue
+        seen_edge_ids.add(edge.id)
+        if not isinstance(edge.properties, dict) or edge.properties:
+            return f"verification-payload-boundary: edge {edge.id} has non-canonical properties"
+
+    verification_evidence_ids = {
+        evidence_id
+        for node in snapshot.nodes
+        if node.id in verification_node_ids
+        for evidence_id in node.evidence_ids
+    }
+    verification_evidence_ids.update(
+        evidence_id for edge in restricted_edges for evidence_id in edge.evidence_ids
+    )
+    for evidence in snapshot.evidence:
+        if evidence.id not in verification_evidence_ids:
+            continue
+        if not isinstance(evidence.properties, dict) or evidence.properties:
+            return f"verification-payload-boundary: evidence {evidence.id} has non-canonical properties"
+        locator = evidence.locator
+        navigation_detail = getattr(locator, "navigation_detail", None)
+        if navigation_detail is not None:
+            try:
+                _validate_navigation_detail(navigation_detail)
+            except ValueError:
+                return f"verification-payload-boundary: evidence {evidence.id} has non-canonical locator metadata"
+    return None
+
+
 def pull_request_projection_edge(
     pull_request: PullRequestImplementationEvidence,
     relation: PullRequestDeclaredAssociation | PullRequestObservedRepositoryRelation,
@@ -1231,12 +1405,21 @@ class GraphSnapshot:
     allow_legacy_evidence: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for item in self.nodes:
+            if getattr(item.kind, "value", item.kind) in _VERIFICATION_KEY_BY_KIND:
+                if error := verification_identity_error(item):
+                    raise ValueError(f"invalid-verification-identity: {item.id}: {error}")
+                if not item.evidence_ids:
+                    raise ValueError(
+                        f"invalid-verification-provenance: verification node lacks evidence: {item.id}"
+                    )
         for item in self.cross_graph_link_evidence:
             CrossGraphLinkEvidence(
                 item.claim_id, item.strategy_id, item.observation_id,
                 item.provenance_evidence_id, item.origin, item.status,
                 item.confidence, item.trust_disposition,
                 item.pull_request_evidence_id, item.declared_association_id,
+                item.verification_evidence_id,
             )
         for item in self.cross_graph_link_lifecycle:
             CrossGraphLinkLifecycle(
@@ -1283,6 +1466,27 @@ class GraphSnapshot:
                     item, {record.id: record for record in self.provenance}
                 ):
                     raise ValueError(f"invalid-provenance: {error}")
+        evidence_by_id = {item.id: item for item in self.evidence}
+        provenance_by_id = {item.id: item for item in self.provenance}
+        for node in self.nodes:
+            if getattr(node.kind, "value", node.kind) not in _VERIFICATION_KEY_BY_KIND:
+                continue
+            if any(
+                evidence_id not in evidence_by_id
+                or not _has_complete_provenance(evidence_by_id[evidence_id], provenance_by_id)
+                for evidence_id in node.evidence_ids
+            ):
+                raise ValueError(
+                    f"invalid-verification-provenance: incomplete evidence: {node.id}"
+                )
+        claims_by_id = {item.id: item for item in self.cross_graph_link_claims}
+        for support in self.cross_graph_link_evidence:
+            if support.verification_evidence_id is not None:
+                _validate_verification_support_reference(
+                    support, claims_by_id.get(support.claim_id),
+                    {item.id: item for item in self.nodes}, self.edges,
+                    evidence_by_id, provenance_by_id,
+                )
         object.__setattr__(self, "cross_graph_link_claims", tuple(sorted(self.cross_graph_link_claims, key=lambda item: item.id)))
         object.__setattr__(self, "provenance", tuple(sorted(self.provenance, key=lambda item: item.id)))
         object.__setattr__(self, "cross_graph_link_evidence", tuple(sorted(self.cross_graph_link_evidence, key=lambda item: item.id)))
@@ -1387,9 +1591,29 @@ class GraphSnapshot:
                     if entry.claim_id == claim.id
                 ),
             )
+            and _trusted_claim_has_valid_verification_support(
+                claim, tuple(evidence_by_claim.get(claim.id, ())), self.nodes, self.edges,
+                evidence_by_id, provenance_by_id,
+                tuple(
+                    entry for entry in self.cross_graph_link_lifecycle
+                    if entry.claim_id == claim.id
+                ),
+            )
         )
 
     def as_dict(self) -> dict[str, Any]:
+        if error := verification_payload_error(self):
+            raise ValueError(error)
+        claims_by_id = {item.id: item for item in self.cross_graph_link_claims}
+        nodes_by_id = {item.id: item for item in self.nodes}
+        evidence_by_id = {item.id: item for item in self.evidence}
+        provenance_by_id = {item.id: item for item in self.provenance}
+        for support in self.cross_graph_link_evidence:
+            if support.verification_evidence_id is not None:
+                _validate_verification_support_reference(
+                    support, claims_by_id.get(support.claim_id), nodes_by_id,
+                    self.edges, evidence_by_id, provenance_by_id,
+                )
         return {
             "edge_count": self.edge_count,
             "edges": [_serialize_value(edge) for edge in self.edges],
@@ -1526,6 +1750,7 @@ def _validate_cross_graph_claim_references(
     node_by_id = {node.id: node for node in nodes}
     node_ids = set(node_by_id)
     claim_ids = {claim.id for claim in claims}
+    claims_by_id = {claim.id: claim for claim in claims}
     evidence_ids = {item.id for item in evidence}
     provenance_ids = {item.id for item in provenance}
     for item in evidence:
@@ -1680,6 +1905,11 @@ def _validate_cross_graph_claim_references(
             evidence_by_id[observation.provenance_evidence_id], provenance_by_id
         ):
             raise ValueError(f"Cross-graph evidence requires complete provenance: {observation.id}")
+        if observation.verification_evidence_id is not None:
+            _validate_verification_support_reference(
+                observation, claims_by_id.get(observation.claim_id), node_by_id,
+                edges, evidence_by_id, provenance_by_id,
+            )
         if observation.pull_request_evidence_id is not None:
             pr = pull_requests.get(observation.pull_request_evidence_id)
             association = association_by_id.get(observation.declared_association_id or "")
@@ -1827,6 +2057,131 @@ def _trusted_claim_has_eligible_evidence(
     return eligible_for_trusted_cross_graph_projection(
         claim, observations, lifecycle, lifecycle_support
     )
+
+
+def _validate_verification_support_reference(
+    support: CrossGraphLinkEvidence,
+    claim: CrossGraphLinkClaim | None,
+    nodes_by_id: dict[str, Node],
+    edges: tuple[Edge, ...],
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> None:
+    """Validate the graph binding of a verification-cited support record."""
+
+    if claim is None:
+        raise ValueError(f"verification-support-claim-exists: {support.id}")
+    if claim.relation_kind != EdgeKind.VERIFIED_BY.value:
+        raise ValueError(f"verification-support-relation-kind: {support.id}")
+    subject = nodes_by_id.get(claim.subject_id)
+    if subject is None:
+        raise ValueError(f"verification-support-subject-exists: {support.id}")
+    from engineering_kg.relationship_vocabulary import relationship_error
+    if error := relationship_error(claim.relation_kind, subject, claim.target):
+        raise ValueError(
+            f"verification-support-claim-endpoint-contract: {support.id}: {error}"
+        )
+    if support.verification_evidence_id not in nodes_by_id:
+        raise ValueError(
+            f"verification-support-reference-kind: absent verification evidence: {support.id}"
+        )
+    verification = nodes_by_id[support.verification_evidence_id]
+    if getattr(verification.kind, "value", verification.kind) != NodeKind.VERIFICATION_EVIDENCE.value:
+        raise ValueError(
+            f"verification-support-reference-kind: referenced node is not VERIFICATION_EVIDENCE: {support.id}"
+        )
+    if not verification.evidence_ids or any(
+        evidence_id not in evidence_by_id
+        or not _has_complete_provenance(evidence_by_id[evidence_id], provenance_by_id)
+        for evidence_id in verification.evidence_ids
+    ):
+        raise ValueError(
+            f"verification-support-provenance-complete: {support.id}"
+        )
+    validating_edges = tuple(
+        edge for edge in edges
+        if edge.source_id == support.verification_evidence_id
+        and edge.target_id == claim.subject_id
+        and getattr(edge.kind, "value", edge.kind) == EdgeKind.VALIDATES.value
+    )
+    if not validating_edges:
+        raise ValueError(f"verification-support-validates-subject: {support.id}")
+    for edge in validating_edges:
+        error = relationship_error(
+            edge.kind, nodes_by_id.get(edge.source_id), nodes_by_id.get(edge.target_id)
+        )
+        if error:
+            raise ValueError(
+                f"verification-support-validates-endpoint-contract: {support.id}: {error}"
+            )
+    if any(
+        not edge.evidence_ids
+        or any(
+            evidence_id not in evidence_by_id
+            or not _has_complete_provenance(evidence_by_id[evidence_id], provenance_by_id)
+            for evidence_id in edge.evidence_ids
+        )
+        for edge in validating_edges
+    ):
+        raise ValueError(f"verification-support-validates-provenance: {support.id}")
+
+
+def _trusted_claim_has_valid_verification_support(
+    claim: CrossGraphLinkClaim,
+    observations: tuple[CrossGraphLinkEvidence, ...],
+    nodes: tuple[Node, ...],
+    edges: tuple[Edge, ...],
+    evidence_by_id: dict[str, Evidence],
+    provenance_by_id: dict[str, ProvenanceRecord],
+    lifecycle_support: tuple[CrossGraphLinkLifecycle, ...] = (),
+) -> bool:
+    if claim.relation_kind == EdgeKind.IMPLEMENTS.value:
+        # A support record can be verification-derived even when it omits the
+        # explicit verification_evidence_id. Treat evidence attached to any
+        # verification fact or relation as ineligible implementation proof.
+        verification_associated_evidence_ids = {
+            evidence_id
+            for node in nodes
+            if getattr(node.kind, "value", node.kind) in _VERIFICATION_KEY_BY_KIND
+            for evidence_id in node.evidence_ids
+        }
+        verification_node_ids = {
+            node.id
+            for node in nodes
+            if getattr(node.kind, "value", node.kind) in _VERIFICATION_KEY_BY_KIND
+        }
+        for edge in edges:
+            edge_kind = getattr(edge.kind, "value", edge.kind)
+            if (
+                edge.source_id in verification_node_ids
+                or edge.target_id in verification_node_ids
+                or edge_kind in {
+                    EdgeKind.VERIFIED_BY.value,
+                    EdgeKind.EXECUTED_IN.value,
+                    EdgeKind.VALIDATES.value,
+                }
+            ):
+                verification_associated_evidence_ids.update(edge.evidence_ids)
+        if any(
+            support.provenance_evidence_id in verification_associated_evidence_ids
+            for support in (*observations, *lifecycle_support)
+        ):
+            return False
+
+    references = [item for item in observations if item.verification_evidence_id is not None]
+    if not references:
+        return True
+    if claim.relation_kind != EdgeKind.VERIFIED_BY.value:
+        return False
+    nodes_by_id = {item.id: item for item in nodes}
+    for support in references:
+        try:
+            _validate_verification_support_reference(
+                support, claim, nodes_by_id, edges, evidence_by_id, provenance_by_id,
+            )
+        except ValueError:
+            return False
+    return True
 
 
 @dataclass(frozen=True)

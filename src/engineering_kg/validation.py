@@ -31,6 +31,9 @@ from engineering_kg.ontology import (
     pull_request_relation_provenance_error,
     provenance_association_error,
     source_artifact_identity_error,
+    verification_identity_error,
+    verification_node_id,
+    verification_payload_error,
     openspec_requirement_id,
     openspec_scenario_id,
     openspec_specification_id,
@@ -142,6 +145,12 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
     diagnostics.extend(_evidence_reference_diagnostics(snapshot, evidence_by_id))
     diagnostics.extend(_retired_vocabulary_diagnostics(snapshot))
     diagnostics.extend(_canonical_identity_diagnostics(snapshot.nodes))
+    if error := verification_payload_error(snapshot):
+        diagnostics.append(GraphValidationDiagnostic(
+            "error", "verification-payload-boundary", _verification_payload_object_id(error),
+            "Verification records contain non-canonical provider payload fields.",
+        ))
+    diagnostics.extend(_verification_provenance_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_relationship_vocabulary_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
@@ -499,7 +508,7 @@ def _duplicate_conflict_diagnostics(
         # Classified support that bypassed frozen construction must be
         # diagnosed by _classified_support_diagnostics, not serialized while
         # checking duplicate identities.
-        if collection in {"cross-graph-link-evidence", "cross-graph-link-lifecycle"}:
+        if collection in {"evidence", "cross-graph-link-evidence", "cross-graph-link-lifecycle"}:
             return []
         raise
     return [
@@ -543,6 +552,11 @@ def _cross_graph_link_diagnostics(
             evidence_by_id[observation.provenance_evidence_id], provenance_by_id
         ):
             diagnostics.append(_cross_error("cross-graph-provenance-complete", observation.id, "Cross-graph evidence requires complete resolvable first-class provenance."))
+        if observation.verification_evidence_id is not None:
+            diagnostics.extend(_verification_support_diagnostics(
+                observation, claims_by_id.get(observation.claim_id), nodes_by_id,
+                snapshot.edges, evidence_by_id, provenance_by_id,
+            ))
     revisions: dict[tuple[str, int], CrossGraphLinkLifecycle] = {}
     lifecycle_claims: set[str] = set()
     latest_lifecycle: dict[str, CrossGraphLinkLifecycle] = {}
@@ -606,9 +620,10 @@ def _classified_support_diagnostics(
         if isinstance(support, CrossGraphLinkEvidence):
             CrossGraphLinkEvidence(support.claim_id, support.strategy_id, support.observation_id,
                                    support.provenance_evidence_id, support.origin, support.status,
-                                   support.confidence, support.trust_disposition,
-                                   support.pull_request_evidence_id,
-                                   support.declared_association_id)
+                                    support.confidence, support.trust_disposition,
+                                    support.pull_request_evidence_id,
+                                    support.declared_association_id,
+                                    support.verification_evidence_id)
         else:
             CrossGraphLinkLifecycle(support.claim_id, support.revision, support.state,
                                     support.provenance_evidence_id, support.origin, support.status,
@@ -676,6 +691,14 @@ def _complete_code_locator(value: object) -> bool:
 
 def _cross_error(rule_id: str, object_id: str, message: str) -> GraphValidationDiagnostic:
     return GraphValidationDiagnostic("error", rule_id, object_id, message)
+
+
+def _verification_payload_object_id(error: str) -> str:
+    """Extract only the safe graph-record ID from a payload-boundary error."""
+    parts = error.split()
+    if len(parts) >= 3 and parts[1] in {"edge", "evidence"}:
+        return parts[2]
+    return "verification-payload"
 
 
 def _traceability_shape_diagnostics(
@@ -772,6 +795,17 @@ def _canonical_identity_diagnostics(nodes: tuple[Node, ...]) -> list[GraphValida
             expected = _requirement_id(properties)
         elif kind == NodeKind.SCENARIO.value:
             expected = _scenario_id(properties)
+        elif kind in {
+            NodeKind.TEST_CASE.value, NodeKind.TEST_SUITE.value,
+            NodeKind.TEST_RUN.value, NodeKind.VERIFICATION_EVIDENCE.value,
+        }:
+            if error := verification_identity_error(node):
+                diagnostics.append(GraphValidationDiagnostic(
+                    "error", "verification-natural-key-identity", node.id,
+                    f"Verification node identity is invalid: {error}.",
+                ))
+                continue
+            expected = node.id
         else:
             continue
         if expected is None or node.id != expected:
@@ -783,6 +817,107 @@ def _canonical_identity_diagnostics(nodes: tuple[Node, ...]) -> list[GraphValida
                     message="Canonical node ID does not match its required natural-key properties.",
                 )
             )
+    return diagnostics
+
+
+def _verification_provenance_diagnostics(
+    snapshot: GraphSnapshot,
+    nodes_by_id: dict[str, Node],
+    evidence_by_id: dict[str, object],
+) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
+    verification_kinds = {
+        NodeKind.TEST_CASE.value, NodeKind.TEST_SUITE.value,
+        NodeKind.TEST_RUN.value, NodeKind.VERIFICATION_EVIDENCE.value,
+    }
+    for node in sorted(snapshot.nodes, key=lambda item: item.id):
+        if _value(node.kind) not in verification_kinds:
+            continue
+        if not node.evidence_ids:
+            diagnostics.append(_cross_error(
+                "verification-provenance-complete", node.id,
+                "Verification nodes require complete source evidence and provenance.",
+            ))
+            continue
+        if any(
+            evidence_by_id.get(evidence_id) is None
+            or not _has_complete_provenance(evidence_by_id[evidence_id], provenance_by_id)
+            for evidence_id in node.evidence_ids
+        ):
+            diagnostics.append(_cross_error(
+                "verification-provenance-complete", node.id,
+                "Verification nodes require complete source evidence and provenance.",
+            ))
+    return diagnostics
+
+
+def _verification_support_diagnostics(
+    support: CrossGraphLinkEvidence,
+    claim: CrossGraphLinkClaim | None,
+    nodes_by_id: dict[str, Node],
+    edges: tuple[Edge, ...],
+    evidence_by_id: dict[str, object],
+    provenance_by_id: dict[str, ProvenanceRecord],
+) -> list[GraphValidationDiagnostic]:
+    diagnostics: list[GraphValidationDiagnostic] = []
+    if claim is None:
+        return [_cross_error("verification-support-claim-exists", support.id, "Verification support references an absent claim.")]
+    if claim.relation_kind != EdgeKind.VERIFIED_BY.value:
+        diagnostics.append(_cross_error(
+            "verification-support-relation-kind", support.id,
+            "Verification evidence may support only VERIFIED_BY claims.",
+        ))
+    if claim.subject_id not in nodes_by_id:
+        diagnostics.append(_cross_error(
+            "verification-support-subject-exists", support.id,
+            "Verification support claim subject is absent.",
+        ))
+    evidence_node = nodes_by_id.get(support.verification_evidence_id or "")
+    if evidence_node is None:
+        diagnostics.append(_cross_error(
+            "verification-support-reference-exists", support.id,
+            "Verification support references an absent verification-evidence node.",
+        ))
+        return diagnostics
+    if _value(evidence_node.kind) != NodeKind.VERIFICATION_EVIDENCE.value:
+        diagnostics.append(_cross_error(
+            "verification-support-reference-kind", support.id,
+            "Verification support reference must resolve to VERIFICATION_EVIDENCE.",
+        ))
+    if not evidence_node.evidence_ids or any(
+        evidence_by_id.get(item) is None
+        or not _has_complete_provenance(evidence_by_id[item], provenance_by_id)
+        for item in evidence_node.evidence_ids
+    ):
+        diagnostics.append(_cross_error(
+            "verification-support-provenance-complete", support.id,
+            "Referenced verification evidence lacks complete provenance.",
+        ))
+    validating_edges = tuple(
+        edge for edge in edges
+        if edge.source_id == evidence_node.id
+        and edge.target_id == claim.subject_id
+        and _value(edge.kind) == EdgeKind.VALIDATES.value
+    )
+    if not validating_edges:
+        diagnostics.append(_cross_error(
+            "verification-support-validates-subject", support.id,
+            "Referenced verification evidence does not VALIDATE the claim subject.",
+        ))
+    elif any(
+        not edge.evidence_ids
+        or any(
+            evidence_by_id.get(item) is None
+            or not _has_complete_provenance(evidence_by_id[item], provenance_by_id)
+            for item in edge.evidence_ids
+        )
+        for edge in validating_edges
+    ):
+        diagnostics.append(_cross_error(
+            "verification-support-validates-provenance", support.id,
+            "The VALIDATES binding lacks complete provenance.",
+        ))
     return diagnostics
 
 

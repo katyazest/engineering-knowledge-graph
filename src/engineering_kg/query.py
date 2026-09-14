@@ -13,6 +13,7 @@ from engineering_kg.ontology import (
     GraphSnapshot,
     Node,
     NodeKind,
+    _validate_verification_support_reference,
     has_complete_resolvable_provenance,
 )
 from engineering_kg.persistence import read_graph_snapshot
@@ -31,12 +32,14 @@ QUERY_FORBIDDEN_FIELDS = frozenset(
         "credentials",
         "dependency_graph",
         "external_api_response",
+        "framework",
         "function_body",
         "generated_graph_records",
         "jira_payload",
         "bitbucket_payload",
         "confluence_content",
         "openlore_analysis",
+        "outcome",
         "page_content",
         "page_url",
         "source_code",
@@ -44,7 +47,14 @@ QUERY_FORBIDDEN_FIELDS = frozenset(
         "token",
         "tokens",
         "url",
-    }
+        "coverage",
+        "ci_payload",
+        "log",
+        "logs",
+            "provider_payload",
+            "test_output",
+            "raw",
+        }
 )
 
 
@@ -292,7 +302,7 @@ class EngineeringKgQuery:
                 edge
                 for edge in self.snapshot.edges
                 if (edge.source_id == object_id or edge.target_id == object_id)
-                and self._is_trusted_semantic_edge(edge)
+                and self._is_traceability_edge(edge)
             )
         )
         support_records = tuple(
@@ -397,7 +407,11 @@ class EngineeringKgQuery:
             "edge_id": edge.id,
             "evidence_ids": sorted(edge.evidence_ids),
             "kind": str(_value(edge.kind)),
-            "properties": _sanitize_value(edge.properties),
+            "properties": (
+                {}
+                if self._is_verification_involved_edge(edge)
+                else _sanitize_value(edge.properties)
+            ),
             "source_id": edge.source_id,
             "target_id": edge.target_id,
         }
@@ -411,6 +425,30 @@ class EngineeringKgQuery:
             data["provenance"] = [dict(item) for item in provenance]
         return data
 
+    def _is_verification_involved_edge(self, edge: Edge) -> bool:
+        """Return whether an edge is subject to verification payload rules."""
+
+        verification_kinds = {
+            EdgeKind.VERIFIED_BY.value,
+            EdgeKind.EXECUTED_IN.value,
+            EdgeKind.VALIDATES.value,
+        }
+        if _value(edge.kind) in verification_kinds:
+            return True
+        return any(
+            node is not None
+            and _value(node.kind) in {
+                NodeKind.TEST_CASE.value,
+                NodeKind.TEST_SUITE.value,
+                NodeKind.TEST_RUN.value,
+                NodeKind.VERIFICATION_EVIDENCE.value,
+            }
+            for node in (
+                self._nodes_by_id.get(edge.source_id),
+                self._nodes_by_id.get(edge.target_id),
+            )
+        )
+
     def _is_trusted_semantic_edge(self, edge: Edge) -> bool:
         """Return whether an edge is safe to expose as a semantic relationship."""
 
@@ -422,6 +460,25 @@ class EngineeringKgQuery:
             and relationship_error(
                 kind, self._nodes_by_id.get(edge.source_id), self._nodes_by_id.get(edge.target_id)
             ) is None
+            and bool(edge.evidence_ids)
+            and all(self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids)
+        )
+
+    def _is_traceability_edge(self, edge: Edge) -> bool:
+        """Return whether an admitted edge belongs in object traceability."""
+
+        if self._is_trusted_semantic_edge(edge):
+            return True
+        if _value(edge.kind) != EdgeKind.CONTAINS.value:
+            return False
+        source = self._nodes_by_id.get(edge.source_id)
+        target = self._nodes_by_id.get(edge.target_id)
+        return (
+            source is not None
+            and target is not None
+            and _value(source.kind) == NodeKind.TEST_SUITE.value
+            and _value(target.kind) == NodeKind.TEST_CASE.value
+            and relationship_error(edge.kind, source, target) is None
             and bool(edge.evidence_ids)
             and all(self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids)
         )
@@ -463,12 +520,29 @@ class EngineeringKgQuery:
         return tuple(_sanitize_value(self._provenance_by_id[item].as_dict()) for item in ids if item in self._provenance_by_id)
 
     def _cross_graph_links_for(self, object_id: str) -> tuple[dict[str, Any], ...]:
-        """Project cross-graph support and its provenance for one claim subject."""
+        """Project links for a claim subject or cited verification evidence."""
 
         links: list[dict[str, Any]] = []
-        for claim in self.snapshot.cross_graph_link_claims:
-            if claim.subject_id != object_id:
+        for claim in sorted(self.snapshot.cross_graph_link_claims, key=lambda item: item.id):
+            claim_observations = tuple(sorted(
+                (
+                    observation
+                    for observation in self.snapshot.cross_graph_link_evidence
+                    if observation.claim_id == claim.id
+                ),
+                key=lambda item: item.id,
+            ))
+            if claim.subject_id != object_id and not any(
+                observation.verification_evidence_id == object_id
+                for observation in claim_observations
+            ):
                 continue
+            for observation in claim_observations:
+                if observation.verification_evidence_id is not None:
+                    _validate_verification_support_reference(
+                        observation, claim, self._nodes_by_id, self.snapshot.edges,
+                        self._evidence_by_id, self._provenance_by_id,
+                    )
             observations = [
                 {
                     **observation.as_dict(),
@@ -476,8 +550,7 @@ class EngineeringKgQuery:
                         self._provenance_for((observation.provenance_evidence_id,))
                     ),
                 }
-                for observation in self.snapshot.cross_graph_link_evidence
-                if observation.claim_id == claim.id
+                for observation in claim_observations
             ]
             lifecycle = [
                 {
@@ -486,8 +559,14 @@ class EngineeringKgQuery:
                         self._provenance_for((entry.provenance_evidence_id,))
                     ),
                 }
-                for entry in self.snapshot.cross_graph_link_lifecycle
-                if entry.claim_id == claim.id
+                for entry in sorted(
+                    (
+                        entry
+                        for entry in self.snapshot.cross_graph_link_lifecycle
+                        if entry.claim_id == claim.id
+                    ),
+                    key=lambda item: (item.revision, item.id),
+                )
             ]
             current_lifecycle = max(
                 lifecycle,
@@ -600,7 +679,7 @@ def _sanitize_value(value: Any) -> Any:
         sanitized: dict[str, Any] = {}
         for key in sorted(value, key=lambda item: str(item)):
             key_text = str(key)
-            if key_text in QUERY_FORBIDDEN_FIELDS:
+            if _is_forbidden_query_field(key_text):
                 continue
             sanitized[key_text] = _sanitize_value(value[key])
         return sanitized
@@ -609,6 +688,19 @@ def _sanitize_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_sanitize_value(item) for item in value]
     return value
+
+
+def _is_forbidden_query_field(key: str) -> bool:
+    """Omit provider/framework/CI payload containers, including key variants."""
+    folded = key.casefold().replace("-", "_")
+    normalized = "".join(
+        f"_{character.lower()}" if character.isupper() else character
+        for character in key
+    ).replace("-", "_").casefold()
+    tokens = set(folded.split("_")) | set(normalized.split("_"))
+    return folded in {field.casefold() for field in QUERY_FORBIDDEN_FIELDS} or bool(
+        tokens.intersection({"provider", "framework", "ci"})
+    )
 
 
 def _value(value: object) -> object:

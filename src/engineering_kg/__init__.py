@@ -18,6 +18,8 @@ from engineering_kg.ontology import (
     ProvenanceRecord,
     SourceArtifactIdentity,
     stable_id,
+    verification_node,
+    verification_node_id,
 )
 from engineering_kg.openlore import (
     OpenLoreRepositoryReference,
@@ -108,6 +110,8 @@ __all__ = [
     "read_graph_snapshot",
     "run_pipeline",
     "stable_id",
+    "verification_node",
+    "verification_node_id",
     "validate_workspace_openlore_source",
     "BridgeDiagnostic",
     "BridgeValidationError",

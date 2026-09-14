@@ -683,12 +683,12 @@ class PullRequestImplementationEvidenceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source reference is required"):
             normalize_pull_request_evidence(raw)
 
-    def test_catalog_rejects_pr_implementation_and_reversed_pr_endpoints(self) -> None:
+    def test_catalog_admits_pr_implementation_source_and_rejects_reversed_pr_endpoints(self) -> None:
         from engineering_kg.ontology import Node
 
         pr = Node("pr-node", NodeKind.PULL_REQUEST, "pr")
         repo = self.repository
-        self.assertEqual(relationship_error("implements", pr, repo), "relationship-endpoint-contract")
+        self.assertIsNone(relationship_error("implements", pr, repo))
         self.assertEqual(relationship_error("references", pr, repo), "pr-declared-association-endpoint-contract")
 
     def test_multiple_symbols_remain_observed_candidates_without_implementation_projection(self) -> None:

@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from engineering_kg.ontology import CodeLocator, Node
 
 
-CATALOG_REVISION = "3"
+CATALOG_REVISION = "4"
 
 
 class RelationshipKind(StrEnum):
@@ -18,6 +18,8 @@ class RelationshipKind(StrEnum):
     TRACES_TO = "traces_to"
     IMPLEMENTS = "implements"
     VERIFIED_BY = "verified_by"
+    EXECUTED_IN = "executed_in"
+    VALIDATES = "validates"
     TOUCHES = "touches"
     DEPENDS_ON = "depends_on"
     REFERENCES = "references"
@@ -64,14 +66,20 @@ class SourceMapping:
 _ANY = frozenset({"*"})
 _CHANGE = frozenset({"openspec-active-change", "openspec-archived-change"})
 _TRACE = _CHANGE | frozenset({"requirement", "scenario", "jira_story"})
-_IMPLEMENTER = frozenset({"jira_story", "service", "repository", "contract", "business_process"})
+_IMPLEMENTER = frozenset({"jira_story", "pull_request", "service", "repository", "contract", "business_process"})
 _DEPENDENCY = _IMPLEMENTER | frozenset({"pull_request", "specification", "requirement", "scenario"})
+_VERIFICATION_TARGET = frozenset({
+    "requirement", "scenario", "jira_story", "contract", "service", "business_process",
+})
+_VERIFICATION_FACT = frozenset({"test_case", "test_suite"})
 
 RELATIONSHIP_CATALOG: tuple[RelationshipDefinition, ...] = (
-    RelationshipDefinition(RelationshipKind.CONTAINS, "Structural containment.", frozenset({"specification", "requirement"}) | _CHANGE, frozenset({"requirement", "scenario", "openspec-artifact"}), classification="structural"),
+    RelationshipDefinition(RelationshipKind.CONTAINS, "Structural containment.", frozenset({"specification", "requirement", "test_suite"}) | _CHANGE, frozenset({"requirement", "scenario", "openspec-artifact", "test_case"}), classification="structural"),
     RelationshipDefinition(RelationshipKind.TRACES_TO, "Traceability relationship.", _TRACE, frozenset({"specification", "requirement", "scenario", "jira_story"})),
     RelationshipDefinition(RelationshipKind.IMPLEMENTS, "Implementation relationship.", _IMPLEMENTER, frozenset({"service", "repository", "contract", "business_process"}), True),
-    RelationshipDefinition(RelationshipKind.VERIFIED_BY, "Verification relationship.", frozenset({"requirement", "scenario", "jira_story", "contract", "service", "business_process"}), frozenset({"scenario", "pull_request", "contract"}), True),
+    RelationshipDefinition(RelationshipKind.VERIFIED_BY, "Verification relationship.", _VERIFICATION_TARGET, frozenset({"scenario", "pull_request", "contract", "test_case", "test_suite"}), True),
+    RelationshipDefinition(RelationshipKind.EXECUTED_IN, "Test execution relationship.", _VERIFICATION_FACT, frozenset({"test_run"})),
+    RelationshipDefinition(RelationshipKind.VALIDATES, "Verification evidence binding.", frozenset({"verification_evidence"}), _VERIFICATION_FACT | frozenset({"test_run"}) | _VERIFICATION_TARGET),
     RelationshipDefinition(RelationshipKind.TOUCHES, "Change touches an implementation target.", frozenset({"jira_story", "pull_request", "openspec-active-change", "openspec-archived-change"}), frozenset({"service", "repository", "contract", "business_process"}), True),
     RelationshipDefinition(RelationshipKind.DEPENDS_ON, "Directed dependency.", _DEPENDENCY, _DEPENDENCY),
     RelationshipDefinition(RelationshipKind.REFERENCES, "Non-owning reference.", _ANY, _ANY, True),
@@ -89,6 +97,10 @@ SOURCE_MAPPINGS = (
     SourceMapping("pr-declared-association", "references", "declared"),
     SourceMapping("pr-observed-repository", "touches", "observed"),
     SourceMapping("pr-changed-symbol", "touches", "candidate"),
+    SourceMapping("normalized-verification-contains", "contains", "structural"),
+    SourceMapping("normalized-verification-verified-by", "verified_by", "semantic"),
+    SourceMapping("normalized-verification-executed-in", "executed_in", "semantic"),
+    SourceMapping("normalized-verification-validates", "validates", "semantic"),
 )
 
 
@@ -134,6 +146,7 @@ def relationship_error(kind: object, source: "Node | None", target: "Node | Code
             ("specification", "requirement"), ("requirement", "scenario"),
             ("openspec-active-change", "openspec-artifact"),
             ("openspec-archived-change", "openspec-artifact"),
+            ("test_suite", "test_case"),
         }:
             return "relationship-endpoint-contract"
     return None
@@ -166,7 +179,8 @@ _CANONICAL_NODE_KINDS = frozenset({
     "workspace", "service", "repository", "specification", "requirement",
     "scenario", "jira_story", "pull_request", "contract",
     "external_system", "business_process", "adr", "openspec-active-change",
-    "openspec-archived-change", "openspec-artifact",
+    "openspec-archived-change", "openspec-artifact", "test_case", "test_suite",
+    "test_run", "verification_evidence",
 })
 
 
