@@ -8,8 +8,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from engineering_kg.ontology import (
-    Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceRecord, SourceArtifactIdentity,
-    SourceArtifactLocator, openspec_specification_id, stable_id,
+    Edge, EdgeKind, Evidence, GraphSnapshot, Node, NodeKind, ProvenanceRecord,
+    SourceArtifactIdentity, SourceArtifactLocator, openspec_specification_id,
+    stable_id, verification_node,
 )
 from engineering_kg.validation import validate_graph_integrity
 
@@ -60,6 +61,32 @@ class GraphIntegrityValidationTest(unittest.TestCase):
             ),
         )
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
+
+    def test_generic_ekg48_execution_without_openspec_mapping_remains_valid(self) -> None:
+        identity = SourceArtifactIdentity(
+            "verification-provider", "payments", "test-execution", "run-1", "runs/run-1",
+        )
+        provenance = ProvenanceRecord(
+            "external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64,
+            "verification-extractor", "1", identity,
+        )
+        evidence = Evidence(
+            stable_id("evidence", identity.id), "verification-provider",
+            SourceArtifactLocator(identity), provenance_ids=(provenance.id,),
+        )
+        test_case = verification_node(NodeKind.TEST_CASE, "payments", "case-001", (evidence.id,))
+        test_run = verification_node(NodeKind.TEST_RUN, "payments", "run-001", (evidence.id,))
+        execution = Edge(
+            "case-executed-run", EdgeKind.EXECUTED_IN, test_case.id, test_run.id,
+            evidence_ids=(evidence.id,),
+        )
+
+        result = validate_graph_integrity(GraphSnapshot(
+            nodes=(test_case, test_run), edges=(execution,),
+            evidence=(evidence,), provenance=(provenance,),
+        ))
+
+        self.assertEqual(result.status, "valid", result.metadata.as_dict())
 
     def test_external_evidence_without_identity_is_invalid_but_generated_evidence_is_allowed(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid-source-artifact-identity"):

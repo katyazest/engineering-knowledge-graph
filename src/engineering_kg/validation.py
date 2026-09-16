@@ -6,12 +6,19 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+from engineering_kg.compact_identity import (
+    is_complete_symbol_identity,
+    is_immutable_revision,
+    safe_relative_file,
+    safe_repository,
+)
 from engineering_kg.ontology import (
     CROSS_GRAPH_LINK_LIFECYCLE_STATES,
     CodeLocator,
     CrossGraphLinkClaim,
     CrossGraphLinkEvidence,
     CrossGraphLinkLifecycle,
+    CrossGraphLinkLifecycleState,
     Edge,
     EdgeKind,
     GraphSnapshot,
@@ -152,6 +159,7 @@ def validate_graph_integrity(snapshot: GraphSnapshot) -> GraphValidationResult:
         ))
     diagnostics.extend(_verification_provenance_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_relationship_vocabulary_diagnostics(snapshot, nodes_by_id, evidence_by_id))
+    diagnostics.extend(_scenario_test_traceability_diagnostics(snapshot, nodes_by_id, evidence_by_id))
     diagnostics.extend(_traceability_shape_diagnostics(snapshot.edges, nodes_by_id))
     diagnostics.extend(_unresolved_related_spec_diagnostics(snapshot.nodes, snapshot.edges, snapshot.evidence))
     diagnostics.extend(_cross_graph_link_diagnostics(snapshot, nodes_by_id, evidence_by_id))
@@ -537,7 +545,10 @@ def _cross_graph_link_diagnostics(
     for claim in snapshot.cross_graph_link_claims:
         if claim.subject_id not in nodes_by_id:
             diagnostics.append(_cross_error("cross-graph-subject-exists", claim.id, "Cross-graph claim subject_id does not reference an existing node."))
-        if not _complete_code_locator(claim.target):
+        # Generic cross-graph claims retain the baseline EKG-48 locator
+        # contract; reliable test-code candidates use the stricter admission
+        # contract checked below.
+        if not _nonempty_code_locator(claim.target):
             diagnostics.append(_cross_error("cross-graph-target-complete", claim.id, "Cross-graph claim target must be a complete CodeLocator."))
         error = relationship_error(claim.relation_kind, nodes_by_id.get(claim.subject_id), claim.target)
         if error:
@@ -682,7 +693,184 @@ def _relationship_vocabulary_diagnostics(
     return diagnostics
 
 
+def _scenario_test_traceability_diagnostics(
+    snapshot: GraphSnapshot,
+    nodes_by_id: dict[str, Node],
+    evidence_by_id: dict[str, object],
+) -> list[GraphValidationDiagnostic]:
+    """Validate the additional source-scoped contracts without restricting generic EKG-48 facts."""
+
+    diagnostics: list[GraphValidationDiagnostic] = []
+    provenance_by_id = {item.id: item for item in snapshot.provenance}
+    mapped_tests: set[str] = set()
+    # Collect mapping endpoints before checking execution edges; record order is
+    # ID-sorted and does not imply admission order.
+    for edge in snapshot.edges:
+        if (
+            _value(edge.kind) == EdgeKind.VERIFIED_BY.value
+            and edge.source_id in nodes_by_id
+            and _value(nodes_by_id[edge.source_id].kind) in {NodeKind.REQUIREMENT.value, NodeKind.SCENARIO.value}
+            and edge.target_id in nodes_by_id
+            and _value(nodes_by_id[edge.target_id].kind) == NodeKind.TEST_CASE.value
+            and any(
+                item in evidence_by_id
+                and isinstance(evidence_by_id[item].locator, OpenSpecLocator)
+                and evidence_by_id[item].locator.artifact_type == "openspec-test-traceability"
+                for item in edge.evidence_ids
+            )
+        ):
+            mapped_tests.add(edge.target_id)
+    for edge in snapshot.edges:
+        mapping_evidence = tuple(
+            evidence_by_id[item]
+            for item in edge.evidence_ids
+            if item in evidence_by_id
+            and isinstance(evidence_by_id[item].locator, OpenSpecLocator)
+            and evidence_by_id[item].locator.artifact_type == "openspec-test-traceability"
+        )
+        if mapping_evidence:
+            source = nodes_by_id.get(edge.source_id)
+            target = nodes_by_id.get(edge.target_id)
+            if _value(edge.kind) != EdgeKind.VERIFIED_BY.value:
+                diagnostics.append(_cross_error("traceability-mapping-relation-kind", edge.id, "Declared test mapping must use VERIFIED_BY."))
+            elif source is None or _value(source.kind) not in {NodeKind.REQUIREMENT.value, NodeKind.SCENARIO.value}:
+                diagnostics.append(_cross_error("traceability-mapping-source-kind", edge.id, "Declared test mapping source must be REQUIREMENT or SCENARIO."))
+            elif target is None or _value(target.kind) != NodeKind.TEST_CASE.value:
+                diagnostics.append(_cross_error("traceability-mapping-target-kind", edge.id, "Declared test mapping target must be TEST_CASE."))
+            else:
+                mapped_tests.add(target.id)
+            if any(
+                evidence.source != "openspec"
+                or evidence.locator.source_artifact_identity is None
+                or evidence.locator.source_artifact_identity.stable_locator != "openspec/test-traceability.yaml"
+                for evidence in mapping_evidence
+            ):
+                diagnostics.append(_cross_error("traceability-mapping-source-contract", edge.id, "Declared test mapping evidence must be sourced by openspec/test-traceability.yaml."))
+            if not edge.evidence_ids or any(
+                item not in evidence_by_id
+                or not _has_complete_provenance(evidence_by_id[item], provenance_by_id)
+                for item in edge.evidence_ids
+            ):
+                diagnostics.append(_cross_error("traceability-mapping-provenance-complete", edge.id, "Declared test mapping requires complete evidence and provenance."))
+
+        execution_evidence = tuple(
+            evidence_by_id[item]
+            for item in edge.evidence_ids
+            if item in evidence_by_id
+            and evidence_by_id[item].source == "test-execution"
+        )
+        if execution_evidence:
+            source = nodes_by_id.get(edge.source_id)
+            target = nodes_by_id.get(edge.target_id)
+            if _value(edge.kind) != EdgeKind.EXECUTED_IN.value or source is None or _value(source.kind) != NodeKind.TEST_CASE.value or target is None or _value(target.kind) != NodeKind.TEST_RUN.value:
+                diagnostics.append(_cross_error("traceability-execution-endpoint-contract", edge.id, "Admitted execution must be TEST_CASE EXECUTED_IN TEST_RUN."))
+            elif source.id not in mapped_tests:
+                diagnostics.append(_cross_error("traceability-execution-scope", edge.id, "Execution observation must identify an admitted mapped TEST_CASE."))
+            for evidence in execution_evidence:
+                locator = evidence.locator
+                identity = (
+                    locator.source_artifact_identity
+                    if isinstance(locator, SourceArtifactLocator)
+                    else None
+                )
+                if (
+                    identity is None
+                    or identity.artifact_type != "test-execution"
+                    or source_artifact_identity_error(evidence) is not None
+                ):
+                    diagnostics.append(_cross_error(
+                        "traceability-execution-source-contract", edge.id,
+                        "Execution observation evidence must use a matching test-execution source-artifact identity.",
+                    ))
+            if not edge.evidence_ids or any(
+                item not in evidence_by_id
+                or not _has_complete_provenance(evidence_by_id[item], provenance_by_id)
+                for item in edge.evidence_ids
+            ):
+                diagnostics.append(_cross_error("traceability-execution-provenance-complete", edge.id, "Execution observation requires complete evidence and provenance."))
+            if any(
+                not isinstance(evidence.locator, SourceArtifactLocator)
+                or evidence.locator.source_artifact_identity.artifact_type != "test-execution"
+                or not evidence.provenance_ids
+                or any(
+                    item not in provenance_by_id
+                    or provenance_by_id[item].kind is not ProvenanceKind.EXTERNAL
+                    or provenance_by_id[item].source_artifact_identity != evidence.locator.source_artifact_identity
+                    or not _has_complete_provenance(evidence, provenance_by_id)
+                    for item in evidence.provenance_ids
+                )
+                for evidence in execution_evidence
+            ):
+                diagnostics.append(_cross_error(
+                    "traceability-execution-provenance-complete", edge.id,
+                    "Execution observation requires complete external provenance bound to its source artifact.",
+                ))
+
+    claims = {item.id: item for item in snapshot.cross_graph_link_claims}
+    lifecycles = defaultdict(list)
+    for item in snapshot.cross_graph_link_lifecycle:
+        lifecycles[item.claim_id].append(item)
+    for observation in snapshot.cross_graph_link_evidence:
+        if observation.strategy_id != "reliable-test-code-resolution":
+            continue
+        claim = claims.get(observation.claim_id)
+        if (
+            claim is None
+            or claim.subject_id not in mapped_tests
+            or claim.relation_kind != EdgeKind.REFERENCES.value
+            or not _complete_code_locator(claim.target)
+        ):
+            diagnostics.append(_cross_error("reliable-test-code-resolution-scope", observation.id, "Reliable test-code candidate must reference an admitted mapped TEST_CASE with a complete locator."))
+        if (
+            observation.origin != "observed"
+            or observation.trust_disposition != "untrusted"
+            or observation.status != "authoritative"
+        ):
+            diagnostics.append(_cross_error("reliable-test-code-resolution-classification", observation.id, "Reliable test-code candidate must be observed and untrusted."))
+        source_evidence = evidence_by_id.get(observation.provenance_evidence_id)
+        if (
+            source_evidence is None
+            or not isinstance(source_evidence.locator, SourceArtifactLocator)
+            or source_evidence.locator.source_artifact_identity.artifact_type != "test-code-resolution"
+            or not _has_complete_provenance(source_evidence, provenance_by_id)
+        ):
+            diagnostics.append(_cross_error("reliable-test-code-resolution-provenance", observation.id, "Reliable test-code candidate requires complete source provenance."))
+        current = max(lifecycles.get(observation.claim_id, ()), key=lambda item: (item.revision, item.id), default=None)
+        lifecycle_evidence = evidence_by_id.get(current.provenance_evidence_id) if current is not None else None
+        lifecycle_valid = (
+            current is not None
+            and _value(current.state) == CrossGraphLinkLifecycleState.CANDIDATE.value
+            and current.origin == "observed"
+            and current.status == "derived"
+            and current.trust_disposition == "untrusted"
+            and lifecycle_evidence is not None
+            and _has_complete_provenance(lifecycle_evidence, provenance_by_id)
+            and any(
+                provenance_by_id[item].kind is ProvenanceKind.DERIVED
+                for item in lifecycle_evidence.provenance_ids
+                if item in provenance_by_id
+            )
+        )
+        if not lifecycle_valid:
+            diagnostics.append(_cross_error("reliable-test-code-resolution-lifecycle", observation.id, "Reliable test-code candidate requires an observed, untrusted candidate lifecycle."))
+    return diagnostics
+
+
 def _complete_code_locator(value: object) -> bool:
+    if not isinstance(value, CodeLocator):
+        return False
+    try:
+        return (
+            bool(safe_repository(value.repository, "code locator.repository"))
+            and is_immutable_revision(value.revision)
+            and bool(safe_relative_file(value.file, "code locator.file"))
+            and is_complete_symbol_identity(value.symbol)
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _nonempty_code_locator(value: object) -> bool:
     return isinstance(value, CodeLocator) and all(
         isinstance(getattr(value, field), str) and getattr(value, field).strip()
         for field in ("repository", "revision", "file", "symbol")

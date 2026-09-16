@@ -1203,7 +1203,10 @@ PullRequestRepositoryRelation = PullRequestObservedRepositoryRelation
 # authoritative external artifact. Every other evidence source is treated as
 # authoritative and must carry the shared identity at graph boundaries.
 INTERNAL_OR_GENERATED_EVIDENCE_SOURCES = frozenset(
-    {"fixture", "openlore", "pr-code-candidate-extraction", "repo-index", "review"}
+    {
+        "fixture", "openlore", "pr-code-candidate-extraction", "repo-index", "review",
+        "reliable-test-code-resolution",
+    }
 )
 
 

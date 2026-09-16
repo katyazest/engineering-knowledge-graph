@@ -55,7 +55,10 @@ means a complete locator (repository, revision, file, and symbol).
     {"classification": "structural", "kind": "contains", "source": "normalized-verification-contains", "unsupported_behavior": "diagnose-and-skip"},
     {"classification": "semantic", "kind": "verified_by", "source": "normalized-verification-verified-by", "unsupported_behavior": "diagnose-and-skip"},
     {"classification": "semantic", "kind": "executed_in", "source": "normalized-verification-executed-in", "unsupported_behavior": "diagnose-and-skip"},
-    {"classification": "semantic", "kind": "validates", "source": "normalized-verification-validates", "unsupported_behavior": "diagnose-and-skip"}
+    {"classification": "semantic", "kind": "validates", "source": "normalized-verification-validates", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "semantic", "kind": "verified_by", "source": "declared-test", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "semantic", "kind": "executed_in", "source": "normalized-execution", "unsupported_behavior": "diagnose-and-skip"},
+    {"classification": "candidate", "kind": "references", "source": "reliable-test-code-resolution", "unsupported_behavior": "diagnose-and-skip"}
   ]
 }
 ```
@@ -73,7 +76,9 @@ OpenSpec `related` maps to non-confident `REFERENCES`; and merged-PR changed
 symbols map to candidate `TOUCHES` claims. Unsupported source claims are
 diagnosed and skipped. No supported mapper emits `IMPLEMENTS`, `DEPENDS_ON`,
 `OWNED_BY`, or `PROVIDES`; verification/test-code inputs never emit
-`IMPLEMENTS`.
+`IMPLEMENTS`. Declared test-traceability mappings use `VERIFIED_BY`, execution
+observations use `EXECUTED_IN`, and reliable test-code observations use only
+observed candidate `REFERENCES`.
 
 Persistence and readback accept only revision 4's current canonical format.
 Relationship aliases, reversed encodings (including `OWNS`), and historical

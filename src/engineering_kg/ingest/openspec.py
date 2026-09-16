@@ -88,6 +88,40 @@ class OpenSpecStoreSourceValidationResult:
 
 
 @dataclass(frozen=True)
+class OpenSpecTraceabilitySourceContext:
+    """Payload-free identity for the optional traceability sidecar."""
+
+    path: Path
+    relative_path: str
+    source_artifact_identity: SourceArtifactIdentity
+    revision_or_version: str
+    observed_at: str
+
+
+def locate_openspec_test_traceability(
+    store_source: OpenSpecStoreSourceValidationResult,
+) -> OpenSpecTraceabilitySourceContext | None:
+    """Locate the sidecar only beneath a previously validated OpenSpec root."""
+
+    if store_source.status != "valid":
+        raise OpenSpecGraphExtractionError("OpenSpec store source must be valid before traceability lookup")
+    root = store_source.openspec_root_path.resolve()
+    path = (root / "test-traceability.yaml").resolve()
+    if path.parent != root:
+        raise OpenSpecGraphExtractionError("OpenSpec traceability artifact escaped the validated root")
+    if not path.is_file():
+        return None
+    identity = SourceArtifactIdentity(
+        "openspec", store_source.repository_id, "openspec-test-traceability",
+        store_source.revision_or_version, "openspec/test-traceability.yaml",
+    )
+    return OpenSpecTraceabilitySourceContext(
+        path, "openspec/test-traceability.yaml", identity,
+        store_source.revision_or_version, store_source.observed_at,
+    )
+
+
+@dataclass(frozen=True)
 class OpenSpecExtractionMetadata:
     """Serializable status metadata for one OpenSpec graph extraction run."""
 

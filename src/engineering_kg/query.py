@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from engineering_kg.ontology import (
+    CrossGraphEvidenceOrigin,
+    CrossGraphEvidenceStatus,
+    CrossGraphLinkLifecycleState,
+    CrossGraphTrustDisposition,
     Edge,
     EdgeKind,
     Evidence,
@@ -14,6 +18,7 @@ from engineering_kg.ontology import (
     Node,
     NodeKind,
     _validate_verification_support_reference,
+    OpenSpecLocator,
     has_complete_resolvable_provenance,
 )
 from engineering_kg.persistence import read_graph_snapshot
@@ -141,6 +146,24 @@ class TraceabilityResult:
             "object_id": self.object_id,
             "relationships": [_sanitize_value(item) for item in self.relationships],
             "support_records": [_sanitize_value(item) for item in self.support_records],
+        }
+
+
+@dataclass(frozen=True)
+class ScenarioTestTraceabilityResult:
+    """Payload-free per-test mapping and execution projection."""
+
+    object_id: str
+    status: str
+    mappings: tuple[dict[str, Any], ...] = ()
+    missing: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mappings": [_sanitize_value(item) for item in self.mappings],
+            "missing": self.missing,
+            "object_id": self.object_id,
+            "status": self.status,
         }
 
 
@@ -320,6 +343,121 @@ class EngineeringKgQuery:
             support_records=support_records,
             cross_graph_links=self._cross_graph_links_for(object_id),
         ).as_dict()
+
+    def get_scenario_test_traceability(
+        self,
+        object_id: str,
+        *,
+        require_validation: bool = False,
+        missing_ok: bool = True,
+    ) -> dict[str, Any]:
+        """Return exact declared mapping and represented execution state."""
+
+        if require_validation:
+            validation = self.validation or validate_graph_integrity(self.snapshot)
+            _raise_if_invalid(validation)
+        target = self._nodes_by_id.get(object_id)
+        if target is None or _value(target.kind) not in {
+            NodeKind.REQUIREMENT.value, NodeKind.SCENARIO.value,
+        }:
+            if missing_ok:
+                return TraceabilityResult(object_id=object_id, missing=True).as_dict()
+            raise GraphObjectNotFoundError(object_id)
+
+        mappings: list[dict[str, Any]] = []
+        for edge in sorted(self.snapshot.edges, key=lambda item: item.id):
+            if edge.source_id != object_id or _value(edge.kind) != EdgeKind.VERIFIED_BY.value:
+                continue
+            test = self._nodes_by_id.get(edge.target_id)
+            if test is None or _value(test.kind) != NodeKind.TEST_CASE.value:
+                continue
+            mapping_evidence = tuple(
+                evidence for evidence_id in edge.evidence_ids
+                if (evidence := self._evidence_by_id.get(evidence_id)) is not None
+                and isinstance(evidence.locator, OpenSpecLocator)
+                and evidence.locator.artifact_type == "openspec-test-traceability"
+                and self._has_complete_provenance(evidence_id)
+            )
+            if not mapping_evidence:
+                continue
+            execution_edges = tuple(sorted(
+                (
+                    candidate for candidate in self.snapshot.edges
+                    if candidate.source_id == test.id
+                    and _value(candidate.kind) == EdgeKind.EXECUTED_IN.value
+                    and self._valid_execution_edge(candidate)
+                ),
+                key=lambda item: item.id,
+            ))
+            runs = tuple(sorted({candidate.target_id for candidate in execution_edges}))
+            candidates = self._reliable_test_code_candidates(test.id)
+            mapping_provenance = tuple(sorted({
+                provenance_id
+                for evidence in mapping_evidence
+                for provenance_id in evidence.provenance_ids
+            }))
+            mappings.append({
+                "mapping_edge_id": edge.id,
+                "mapping_evidence_ids": tuple(sorted(item.id for item in mapping_evidence)),
+                "mapping_provenance_ids": mapping_provenance,
+                "test_case_id": test.id,
+                "test_case_key": test.properties.get("test_case_key"),
+                "verification_scope_id": test.properties.get("verification_scope_id"),
+                "execution_state": "executed" if runs else "not-executed",
+                "run_ids": runs,
+                "candidates": candidates,
+            })
+        return ScenarioTestTraceabilityResult(
+            object_id, "mapped" if mappings else "unmapped", tuple(mappings),
+        ).as_dict()
+
+    # Names used by callers that refer to the projection by its capability.
+    get_test_traceability = get_scenario_test_traceability
+    scenario_test_traceability = get_scenario_test_traceability
+
+    def _valid_execution_edge(self, edge: Edge) -> bool:
+        source = self._nodes_by_id.get(edge.source_id)
+        target = self._nodes_by_id.get(edge.target_id)
+        return (
+            source is not None and target is not None
+            and _value(source.kind) == NodeKind.TEST_CASE.value
+            and _value(target.kind) == NodeKind.TEST_RUN.value
+            and relationship_error(edge.kind, source, target) is None
+            and bool(edge.evidence_ids)
+            and all(self._has_complete_provenance(item) for item in edge.evidence_ids)
+        )
+
+    def _reliable_test_code_candidates(self, test_id: str) -> list[dict[str, Any]]:
+        claims = {item.id: item for item in self.snapshot.cross_graph_link_claims}
+        results: list[dict[str, Any]] = []
+        for observation in sorted(self.snapshot.cross_graph_link_evidence, key=lambda item: item.id):
+            claim = claims.get(observation.claim_id)
+            if claim is None or claim.subject_id != test_id or observation.strategy_id != "reliable-test-code-resolution":
+                continue
+            if (
+                observation.origin is not CrossGraphEvidenceOrigin.OBSERVED
+                or observation.trust_disposition is not CrossGraphTrustDisposition.UNTRUSTED
+                or observation.status is not CrossGraphEvidenceStatus.AUTHORITATIVE
+                or observation.provenance_evidence_id not in self._evidence_by_id
+                or not self._has_complete_provenance(observation.provenance_evidence_id)
+            ):
+                continue
+            lifecycles = sorted(
+                (item for item in self.snapshot.cross_graph_link_lifecycle if item.claim_id == claim.id),
+                key=lambda item: (item.revision, item.id),
+            )
+            current = lifecycles[-1] if lifecycles else None
+            if current is None or _value(current.state) != CrossGraphLinkLifecycleState.CANDIDATE.value:
+                continue
+            results.append({
+                "claim_id": claim.id,
+                "observation_id": observation.id,
+                "relation_kind": claim.relation_kind,
+                "target": claim.target.as_dict(),
+                "trust_disposition": observation.trust_disposition.value,
+                "lifecycle": str(_value(current.state)),
+            })
+        return results
 
     def _node_result(self, node: Node) -> QueryNodeResult:
         return QueryNodeResult(

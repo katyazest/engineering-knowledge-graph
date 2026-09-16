@@ -52,6 +52,18 @@ from engineering_kg.openlore_bridge import (
     adapt_resolution_to_changed_symbol_mappings,
 )
 from engineering_kg.pipeline import PipelineResult, run_pipeline
+from engineering_kg.ingest.scenario_test_traceability import (
+    DeclaredTestMapping,
+    NormalizedTestCodeResolution,
+    NormalizedTestExecutionObservation,
+    ScenarioTestTraceabilityMetadata,
+    ScenarioTestTraceabilityResult,
+    TraceabilityAdmissionError,
+    admit_scenario_test_traceability,
+    normalize_test_code_resolution,
+    normalize_test_execution_observation,
+    parse_test_traceability,
+)
 from engineering_kg.persistence import (
     LadybugDbStore,
     PersistenceError,
@@ -109,6 +121,16 @@ __all__ = [
     "persist_graph_snapshot",
     "read_graph_snapshot",
     "run_pipeline",
+    "DeclaredTestMapping",
+    "NormalizedTestCodeResolution",
+    "NormalizedTestExecutionObservation",
+    "ScenarioTestTraceabilityMetadata",
+    "ScenarioTestTraceabilityResult",
+    "TraceabilityAdmissionError",
+    "admit_scenario_test_traceability",
+    "normalize_test_code_resolution",
+    "normalize_test_execution_observation",
+    "parse_test_traceability",
     "stable_id",
     "verification_node",
     "verification_node_id",

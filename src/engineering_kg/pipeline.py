@@ -20,6 +20,12 @@ from engineering_kg.ingest.pr_code_candidates import (
     PrCodeCandidateExtractionResult,
     extract_pr_code_candidates,
 )
+from engineering_kg.ingest.scenario_test_traceability import (
+    NormalizedTestCodeResolution,
+    NormalizedTestExecutionObservation,
+    ScenarioTestTraceabilityResult,
+    admit_scenario_test_traceability,
+)
 from engineering_kg.ontology import GraphSnapshot
 from engineering_kg.openlore import OpenLoreSourceValidationResult, validate_workspace_openlore_source
 from engineering_kg.persistence import (
@@ -50,6 +56,7 @@ class PipelineResult:
     graph_integrity_validation: GraphValidationResult | None = None
     ontology_migration: OntologyMigrationResult | None = None
     pr_code_candidate_extraction: PrCodeCandidateExtractionResult | None = None
+    scenario_test_traceability: ScenarioTestTraceabilityResult | None = None
 
     @property
     def configured_stage_count(self) -> int:
@@ -100,6 +107,10 @@ class PipelineResult:
             data.pop("pr_code_candidate_extraction")
         else:
             data["pr_code_candidate_extraction"] = {"metadata": self.pr_code_candidate_extraction.metadata.as_dict()}
+        if self.scenario_test_traceability is None:
+            data.pop("scenario_test_traceability")
+        else:
+            data["scenario_test_traceability"] = {"metadata": self.scenario_test_traceability.metadata.as_dict()}
         return data
 
 
@@ -110,6 +121,8 @@ def run_pipeline(
     openspec_store_id: str | None = None,
     pr_change_sets: tuple[NormalizedPullRequestEvidence, ...] | None = None,
     engineering_change_subject_graph: GraphSnapshot | None = None,
+    test_execution_observations: tuple[NormalizedTestExecutionObservation, ...] | None = None,
+    test_code_resolutions: tuple[NormalizedTestCodeResolution, ...] | None = None,
 ) -> PipelineResult:
     """Start the MVP pipeline, optionally persisting a graph snapshot."""
 
@@ -127,9 +140,11 @@ def run_pipeline(
         graph_integrity_validation = None
         ontology_migration = None
         pr_code_candidate_extraction = None
+        scenario_test_traceability = None
         _validate_candidate_stage_order(
             configured_stages, pr_change_sets
         )
+        _validate_traceability_stage_order(configured_stages)
         if "workspace-registry" in configured_stages:
             executed_stages.append("workspace-registry")
             graph = registry.to_graph_snapshot()
@@ -148,6 +163,19 @@ def run_pipeline(
             openspec_graph_extraction = extract_openspec_graph(openspec_store_source)
             graph = graph.merged_with(openspec_graph_extraction.graph)
             executed_stages.append("openspec-graph-extraction")
+        if "scenario-test-traceability" in configured_stages:
+            if openspec_store_source is None or openspec_graph_extraction is None:
+                raise ValueError(
+                    "scenario-test-traceability requires successful openspec-store-source and openspec-graph-extraction stages"
+                )
+            scenario_test_traceability = admit_scenario_test_traceability(
+                openspec_store_source,
+                openspec_graph_extraction,
+                test_execution_observations or (),
+                test_code_resolutions or (),
+            )
+            graph = graph.merged_with(scenario_test_traceability.graph)
+            executed_stages.append("scenario-test-traceability")
         openlore_source = None
         if "workspace-openlore-source" in configured_stages:
             openlore_source = validate_workspace_openlore_source(registry)
@@ -179,6 +207,7 @@ def run_pipeline(
                     openspec_store_source=openspec_store_source,
                     openspec_graph_extraction=openspec_graph_extraction,
                     pr_code_candidate_extraction=pr_code_candidate_extraction,
+                    scenario_test_traceability=scenario_test_traceability,
                     ontology_migration=OntologyMigrationResult(
                         graph,
                         status="failed",
@@ -213,6 +242,7 @@ def run_pipeline(
             graph_integrity_validation=graph_integrity_validation,
             ontology_migration=ontology_migration,
             pr_code_candidate_extraction=pr_code_candidate_extraction,
+            scenario_test_traceability=scenario_test_traceability,
         )
 
     if persistence_path is not None:
@@ -283,6 +313,26 @@ def _validate_candidate_stage_order(
     for later in ("graph-derivation", "graph-integrity-validation"):
         if later in stages and candidate_index > stages.index(later):
             raise ValueError(f"pr-code-candidate-extraction must run before {later}")
+
+
+def _validate_traceability_stage_order(stages: tuple[str, ...]) -> None:
+    """Validate traceability prerequisites before any stage can emit its delta."""
+
+    if "scenario-test-traceability" not in stages:
+        return
+    traceability_index = stages.index("scenario-test-traceability")
+    for prerequisite in ("openspec-store-source", "openspec-graph-extraction"):
+        if prerequisite not in stages or stages.index(prerequisite) > traceability_index:
+            raise ValueError(
+                "scenario-test-traceability requires prior "
+                f"{prerequisite} stage"
+            )
+    for later in (
+        "ladybugdb-persistence", "ontology-migration", "graph-derivation",
+        "graph-integrity-validation",
+    ):
+        if later in stages and traceability_index > stages.index(later):
+            raise ValueError(f"scenario-test-traceability must run before {later}")
 
 
 def _validate_candidate_subject_availability(

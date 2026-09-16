@@ -101,6 +101,9 @@ SOURCE_MAPPINGS = (
     SourceMapping("normalized-verification-verified-by", "verified_by", "semantic"),
     SourceMapping("normalized-verification-executed-in", "executed_in", "semantic"),
     SourceMapping("normalized-verification-validates", "validates", "semantic"),
+    SourceMapping("declared-test", "verified_by", "semantic"),
+    SourceMapping("normalized-execution", "executed_in", "semantic"),
+    SourceMapping("reliable-test-code-resolution", "references", "candidate"),
 )
 
 
