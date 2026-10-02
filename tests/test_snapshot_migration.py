@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from engineering_kg.ontology import (
     CodeLocator, CrossGraphLinkClaim, CrossGraphLinkEvidence, CrossGraphLinkLifecycle,
-    Edge, Evidence, GraphSnapshot, Node, NodeKind, OpenSpecLocator,
+    Edge, Evidence, GraphMergeConflict, GraphSnapshot, Node, NodeKind, OpenSpecLocator,
     ProvenanceRecord, PullRequestDeclaredAssociation, PullRequestImplementationEvidence,
     PullRequestObservedRepositoryRelation, SourceArtifactIdentity,
     openspec_specification_id, stable_id,
@@ -97,6 +97,65 @@ class SnapshotMigrationTest(unittest.TestCase):
         document = empty_document(CATALOG_REVISION)
         document["catalog_revision"] = "retired"
         with self.assertRaisesRegex(SnapshotCodecError, "unsupported-catalog-revision"):
+            deserialize_snapshot(document)
+
+    def test_codec_preserves_declared_cross_graph_claim_order(self) -> None:
+        claims = (
+            CrossGraphLinkClaim("change", "touches", CodeLocator("repo", "a" * 40, "b.py", "pkg.b")),
+            CrossGraphLinkClaim("change", "touches", CodeLocator("repo", "a" * 40, "a.py", "pkg.a")),
+        )
+        document = serialize_snapshot(GraphSnapshot(cross_graph_link_claims=claims), CATALOG_REVISION)
+        self.assertEqual(document["cross_graph_link_claim_order"], [item.id for item in claims])
+        self.assertEqual(deserialize_snapshot(document).cross_graph_link_claims, claims)
+
+    def test_codec_rejects_claim_identity_and_shape_drift(self) -> None:
+        claim = CrossGraphLinkClaim("change", "touches", CodeLocator("repo", "a" * 40, "a.py", "pkg.a"))
+        document = serialize_snapshot(GraphSnapshot(cross_graph_link_claims=(claim,)), CATALOG_REVISION)
+        for field, value in (
+            ("id", "wrong-id"),
+            ("target", {"page_id": "page"}),
+            ("unexpected", "ignored"),
+        ):
+            with self.subTest(field=field):
+                corrupted = copy.deepcopy(document)
+                corrupted["cross_graph_link_claims"][claim.id][field] = value
+                with self.assertRaises(SnapshotCodecError):
+                    deserialize_snapshot(corrupted)
+
+    def test_codec_rejects_drifted_pr_and_support_record_identity(self) -> None:
+        claim = CrossGraphLinkClaim("change", "touches", CodeLocator("repo", "a" * 40, "a.py", "pkg.a"))
+        observation = CrossGraphLinkEvidence(claim.id, "test", "observation", "evidence", "observed", "authoritative", "reviewed", "untrusted")
+        lifecycle = CrossGraphLinkLifecycle(claim.id, 1, "candidate", "evidence", "observed", "authoritative", "reviewed", "untrusted")
+        pr = PullRequestImplementationEvidence("bitbucket:pr-1", "repository", "a" * 40, "b" * 40, True, "source", "evidence")
+        association = PullRequestDeclaredAssociation(pr.id, "change", "source", "evidence")
+        relation = PullRequestObservedRepositoryRelation(pr.id, "repository", "source", "evidence")
+        document = serialize_snapshot(GraphSnapshot(
+            cross_graph_link_claims=(claim,), cross_graph_link_evidence=(observation,),
+            cross_graph_link_lifecycle=(lifecycle,), pull_request_evidence=(pr,),
+            pull_request_declared_associations=(association,),
+            pull_request_observed_repository_relations=(relation,),
+        ), CATALOG_REVISION)
+        cases = (
+            ("cross_graph_link_evidence", observation.id, "id", "wrong-id"),
+            ("cross_graph_link_evidence", observation.id, "unexpected", "ignored"),
+            ("cross_graph_link_lifecycle", lifecycle.id, "id", "wrong-id"),
+            ("pull_request_evidence", pr.id, "node_id", "wrong-id"),
+            ("pull_request_declared_associations", association.id, "origin", "observed"),
+            ("pull_request_observed_repository_relations", relation.id, "origin", "declared"),
+        )
+        for collection, record_id, field, value in cases:
+            with self.subTest(collection=collection, field=field):
+                corrupted = copy.deepcopy(document)
+                corrupted[collection][record_id][field] = value
+                with self.assertRaises(SnapshotCodecError):
+                    deserialize_snapshot(corrupted)
+
+    def test_codec_rejects_unknown_provenance_fields(self) -> None:
+        identity = SourceArtifactIdentity("openspec", "requirements", "openspec-spec", "a" * 40, "openspec/specs/payments/spec.md")
+        provenance = ProvenanceRecord("external", "2026-01-02T03:04:05+00:00", "sha256", "a" * 64, "test", "1", identity)
+        document = serialize_snapshot(GraphSnapshot(provenance=(provenance,)), CATALOG_REVISION)
+        document["provenance"][provenance.id]["extra"] = "discarded value"
+        with self.assertRaisesRegex(SnapshotCodecError, "provenance.extra"):
             deserialize_snapshot(document)
 
     def test_unsupported_prior_and_unrecognized_versionless_documents_fail_closed(self) -> None:
@@ -488,6 +547,76 @@ class SnapshotMigrationTest(unittest.TestCase):
             )
             self.assertNotIn("hunter2-catalog-secret", str(diagnostics))
             self.assertNotIn("catalog-secret-token-123", str(diagnostics))
+
+    def test_current_read_diagnostics_keep_rule_without_document_values(self) -> None:
+        cases = (
+            ("unknown-order-id", {"node_order": ["Bearer private-token"]}, "Persisted record order references unknown id"),
+            ("mismatched-record-id", {"nodes": {"node-key": {"id": "Bearer private-token"}}}, "Persisted record id mismatch"),
+            ("unknown-record-field", {"nodes": {"node-key": {"id": "node-key", "Bearer private-token": "payload"}}}, "invalid-record-shape"),
+            ("invalid-record-value", {"nodes": {"node-key": {"id": "node-key", "kind": "repository", "name": "repo", "properties": "Bearer private-token"}}}, "snapshot-codec-invalid"),
+        )
+        for label, mutation, rule in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                graph_path = Path(temporary) / "graph"
+                store = initialize_ladybugdb_store(graph_path)
+                document = empty_document(CATALOG_REVISION)
+                document.update(mutation)
+                store._write_raw(document)
+                original = store._graph_file.read_bytes()
+                result = run_pipeline(persistence_path=graph_path).as_dict()
+                self.assertEqual(store._graph_file.read_bytes(), original)
+            diagnostics = result["ontology_migration"]["diagnostics"]
+            self.assertIn(rule, str(diagnostics))
+            self.assertNotIn("private-token", str(diagnostics))
+
+    def test_legacy_failure_redacts_untrusted_record_id_in_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            graph_path = Path(temporary) / "graph"
+            store = initialize_ladybugdb_store(graph_path)
+            document = {
+                "catalog_revision": CATALOG_REVISION,
+                "nodes": {"Bearer private-token": Node("Bearer private-token", "openspec-requirement", "payment", {"capability": "payments"}).as_dict()},
+                "node_order": ["Bearer private-token"],
+                "edges": {}, "edge_order": [],
+            }
+            store._write_raw(document)
+            original = store._graph_file.read_bytes()
+            result = run_pipeline(persistence_path=graph_path).as_dict()
+            self.assertEqual(store._graph_file.read_bytes(), original)
+        diagnostics = result["ontology_migration"]["diagnostics"]
+        self.assertIn("legacy-identity-insufficient", str(diagnostics))
+        self.assertIn("record-id-redacted", str(diagnostics))
+        self.assertNotIn("private-token", str(diagnostics))
+
+    def test_write_integrity_diagnostic_keeps_rule_and_safe_object_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = initialize_ladybugdb_store(Path(temporary) / "graph")
+            original = store._graph_file.read_bytes()
+            with self.assertRaises(PersistenceIntegrityError) as raised:
+                store.write_snapshot(GraphSnapshot(nodes=(Node("Bearer private-token", "openspec-spec", "payments"),)))
+            self.assertEqual(store._graph_file.read_bytes(), original)
+        self.assertIn("retired-openspec-domain-vocabulary", str(raised.exception))
+        self.assertIn("record-id-redacted", str(raised.exception))
+        self.assertNotIn("private-token", str(raised.exception))
+
+        edge_id = stable_id("edge", "missing-endpoint")
+        with tempfile.TemporaryDirectory() as temporary:
+            store = initialize_ladybugdb_store(Path(temporary) / "graph")
+            with self.assertRaises(PersistenceIntegrityError) as raised:
+                store.write_snapshot(GraphSnapshot(edges=(Edge(edge_id, "contains", "missing-source", "missing-target"),)))
+        self.assertIn("edge-source-exists", str(raised.exception))
+        self.assertIn(edge_id, str(raised.exception))
+        self.assertNotIn("missing-source", str(raised.exception))
+
+    def test_published_merge_conflicts_redact_untrusted_ids(self) -> None:
+        conflict = GraphMergeConflict(
+            "node-merge-conflict", "nodes", "Bearer private-token",
+            ("Bearer private-token",), ("evidence:0123456789abcdef",),
+        )
+        diagnostic = PersistenceIntegrityError("graph-merge-conflict", (conflict,)).as_dict()
+        self.assertEqual(diagnostic["conflicts"][0]["canonical_id"], "record-id-redacted")
+        self.assertEqual(diagnostic["conflicts"][0]["contributor_evidence_ids"], ["evidence:0123456789abcdef"])
+        self.assertNotIn("private-token", str(diagnostic))
 
 
 if __name__ == "__main__":

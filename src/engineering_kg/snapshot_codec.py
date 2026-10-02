@@ -72,7 +72,7 @@ def deserialize_snapshot(document: Mapping[str, Any], *, allow_legacy_evidence: 
     edges = tuple(_edge(item) for item in _ordered(data, "edges", "edge_order"))
     evidence = tuple(_evidence(item, allow_legacy_evidence) for item in _ordered(data, "evidence", "evidence_order"))
     provenance = tuple(_provenance(item) for item in _ordered(data, "provenance", "provenance_order"))
-    claims = tuple(_claim(item) for item in _ordered(data, "cross_graph_link_claims", "cross_graph_link_order"))
+    claims = tuple(_claim(item) for item in _ordered(data, "cross_graph_link_claims", "cross_graph_link_claim_order"))
     observations = tuple(_observation(item) for item in _ordered(data, "cross_graph_link_evidence", "cross_graph_link_evidence_order"))
     lifecycle = tuple(_lifecycle(item) for item in _ordered(data, "cross_graph_link_lifecycle", "cross_graph_link_lifecycle_order"))
     prs = tuple(_pr(item) for item in _ordered(data, "pull_request_evidence", "pull_request_evidence_order"))
@@ -220,6 +220,7 @@ def _locator(value: Any) -> Any:
 
 
 def _provenance(item: dict[str, Any]) -> ProvenanceRecord:
+    _allowed(item, {"id", "kind", "observed_at", "content_hash_algorithm", "content_hash", "extractor_id", "extractor_version", "source_artifact_identity", "derivation_rule_id", "input_provenance_ids"}, "provenance")
     try:
         record = ProvenanceRecord(_text(item.get("kind"), "provenance.kind"), _text(item.get("observed_at"), "provenance.observed_at"), _text(item.get("content_hash_algorithm"), "provenance.content_hash_algorithm"), _text(item.get("content_hash"), "provenance.content_hash"), _text(item.get("extractor_id"), "provenance.extractor_id"), _text(item.get("extractor_version"), "provenance.extractor_version"), _identity(item["source_artifact_identity"]) if item.get("source_artifact_identity") is not None else None, _optional_text(item.get("derivation_rule_id"), "provenance.derivation_rule_id"), _texts(item.get("input_provenance_ids", []), "provenance.input_provenance_ids"))
     except (TypeError, ValueError) as exc:
@@ -230,51 +231,85 @@ def _provenance(item: dict[str, Any]) -> ProvenanceRecord:
 
 
 def _claim(item: dict[str, Any]) -> CrossGraphLinkClaim:
+    _allowed(item, {"id", "subject_id", "relation_kind", "target"}, "cross_graph_link_claim")
     try:
         target = _locator(item.get("target"))
-        return CrossGraphLinkClaim(_text(item.get("subject_id"), "claim.subject_id"), _text(item.get("relation_kind"), "claim.relation_kind"), target)
+        if not isinstance(target, CodeLocator):
+            raise SnapshotCodecError("cross_graph_link_claim.target must be a CodeLocator")
+        record = CrossGraphLinkClaim(_text(item.get("subject_id"), "claim.subject_id"), _text(item.get("relation_kind"), "claim.relation_kind"), target)
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "cross_graph_link_claim")
+    return record
 
 
 def _observation(item: dict[str, Any]) -> CrossGraphLinkEvidence:
+    _allowed(item, {"claim_id", "confidence", "id", "observation_id", "origin", "provenance_evidence_id", "status", "strategy_id", "trust_disposition", "pull_request_evidence_id", "declared_association_id", "verification_evidence_id"}, "cross_graph_link_evidence")
     try:
         for field in ("claim_id", "strategy_id", "observation_id", "provenance_evidence_id", "origin", "status", "confidence", "trust_disposition"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise SnapshotCodecError(f"cross_graph_link_evidence.{field} must be a non-empty string")
         if item.get("strategy_id") == "pr-code-candidate-extraction" and (item.get("pull_request_evidence_id") is None or item.get("declared_association_id") is None):
             raise SnapshotCodecError("legacy-pr-candidate-readback-unsupported: PR candidate lacks explicit PR evidence and association")
-        return CrossGraphLinkEvidence(_text(item.get("claim_id"), "observation.claim_id"), _text(item.get("strategy_id"), "observation.strategy_id"), _text(item.get("observation_id"), "observation.observation_id"), _text(item.get("provenance_evidence_id"), "observation.provenance_evidence_id"), _text(item.get("origin"), "observation.origin"), _text(item.get("status"), "observation.status"), _text(item.get("confidence"), "observation.confidence"), _text(item.get("trust_disposition"), "observation.trust_disposition"), _optional_text(item.get("pull_request_evidence_id"), "observation.pull_request_evidence_id"), _optional_text(item.get("declared_association_id"), "observation.declared_association_id"), _optional_text(item.get("verification_evidence_id"), "observation.verification_evidence_id"))
+        record = CrossGraphLinkEvidence(_text(item.get("claim_id"), "observation.claim_id"), _text(item.get("strategy_id"), "observation.strategy_id"), _text(item.get("observation_id"), "observation.observation_id"), _text(item.get("provenance_evidence_id"), "observation.provenance_evidence_id"), _text(item.get("origin"), "observation.origin"), _text(item.get("status"), "observation.status"), _text(item.get("confidence"), "observation.confidence"), _text(item.get("trust_disposition"), "observation.trust_disposition"), _optional_text(item.get("pull_request_evidence_id"), "observation.pull_request_evidence_id"), _optional_text(item.get("declared_association_id"), "observation.declared_association_id"), _optional_text(item.get("verification_evidence_id"), "observation.verification_evidence_id"))
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "cross_graph_link_evidence")
+    return record
 
 
 def _lifecycle(item: dict[str, Any]) -> CrossGraphLinkLifecycle:
+    _allowed(item, {"claim_id", "confidence", "id", "origin", "provenance_evidence_id", "revision", "state", "status", "trust_disposition"}, "cross_graph_link_lifecycle")
     try:
         for field in ("claim_id", "state", "provenance_evidence_id", "origin", "status", "confidence", "trust_disposition"):
             if not isinstance(item.get(field), str) or not item[field].strip():
                 raise SnapshotCodecError(f"cross_graph_link_lifecycle.{field} must be a non-empty string")
-        return CrossGraphLinkLifecycle(_text(item.get("claim_id"), "lifecycle.claim_id"), item.get("revision"), _text(item.get("state"), "lifecycle.state"), _text(item.get("provenance_evidence_id"), "lifecycle.provenance_evidence_id"), _text(item.get("origin"), "lifecycle.origin"), _text(item.get("status"), "lifecycle.status"), _text(item.get("confidence"), "lifecycle.confidence"), _text(item.get("trust_disposition"), "lifecycle.trust_disposition"))
+        revision = item.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise SnapshotCodecError("cross_graph_link_lifecycle.revision must be an integer")
+        record = CrossGraphLinkLifecycle(_text(item.get("claim_id"), "lifecycle.claim_id"), revision, _text(item.get("state"), "lifecycle.state"), _text(item.get("provenance_evidence_id"), "lifecycle.provenance_evidence_id"), _text(item.get("origin"), "lifecycle.origin"), _text(item.get("status"), "lifecycle.status"), _text(item.get("confidence"), "lifecycle.confidence"), _text(item.get("trust_disposition"), "lifecycle.trust_disposition"))
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "cross_graph_link_lifecycle")
+    return record
 
 
 def _pr(item: dict[str, Any]) -> PullRequestImplementationEvidence:
+    _allowed(item, {"base_revision", "head_revision", "id", "merged", "node_id", "provenance_evidence_id", "pull_request_id", "repository_id", "source_evidence_id"}, "pull_request_evidence")
     try:
-        return PullRequestImplementationEvidence(_text(item.get("pull_request_id"), "pr.pull_request_id"), _text(item.get("repository_id"), "pr.repository_id"), _text(item.get("base_revision"), "pr.base_revision"), _text(item.get("head_revision"), "pr.head_revision"), item.get("merged"), _text(item.get("source_evidence_id"), "pr.source_evidence_id"), _text(item.get("provenance_evidence_id"), "pr.provenance_evidence_id"))
+        record = PullRequestImplementationEvidence(_text(item.get("pull_request_id"), "pr.pull_request_id"), _text(item.get("repository_id"), "pr.repository_id"), _text(item.get("base_revision"), "pr.base_revision"), _text(item.get("head_revision"), "pr.head_revision"), item.get("merged"), _text(item.get("source_evidence_id"), "pr.source_evidence_id"), _text(item.get("provenance_evidence_id"), "pr.provenance_evidence_id"))
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "pull_request_evidence")
+    if item.get("node_id") != record.node_id:
+        raise SnapshotCodecError("pull_request_evidence.node_id does not match its stable identity")
+    return record
 
 
 def _association(item: dict[str, Any]) -> PullRequestDeclaredAssociation:
+    _allowed(item, {"id", "intended_change_id", "origin", "provenance_evidence_id", "pull_request_evidence_id", "source_evidence_id"}, "pull_request_declared_association")
     try:
-        return PullRequestDeclaredAssociation(_text(item.get("pull_request_evidence_id"), "association.pull_request_evidence_id"), _text(item.get("intended_change_id"), "association.intended_change_id"), _text(item.get("source_evidence_id"), "association.source_evidence_id"), _text(item.get("provenance_evidence_id"), "association.provenance_evidence_id"))
+        record = PullRequestDeclaredAssociation(_text(item.get("pull_request_evidence_id"), "association.pull_request_evidence_id"), _text(item.get("intended_change_id"), "association.intended_change_id"), _text(item.get("source_evidence_id"), "association.source_evidence_id"), _text(item.get("provenance_evidence_id"), "association.provenance_evidence_id"))
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "pull_request_declared_association")
+    if item.get("origin") != "declared":
+        raise SnapshotCodecError("pull_request_declared_association.origin must be declared")
+    return record
 
 
 def _relation(item: dict[str, Any]) -> PullRequestObservedRepositoryRelation:
+    _allowed(item, {"id", "origin", "provenance_evidence_id", "pull_request_evidence_id", "repository_id", "source_evidence_id"}, "pull_request_observed_repository_relation")
     try:
-        return PullRequestObservedRepositoryRelation(_text(item.get("pull_request_evidence_id"), "relation.pull_request_evidence_id"), _text(item.get("repository_id"), "relation.repository_id"), _text(item.get("source_evidence_id"), "relation.source_evidence_id"), _text(item.get("provenance_evidence_id"), "relation.provenance_evidence_id"))
+        record = PullRequestObservedRepositoryRelation(_text(item.get("pull_request_evidence_id"), "relation.pull_request_evidence_id"), _text(item.get("repository_id"), "relation.repository_id"), _text(item.get("source_evidence_id"), "relation.source_evidence_id"), _text(item.get("provenance_evidence_id"), "relation.provenance_evidence_id"))
     except (TypeError, ValueError) as exc:
         raise SnapshotCodecError(str(exc)) from exc
+    _record_identity(item, record, "pull_request_observed_repository_relation")
+    if item.get("origin") != "observed":
+        raise SnapshotCodecError("pull_request_observed_repository_relation.origin must be observed")
+    return record
+
+
+def _record_identity(item: dict[str, Any], record: Any, context: str) -> None:
+    if item.get("id") != record.id:
+        raise SnapshotCodecError(f"{context}.id does not match its stable identity")

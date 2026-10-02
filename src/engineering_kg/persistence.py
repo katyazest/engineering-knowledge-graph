@@ -34,6 +34,7 @@ from engineering_kg.snapshot_migration import (
     SnapshotMigrationError,
     SnapshotMigrationResult,
     _safe_codec_diagnostic_id,
+    _safe_record_id,
     migrate_snapshot_document,
 )
 
@@ -99,7 +100,16 @@ class PersistenceIntegrityError(PersistenceError):
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "conflicts": [item.as_dict() for item in self.conflicts],
+            "conflicts": [
+                {
+                    **item.as_dict(),
+                    "canonical_id": _safe_record_id(item.canonical_id),
+                    "contributor_record_ids": [_safe_record_id(value) for value in item.contributor_record_ids],
+                    "contributor_evidence_ids": [_safe_record_id(value) for value in item.contributor_evidence_ids],
+                    "contributor_provenance_ids": [_safe_record_id(value) for value in item.contributor_provenance_ids],
+                }
+                for item in self.conflicts
+            ],
             "message": str(self),
         }
 
@@ -172,8 +182,8 @@ class LadybugDbStore:
 
     def write_snapshot(self, snapshot: GraphSnapshot) -> GraphSnapshot:
         try:
-            if error := verification_payload_error(snapshot):
-                raise PersistenceIntegrityError(error)
+            if verification_payload_error(snapshot):
+                raise PersistenceIntegrityError("verification-payload-boundary")
             source_data = self._read_raw()
             migration = self._run_migration(source_data)
             current_data = migration.document or source_data
@@ -181,9 +191,9 @@ class LadybugDbStore:
             try:
                 prospective = current.merged_with(snapshot)
             except GraphMergeConflictError as exc:
-                raise PersistenceIntegrityError(str(exc), exc.conflicts) from exc
+                raise PersistenceIntegrityError("Conflicting graph record values: graph-merge-conflict", exc.conflicts) from exc
             except ValueError as exc:
-                raise PersistenceIntegrityError(str(exc)) from exc
+                raise PersistenceIntegrityError(_safe_merge_diagnostic(exc)) from exc
             # Validate the full prospective graph, including constraints that
             # apply across writes, before replacing the persisted snapshot.
             _validate_snapshot(prospective)
@@ -295,7 +305,7 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
     for item in snapshot.evidence:
         if error := source_artifact_identity_error(item):
             raise PersistenceIntegrityError(
-                f"legacy-evidence-migration-unsupported: {item.id}: {error}"
+                f"legacy-evidence-migration-unsupported: {_safe_record_id(item.id)}: {error}"
             )
     try:
         canonical = GraphSnapshot(
@@ -351,12 +361,12 @@ def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
 
 
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
-    if error := verification_payload_error(snapshot):
-        raise PersistenceIntegrityError(error)
+    if verification_payload_error(snapshot):
+        raise PersistenceIntegrityError("verification-payload-boundary")
     try:
         serialized = snapshot.as_dict()
     except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
+        raise PersistenceIntegrityError("snapshot-serialization-invalid") from exc
     _reject_forbidden_fields(serialized)
     validation = validate_graph_integrity(snapshot)
     errors = [item for item in validation.metadata.diagnostics if item.severity == "error"]
@@ -369,7 +379,7 @@ def _validate_snapshot(snapshot: GraphSnapshot) -> None:
         }
         summary = safe_summaries.get(diagnostic.rule_id, "graph integrity validation failed")
         raise PersistenceIntegrityError(
-            f"{diagnostic.rule_id}: {summary}"
+            f"{diagnostic.rule_id}: {summary} ({_safe_record_id(diagnostic.affected_object_id)})"
         )
 
 
@@ -378,7 +388,7 @@ def _reject_forbidden_fields(value: Any, path: str = "graph") -> None:
         for key, nested in value.items():
             key_text = str(key)
             if _is_forbidden_persistence_field(key_text):
-                raise PersistenceIntegrityError(f"{path}.{key_text} is not allowed in persistence")
+                raise PersistenceIntegrityError("forbidden-persistence-field")
             _reject_forbidden_fields(nested, f"{path}.{key_text}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
@@ -394,6 +404,22 @@ def _is_forbidden_persistence_field(key: str) -> bool:
     ).replace("-", "_").casefold()
     tokens = set(folded.split("_")) | set(normalized.split("_"))
     return folded in {field.casefold() for field in FORBIDDEN_PERSISTENCE_FIELDS}
+
+
+def _safe_merge_diagnostic(error: ValueError) -> str:
+    """Retain known validation rules while dropping record values from errors."""
+    message = str(error)
+    for prefix in (
+        "invalid-cross-graph-classification",
+        "Pull-request source artifact invalid",
+        "Pull-request association provenance binding invalid",
+        "Pull-request repository relation provenance binding invalid",
+        "Pull-request typed relation lacks its exact projected edge",
+        "Pull-request projected edge does not match its typed relation",
+    ):
+        if message.startswith(prefix):
+            return prefix
+    return "snapshot-merge-invalid"
 
 
 def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = False) -> GraphSnapshot:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -95,12 +96,18 @@ _SAFE_CODEC_DIAGNOSTIC_IDS = (
     "unsupported-catalog-revision",
     "legacy-pr-candidate-readback-unsupported",
     "Persisted record id mismatch",
+    "Persisted record order references unknown id",
     "invalid-cross-graph-opaque-identifier",
     "invalid-source-artifact-identity",
     "invalid-provenance",
     "forbidden-persistence-field",
     "invalid-record-shape",
 )
+
+
+def _safe_record_id(value: str) -> str:
+    """Expose only generated stable IDs in operational diagnostics."""
+    return value if re.fullmatch(r"[a-z][a-z0-9-]*:[0-9a-f]{16}", value) else "record-id-redacted"
 
 
 def _safe_codec_diagnostic_id(error: SnapshotCodecError) -> str:
@@ -299,7 +306,7 @@ def _validate_snapshot(snapshot: GraphSnapshot) -> None:
     validation = validate_graph_integrity(snapshot)
     errors = tuple(item for item in validation.metadata.diagnostics if item.severity == "error")
     if errors:
-        raise SnapshotMigrationError("target-integrity-invalid", "migrated ontology snapshot failed graph integrity validation", identifiers=(errors[0].rule_id, errors[0].affected_object_id))
+        raise SnapshotMigrationError("target-integrity-invalid", "migrated ontology snapshot failed graph integrity validation", identifiers=(errors[0].rule_id, _safe_record_id(errors[0].affected_object_id)))
 
 
 def _catalog_document(document: Mapping[str, Any]) -> bool:
@@ -360,7 +367,7 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
             capability = text(item.properties.get("capability"), "capability")
             matches = [spec for spec in specs if spec.properties.get("capability") == capability]
             if not matches or len({spec.properties.get("repository_id") for spec in matches}) != 1:
-                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy requirement has no unique containing specification", identifiers=(item.id,))
+                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy requirement has no unique containing specification", identifiers=(_safe_record_id(item.id),))
             spec = matches[0]
             repository = text(spec.properties.get("repository_id"), "repository_id")
             specification_id = openspec_specification_id(repository, capability)
@@ -371,12 +378,12 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
             parents = [edge.source_id for edge in source.edges if edge.target_id == item.id and edge.kind == "openspec-requirement-contains-scenario"]
             requirements = [nodes_by_id[parent] for parent in parents if parent in nodes_by_id and nodes_by_id[parent].kind == "openspec-requirement"]
             if not requirements or len({(requirement.name, requirement.properties.get("capability")) for requirement in requirements}) != 1:
-                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy scenario has no unique containing requirement", identifiers=(item.id,))
+                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy scenario has no unique containing requirement", identifiers=(_safe_record_id(item.id),))
             requirement = requirements[0]
             capability = text(requirement.properties.get("capability"), "capability")
             specs_for_requirement = [spec for spec in specs if spec.properties.get("capability") == capability]
             if not specs_for_requirement or len({spec.properties.get("repository_id") for spec in specs_for_requirement}) != 1:
-                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy scenario has no unique specification", identifiers=(item.id,))
+                raise SnapshotMigrationError("legacy-identity-insufficient", "legacy scenario has no unique specification", identifiers=(_safe_record_id(item.id),))
             repository = text(specs_for_requirement[0].properties.get("repository_id"), "repository_id")
             requirement_id = openspec_requirement_id(openspec_specification_id(repository, capability), requirement.name)
             node_id = openspec_scenario_id(requirement_id, item.name)
@@ -388,7 +395,7 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
         existing = new_nodes_by_id.get(converted.id)
         if existing is not None:
             if (existing.kind, existing.name, existing.properties) != (converted.kind, converted.name, converted.properties):
-                raise SnapshotMigrationError("legacy-identity-conflict", "legacy records conflict on a canonical identity", identifiers=(converted.id,))
+                raise SnapshotMigrationError("legacy-identity-conflict", "legacy records conflict on a canonical identity", identifiers=(_safe_record_id(converted.id),))
             converted = Node(converted.id, converted.kind, converted.name, converted.properties, tuple(sorted(set(existing.evidence_ids) | set(converted.evidence_ids))))
             new_nodes_by_id[converted.id] = converted
             new_nodes[next(index for index, item in enumerate(new_nodes) if item.id == converted.id)] = converted
@@ -409,10 +416,10 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
         kind = getattr(edge.kind, "value", edge.kind)
         new_kind = mappings.get(kind, edge.kind)
         if kind.startswith("openspec-") and kind not in mappings:
-            raise SnapshotMigrationError("legacy-relationship-unsupported", "legacy relationship mapping is not registered", identifiers=(edge.id,))
+            raise SnapshotMigrationError("legacy-relationship-unsupported", "legacy relationship mapping is not registered", identifiers=(_safe_record_id(edge.id),))
         source_id, target_id = node_map.get(edge.source_id), node_map.get(edge.target_id)
         if source_id is None or target_id is None:
-            raise SnapshotMigrationError("legacy-relationship-endpoint", "legacy relationship endpoint cannot be reconstructed", identifiers=(edge.id,))
+            raise SnapshotMigrationError("legacy-relationship-endpoint", "legacy relationship endpoint cannot be reconstructed", identifiers=(_safe_record_id(edge.id),))
         properties = dict(edge.properties)
         if kind == "openspec-change-traces-to-spec":
             for field in ("source_scope", "target_scope", "via_spec_id"):
@@ -420,7 +427,7 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
         confidence = edge.confidence
         if kind == "openspec-related-spec":
             if not isinstance(properties.get("related_title"), str) or not properties["related_title"].strip():
-                raise SnapshotMigrationError("legacy-relationship-insufficient", "legacy related-spec mapping lacks its retained title", identifiers=(edge.id,))
+                raise SnapshotMigrationError("legacy-relationship-insufficient", "legacy related-spec mapping lacks its retained title", identifiers=(_safe_record_id(edge.id),))
             confidence = "non-confident"
         identity_parts: tuple[Any, ...]
         if kind in {"openspec-spec-contains-requirement", "openspec-requirement-contains-scenario"}:
@@ -448,7 +455,7 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
         if "input_edge_ids" in properties:
             inputs = properties["input_edge_ids"]
             if not isinstance(inputs, (tuple, list)) or any(item not in edge_map for item in inputs):
-                raise SnapshotMigrationError("legacy-relationship-input-insufficient", "derived legacy relationship references an unknown input edge", identifiers=(original.id,))
+                raise SnapshotMigrationError("legacy-relationship-input-insufficient", "derived legacy relationship references an unknown input edge", identifiers=(_safe_record_id(original.id),))
             rewritten_inputs = tuple(edge_map[item] for item in inputs)
             properties["input_edge_ids"] = rewritten_inputs
             identity = stable_id("edge", kind, properties.get("rule_id"), source_id, target_id, *rewritten_inputs)
@@ -459,7 +466,7 @@ def _legacy_transform(document: Mapping[str, Any]) -> tuple[dict[str, Any], int,
         existing_edge = next((existing for existing in edges if existing[0] == identity), None)
         if existing_edge is not None:
             if existing_edge[1:5] != converted_edge[1:5] or existing_edge[6] != converted_edge[6]:
-                raise SnapshotMigrationError("legacy-relationship-conflict", "legacy relationships conflict on a canonical identity", identifiers=(identity,))
+                raise SnapshotMigrationError("legacy-relationship-conflict", "legacy relationships conflict on a canonical identity", identifiers=(_safe_record_id(identity),))
             merged_edge = (*converted_edge[:5], tuple(sorted(set(existing_edge[5]) | set(converted_edge[5]))), converted_edge[6])
             edges[edges.index(existing_edge)] = merged_edge
         else:
@@ -486,13 +493,13 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> GraphSnapshot:
         if not evidence_requires_source_artifact_identity(item) or source_artifact_identity_error(item) is None:
             existing = migrated.get(item.id)
             if existing is not None and existing.as_dict() != item.as_dict():
-                raise SnapshotMigrationError("legacy-evidence-conflict", "legacy evidence records conflict after coalescing", identifiers=(item.id,))
+                raise SnapshotMigrationError("legacy-evidence-conflict", "legacy evidence records conflict after coalescing", identifiers=(_safe_record_id(item.id),))
             migrated[item.id] = item
             continue
         fields = item.properties.get("source_artifact_identity")
         legacy_provenance = item.properties.get("provenance")
         if not isinstance(fields, dict) or not isinstance(legacy_provenance, dict):
-            raise SnapshotMigrationError("legacy-provenance-insufficient", "legacy evidence lacks complete retained identity or provenance", identifiers=(item.id,))
+            raise SnapshotMigrationError("legacy-provenance-insufficient", "legacy evidence lacks complete retained identity or provenance", identifiers=(_safe_record_id(item.id),))
         try:
             identity = SourceArtifactIdentity(
                 _legacy_text(fields.get("source_type"), "source_type"),
@@ -513,7 +520,7 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> GraphSnapshot:
             locator = item.locator
             if isinstance(locator, OpenSpecLocator):
                 if locator.artifact_type != identity.artifact_type or locator.relative_file_path != identity.stable_locator:
-                    raise SnapshotMigrationError("legacy-provenance-conflict", "legacy evidence identity conflicts with its locator", identifiers=(item.id,))
+                    raise SnapshotMigrationError("legacy-provenance-conflict", "legacy evidence identity conflicts with its locator", identifiers=(_safe_record_id(item.id),))
                 migrated_locator = OpenSpecLocator(locator.relative_file_path, locator.artifact_type, locator.openspec_identity, locator.heading_name, locator.line_start, locator.line_end, identity)
                 new_id = stable_id("evidence", identity.id, locator.openspec_identity)
             else:
@@ -528,7 +535,7 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> GraphSnapshot:
                     raise SnapshotMigrationError(
                         "legacy-provenance-conflict",
                         "legacy evidence retained provenance conflicts with its embedded provenance",
-                        identifiers=(item.id,),
+                        identifiers=(_safe_record_id(item.id),),
                     )
                 provenance_ids = item.provenance_ids
             else:
@@ -537,14 +544,14 @@ def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> GraphSnapshot:
             migrated.pop(item.id, None)
             existing = migrated.get(new_id)
             if existing is not None and existing.as_dict() != converted.as_dict():
-                raise SnapshotMigrationError("legacy-evidence-conflict", "legacy evidence records conflict after coalescing", identifiers=(new_id,))
+                raise SnapshotMigrationError("legacy-evidence-conflict", "legacy evidence records conflict after coalescing", identifiers=(_safe_record_id(new_id),))
             migrated[new_id] = converted
             evidence_ids[item.id] = new_id
             provenance[provenance_record.id] = provenance_record
         except SnapshotMigrationError:
             raise
         except (TypeError, ValueError) as exc:
-            raise SnapshotMigrationError("legacy-provenance-insufficient", "legacy evidence lacks complete retained identity or provenance", identifiers=(item.id,)) from exc
+            raise SnapshotMigrationError("legacy-provenance-insufficient", "legacy evidence lacks complete retained identity or provenance", identifiers=(_safe_record_id(item.id),)) from exc
 
     if not evidence_ids:
         return snapshot
