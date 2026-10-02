@@ -61,6 +61,7 @@ def register_query_tools(
         service: str | None = None,
         change: str | None = None,
         evidence_ref: str | None = None,
+        checked_revisions: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """List Engineering KG requirement facts."""
 
@@ -70,24 +71,26 @@ def register_query_tools(
                 service=service,
                 change=change,
                 evidence_ref=evidence_ref,
+                checked_revisions=checked_revisions,
             )
         )
 
     @server.tool()
-    def list_services() -> dict[str, Any]:
+    def list_services(checked_revisions: list[dict[str, str]] | None = None) -> dict[str, Any]:
         """List Engineering KG service and repository facts."""
 
-        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_services())
+        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_services(checked_revisions=checked_revisions))
 
     @server.tool()
-    def list_changes() -> dict[str, Any]:
+    def list_changes(checked_revisions: list[dict[str, str]] | None = None) -> dict[str, Any]:
         """List Engineering KG OpenSpec change facts."""
 
-        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_changes())
+        return _call_tool(lambda: _query(factory, bound_graph_store_path).list_changes(checked_revisions=checked_revisions))
 
     @server.tool()
     def get_traceability(
         object_id: str,
+        checked_revisions: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Return traceability relationships for one Engineering KG graph object."""
 
@@ -95,6 +98,7 @@ def register_query_tools(
             lambda: _query(factory, bound_graph_store_path).get_traceability(
                 object_id,
                 require_validation=require_validation,
+                checked_revisions=checked_revisions,
             )
         )
 

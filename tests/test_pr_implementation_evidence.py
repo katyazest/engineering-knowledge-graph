@@ -184,11 +184,31 @@ class PullRequestImplementationEvidenceTest(unittest.TestCase):
         graph = source.merged_with(extract_pr_code_candidates((normalized,), source).graph)
         with tempfile.TemporaryDirectory() as temporary:
             readback = initialize_ladybugdb_store(Path(temporary) / "store").write_snapshot(graph)
-        result = EngineeringKgQuery.from_snapshot(readback).list_pull_request_implementation_evidence()
+        default_result = EngineeringKgQuery.from_snapshot(readback).list_pull_request_implementation_evidence()
+        self.assertTrue(default_result[0]["evidence_freshness"])
+        self.assertTrue(all(item["status"] == "unknown" for item in default_result[0]["evidence_freshness"]))
+        checked_revisions = [
+            {
+                "source_type": item.source_artifact_identity.source_type,
+                "source_identity": item.source_artifact_identity.source_identity,
+                "artifact_type": item.source_artifact_identity.artifact_type,
+                "stable_locator": item.source_artifact_identity.stable_locator,
+                "revision_or_version": item.source_artifact_identity.revision_or_version,
+                "checked_at": "2026-09-02T12:00:00+00:00",
+            }
+            for item in readback.provenance
+            if item.source_artifact_identity is not None
+        ]
+        result = EngineeringKgQuery.from_snapshot(readback).list_pull_request_implementation_evidence(
+            checked_revisions=checked_revisions,
+        )
         self.assertEqual(result[0]["base_revision"], "a" * 40)
         self.assertEqual(result[0]["head_revision"], "b" * 40)
         self.assertEqual(result[0]["declared_associations"][0]["origin"], "declared")
         self.assertEqual(result[0]["observed_repository_relations"][0]["origin"], "observed")
+        self.assertEqual(result[0]["observed_candidates"][0]["trust_disposition"], "untrusted")
+        self.assertTrue(result[0]["evidence_freshness"])
+        self.assertTrue(all(item["status"] == "fresh" for item in result[0]["evidence_freshness"]))
         self.assertEqual(result[0]["observed_candidates"][0]["trust_disposition"], "untrusted")
         self.assertNotIn("url", str(result).lower())
 
