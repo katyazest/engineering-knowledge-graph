@@ -90,7 +90,7 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
         self.assertNotIn("graph-derivation", result["executed_stages"])
         self.assertNotIn("graph-integrity-validation", result["executed_stages"])
 
-    def test_pipeline_rejects_legacy_records_without_conversion(self) -> None:
+    def test_pipeline_migrates_legacy_records_before_downstream_stages(self) -> None:
         legacy = Node(
             "legacy-spec", "openspec-spec", "Payments",
             {"capability": "payments", "repository_id": "requirements"},
@@ -112,9 +112,10 @@ class PipelineRunnerSmokeTest(unittest.TestCase):
                 graph_path,
                 openspec_stores=(RegisteredOpenSpecStore("requirements-store", ROOT),),
             ).as_dict()
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["ontology_migration"]["status"], "failed")
-        self.assertNotIn("ladybugdb-persistence", result["executed_stages"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["ontology_migration"]["status"], "migrated")
+        self.assertIn("ladybugdb-persistence", result["executed_stages"])
+        self.assertEqual(result["graph"]["nodes"][0]["kind"], "specification")
 
     def test_candidate_stage_requires_enriched_input_and_subject_before_extraction(self) -> None:
         subject = Node("change-1", NodeKind.JIRA_STORY, "EKG-72")

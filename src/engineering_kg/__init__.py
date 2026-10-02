@@ -75,6 +75,14 @@ from engineering_kg.persistence import (
     persist_graph_snapshot,
     read_graph_snapshot,
 )
+from engineering_kg.snapshot_migration import (
+    SnapshotMigrationError,
+    SnapshotMigrationRegistry,
+    SnapshotMigrationResult,
+    SnapshotMigrationTransition,
+    SnapshotSourceDescriptor,
+    migrate_snapshot_document,
+)
 from engineering_kg.query import (
     EngineeringKgQuery,
     GraphObjectNotFoundError,
@@ -121,6 +129,12 @@ __all__ = [
     "persist_graph_snapshot",
     "read_graph_snapshot",
     "run_pipeline",
+    "SnapshotMigrationError",
+    "SnapshotMigrationRegistry",
+    "SnapshotMigrationResult",
+    "SnapshotMigrationTransition",
+    "SnapshotSourceDescriptor",
+    "migrate_snapshot_document",
     "DeclaredTestMapping",
     "NormalizedTestCodeResolution",
     "NormalizedTestExecutionObservation",
