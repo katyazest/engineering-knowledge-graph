@@ -22,6 +22,8 @@ from engineering_kg.ontology import (
     has_complete_resolvable_provenance,
 )
 from engineering_kg.persistence import read_graph_snapshot
+from engineering_kg.freshness import (FreshnessAssessor, FreshnessInputError,
+    current_evidence_eligibility, normalize_checked_revisions)
 from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, relationship_error
 from engineering_kg.validation import GraphValidationResult, validate_graph_integrity
 
@@ -105,6 +107,12 @@ class GraphQueryValidationError(GraphQueryError):
         return data
 
 
+class GraphQueryInputError(GraphQueryError):
+    """Safe input error for invalid freshness checks."""
+
+    code = "invalid-checked-source-revision"
+
+
 @dataclass(frozen=True)
 class QueryNodeResult:
     """Serializable graph node query result."""
@@ -116,10 +124,12 @@ class QueryNodeResult:
     evidence_ids: tuple[str, ...] = ()
     locators: tuple[dict[str, Any], ...] = ()
     provenance: tuple[dict[str, Any], ...] = ()
+    evidence_freshness: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "evidence_ids": list(self.evidence_ids),
+            "evidence_freshness": [_sanitize_value(item) for item in self.evidence_freshness],
             "id": self.id,
             "kind": self.kind,
             "locators": [dict(item) for item in self.locators],
@@ -180,6 +190,14 @@ class EngineeringKgQuery:
         self._nodes_by_id = {node.id: node for node in snapshot.nodes}
         self._evidence_by_id = {item.id: item for item in snapshot.evidence}
         self._provenance_by_id = {item.id: item for item in snapshot.provenance}
+        self._assessor = FreshnessAssessor(self._provenance_by_id, {})
+
+    def _set_checked_revisions(self, checked_revisions: Any) -> None:
+        try:
+            checks = normalize_checked_revisions(checked_revisions)
+        except FreshnessInputError as exc:
+            raise GraphQueryInputError(str(exc)) from None
+        self._assessor = FreshnessAssessor(self._provenance_by_id, checks)
 
     @classmethod
     def from_snapshot(
@@ -210,7 +228,9 @@ class EngineeringKgQuery:
         service: str | None = None,
         change: str | None = None,
         evidence_ref: str | None = None,
+        checked_revisions: Any = None,
     ) -> list[dict[str, Any]]:
+        self._set_checked_revisions(checked_revisions)
         nodes = [
             node
             for node in self.snapshot.nodes
@@ -230,11 +250,13 @@ class EngineeringKgQuery:
             nodes = [node for node in nodes if self._node_has_evidence_ref(node, evidence_ref)]
         return [self._node_result(node).as_dict() for node in _sort_nodes(nodes)]
 
-    def list_services(self) -> list[dict[str, Any]]:
+    def list_services(self, *, checked_revisions: Any = None) -> list[dict[str, Any]]:
+        self._set_checked_revisions(checked_revisions)
         services = [node for node in self.snapshot.nodes if _value(node.kind) == NodeKind.SERVICE.value]
         return [self._service_result(node).as_dict() for node in _sort_nodes(services)]
 
-    def list_changes(self) -> list[dict[str, Any]]:
+    def list_changes(self, *, checked_revisions: Any = None) -> list[dict[str, Any]]:
+        self._set_checked_revisions(checked_revisions)
         changes = [
             node
             for node in self.snapshot.nodes
@@ -249,9 +271,11 @@ class EngineeringKgQuery:
         *,
         intended_change_id: str | None = None,
         require_validation: bool = False,
+        checked_revisions: Any = None,
     ) -> list[dict[str, Any]]:
         """Return represented PR evidence without inferring implementation."""
 
+        self._set_checked_revisions(checked_revisions)
         if require_validation:
             validation = self.validation or validate_graph_integrity(self.snapshot)
             _raise_if_invalid(validation)
@@ -298,6 +322,7 @@ class EngineeringKgQuery:
                 "repository_id": evidence.repository_id,
                 "source_evidence_id": evidence.source_evidence_id,
                 "observed_candidates": self._pr_candidates_for(evidence.id, linked_associations),
+                "evidence_freshness": self._freshness_for((evidence.provenance_evidence_id, evidence.source_evidence_id)),
             })
         return results
 
@@ -310,7 +335,10 @@ class EngineeringKgQuery:
         *,
         require_validation: bool = False,
         missing_ok: bool = True,
+        checked_revisions: Any = None,
+        current_required_evidence_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
+        self._set_checked_revisions(checked_revisions)
         if require_validation:
             validation = self.validation or validate_graph_integrity(self.snapshot)
             _raise_if_invalid(validation)
@@ -342,7 +370,7 @@ class EngineeringKgQuery:
             relationships=relationships,
             support_records=support_records,
             cross_graph_links=self._cross_graph_links_for(object_id),
-        ).as_dict()
+        ).as_dict() | ({"current_evidence_eligibility": current_evidence_eligibility(current_required_evidence_ids, self._evidence_by_id, self._assessor)} if current_required_evidence_ids else {})
 
     def get_scenario_test_traceability(
         self,
@@ -350,9 +378,11 @@ class EngineeringKgQuery:
         *,
         require_validation: bool = False,
         missing_ok: bool = True,
+        checked_revisions: Any = None,
     ) -> dict[str, Any]:
         """Return exact declared mapping and represented execution state."""
 
+        self._set_checked_revisions(checked_revisions)
         if require_validation:
             validation = self.validation or validate_graph_integrity(self.snapshot)
             _raise_if_invalid(validation)
@@ -406,6 +436,7 @@ class EngineeringKgQuery:
                 "execution_state": "executed" if runs else "not-executed",
                 "run_ids": runs,
                 "candidates": candidates,
+                "evidence_freshness": self._freshness_for(mapping_evidence),
             })
         return ScenarioTestTraceabilityResult(
             object_id, "mapped" if mappings else "unmapped", tuple(mappings),
@@ -468,6 +499,7 @@ class EngineeringKgQuery:
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
             provenance=self._provenance_for(node.evidence_ids),
+            evidence_freshness=self._freshness_for(node.evidence_ids),
         )
 
     def _service_result(self, node: Node) -> QueryNodeResult:
@@ -491,6 +523,7 @@ class EngineeringKgQuery:
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
             provenance=self._provenance_for(node.evidence_ids),
+            evidence_freshness=self._freshness_for(node.evidence_ids),
         )
 
     def _change_result(self, node: Node) -> QueryNodeResult:
@@ -516,6 +549,7 @@ class EngineeringKgQuery:
             evidence_ids=tuple(sorted(node.evidence_ids)),
             locators=self._locators_for(node.evidence_ids),
             provenance=self._provenance_for(node.evidence_ids),
+            evidence_freshness=self._freshness_for(node.evidence_ids),
         )
 
     def _pr_candidates_for(self, pull_request_evidence_id: str, associations: list[Any]) -> list[dict[str, Any]]:
@@ -544,6 +578,7 @@ class EngineeringKgQuery:
         data: dict[str, Any] = {
             "edge_id": edge.id,
             "evidence_ids": sorted(edge.evidence_ids),
+            "evidence_freshness": list(self._freshness_for(edge.evidence_ids)),
             "kind": str(_value(edge.kind)),
             "properties": (
                 {}
@@ -655,7 +690,21 @@ class EngineeringKgQuery:
                 if evidence_id in self._evidence_by_id else ()
             )
         })
-        return tuple(_sanitize_value(self._provenance_by_id[item].as_dict()) for item in ids if item in self._provenance_by_id)
+        results = []
+        for item in ids:
+            record = self._provenance_by_id.get(item)
+            if record is not None:
+                results.append(_sanitize_value(record.as_dict() | {"freshness": self._assessor.assess(item).as_dict()}))
+        return tuple(results)
+
+    def _freshness_for(self, evidence_ids: Any) -> tuple[dict[str, Any], ...]:
+        results = []
+        normalized = {item.id if isinstance(item, Evidence) else item for item in evidence_ids}
+        for evidence_id in sorted(normalized):
+            evidence = self._evidence_by_id.get(evidence_id)
+            if evidence is not None:
+                results.append(self._assessor.evidence(evidence))
+        return tuple(results)
 
     def _cross_graph_links_for(self, object_id: str) -> tuple[dict[str, Any], ...]:
         """Project links for a claim subject or cited verification evidence."""
@@ -684,6 +733,7 @@ class EngineeringKgQuery:
             observations = [
                 {
                     **observation.as_dict(),
+                    "evidence_freshness": self._freshness_for((observation.provenance_evidence_id,)),
                     "provenance": list(
                         self._provenance_for((observation.provenance_evidence_id,))
                     ),
@@ -693,6 +743,7 @@ class EngineeringKgQuery:
             lifecycle = [
                 {
                     **entry.as_dict(),
+                    "evidence_freshness": self._freshness_for((entry.provenance_evidence_id,)),
                     "provenance": list(
                         self._provenance_for((entry.provenance_evidence_id,))
                     ),

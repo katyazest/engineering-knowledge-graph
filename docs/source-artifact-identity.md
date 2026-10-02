@@ -71,3 +71,8 @@ fails with the deterministic
 `legacy-source-artifact-identity: OpenSpec evidence lacks sufficient authoritative identity fields`
 diagnostic. Migration never infers identity from a display name, absolute path,
 or current filesystem layout.
+# As-of evidence freshness
+
+Freshness is an ephemeral assessment, not a property written into provenance. A caller may pass a checked authoritative source revision (source type, source identity, artifact type, stable locator, revision, and offset-aware `checked_at`) to local fact queries. The caller is responsible for having checked that source; the graph query API validates the supplied shape but does not contact or authenticate the provider. Results are **as of** that check, not a real-time guarantee.
+
+Only equality of opaque revisions for the same logical artifact establishes `fresh` or `stale`. Without a matching check, including when an observation is old or its hash/extractor metadata changed, the result is `unknown`. Derived evidence keeps each input chain's status and uncertainty. Current-evidence eligibility is an opt-in fail-closed guard for consumers that explicitly request it: missing, stale, or unknown support does not qualify. Freshness does not promote trust, turn PR observations into `IMPLEMENTS` proof, or change stored classification. No named critical readiness workflow is designated by this change; such a policy needs separate approval.

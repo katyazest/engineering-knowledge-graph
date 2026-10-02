@@ -256,6 +256,36 @@ class ScenarioTestTraceabilityTest(unittest.TestCase):
         projection = EngineeringKgQuery.from_snapshot(graph).get_scenario_test_traceability(requirement.id)
         self.assertEqual(projection["mappings"][0]["execution_state"], "executed")
         self.assertEqual(len(projection["mappings"][0]["candidates"]), 1)
+        self.assertTrue(projection["mappings"][0]["evidence_freshness"])
+        self.assertTrue(all(
+            item["status"] == "unknown"
+            for item in projection["mappings"][0]["evidence_freshness"]
+        ))
+        provenance_by_id = {item.id: item for item in graph.provenance}
+        mapping_provenance = [
+            provenance_by_id[item]
+            for item in projection["mappings"][0]["mapping_provenance_ids"]
+        ]
+        checked_revisions = [
+            {
+                "source_type": item.source_artifact_identity.source_type,
+                "source_identity": item.source_artifact_identity.source_identity,
+                "artifact_type": item.source_artifact_identity.artifact_type,
+                "stable_locator": item.source_artifact_identity.stable_locator,
+                "revision_or_version": item.source_artifact_identity.revision_or_version,
+                "checked_at": "2026-09-02T12:00:00+00:00",
+            }
+            for item in mapping_provenance
+            if item.source_artifact_identity is not None
+        ]
+        checked_projection = EngineeringKgQuery.from_snapshot(graph).get_scenario_test_traceability(
+            requirement.id, checked_revisions=checked_revisions,
+        )
+        checked_mapping = checked_projection["mappings"][0]
+        self.assertEqual(checked_mapping["execution_state"], projection["mappings"][0]["execution_state"])
+        self.assertTrue(checked_mapping["evidence_freshness"])
+        self.assertTrue(all(item["status"] == "fresh" for item in checked_mapping["evidence_freshness"]))
+        self.assertEqual(checked_mapping["candidates"][0]["lifecycle"], "candidate")
         with tempfile.TemporaryDirectory() as temporary:
             readback = initialize_ladybugdb_store(Path(temporary) / "candidate-graph").write_snapshot(graph)
         readback_projection = EngineeringKgQuery.from_snapshot(readback).get_scenario_test_traceability(requirement.id)
@@ -543,6 +573,11 @@ class ScenarioTestTraceabilityTest(unittest.TestCase):
         with self.assertRaises(GraphQueryValidationError):
             EngineeringKgQuery.from_snapshot(invalid_graph).get_scenario_test_traceability(
                 requirement.id, require_validation=True,
+                checked_revisions=[{
+                    "source_type": "openspec", "source_identity": "requirements",
+                    "artifact_type": "openspec-spec", "stable_locator": "specs/payments.md",
+                    "revision_or_version": "r1", "checked_at": "2026-09-02T00:00:00+00:00",
+                }],
             )
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(PersistenceIntegrityError):
