@@ -197,6 +197,7 @@ def run_pipeline(
             executed_stages.append("ontology-migration")
             try:
                 ontology_migration = store.migrate_persisted_snapshot()
+                graph = store.write_snapshot(graph)
             except PersistenceError as exc:
                 return PipelineResult(
                     status="failed",
@@ -215,11 +216,17 @@ def run_pipeline(
                     ),
                 )
             executed_stages.append("ladybugdb-persistence")
-            graph = store.write_snapshot(graph)
             ontology_migration = OntologyMigrationResult(
-                graph,
-                ontology_migration.migrated_node_count,
-                ontology_migration.migrated_edge_count,
+                snapshot=graph,
+                migrated_node_count=ontology_migration.migrated_node_count,
+                migrated_edge_count=ontology_migration.migrated_edge_count,
+                status=ontology_migration.status,
+                diagnostics=ontology_migration.diagnostics,
+                source_version=ontology_migration.source_version,
+                source_descriptor=ontology_migration.source_descriptor,
+                target_version=ontology_migration.target_version,
+                applied_migration_ids=ontology_migration.applied_migration_ids,
+                graph_counts=_graph_counts(graph),
             )
         if "graph-derivation" in configured_stages:
             graph_derivation = derive_graph_relationships(graph)
@@ -247,12 +254,30 @@ def run_pipeline(
 
     if persistence_path is not None:
         store = initialize_ladybugdb_store(persistence_path)
-        ontology_migration = store.migrate_persisted_snapshot()
-        graph = store.write_snapshot(GraphSnapshot())
+        try:
+            ontology_migration = store.migrate_persisted_snapshot()
+            graph = store.write_snapshot(GraphSnapshot())
+        except PersistenceError as exc:
+            return PipelineResult(
+                status="failed",
+                configured_stages=("ontology-migration", "ladybugdb-persistence"),
+                executed_stages=("ontology-migration",),
+                graph=GraphSnapshot(),
+                ontology_migration=OntologyMigrationResult(
+                    GraphSnapshot(), status="failed", diagnostics=(str(exc),),
+                ),
+            )
         ontology_migration = OntologyMigrationResult(
-            graph,
-            ontology_migration.migrated_node_count,
-            ontology_migration.migrated_edge_count,
+            snapshot=graph,
+            migrated_node_count=ontology_migration.migrated_node_count,
+            migrated_edge_count=ontology_migration.migrated_edge_count,
+            status=ontology_migration.status,
+            diagnostics=ontology_migration.diagnostics,
+            source_version=ontology_migration.source_version,
+            source_descriptor=ontology_migration.source_descriptor,
+            target_version=ontology_migration.target_version,
+            applied_migration_ids=ontology_migration.applied_migration_ids,
+            graph_counts=_graph_counts(graph),
         )
         return PipelineResult(
             status="completed",
@@ -361,3 +386,18 @@ def _change_subject_id(change_set: NormalizedPullRequestEvidence) -> str:
             "legacy merged-revision-only PR change-set input is unsupported"
         )
     return change_set.association.intended_change_id
+
+
+def _graph_counts(graph: GraphSnapshot) -> dict[str, int]:
+    return {
+        "edge_count": graph.edge_count,
+        "evidence_count": graph.evidence_count,
+        "node_count": graph.node_count,
+        "provenance_count": graph.provenance_count,
+        "cross_graph_link_claim_count": graph.cross_graph_link_claim_count,
+        "cross_graph_link_evidence_count": graph.cross_graph_link_evidence_count,
+        "cross_graph_link_lifecycle_count": graph.cross_graph_link_lifecycle_count,
+        "pull_request_evidence_count": graph.pull_request_evidence_count,
+        "pull_request_declared_association_count": graph.pull_request_declared_association_count,
+        "pull_request_observed_repository_relation_count": graph.pull_request_observed_repository_relation_count,
+    }

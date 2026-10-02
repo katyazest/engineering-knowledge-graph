@@ -364,8 +364,9 @@ class VerificationOntologyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "store")
             store._write_raw({"catalog_revision": "3"})
-            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: '3'"):
+            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: unsupported-catalog-revision") as raised:
                 store.read_snapshot()
+            self.assertNotIn("'3'", str(raised.exception))
 
     def test_validation_and_readback_report_malformed_verification_records_safely(self) -> None:
         evidence = _source_evidence("malformed-verification")
@@ -387,7 +388,7 @@ class VerificationOntologyTest(unittest.TestCase):
                 "nodes": {raw_node["id"]: raw_node},
                 "node_order": [raw_node["id"]],
             })
-            with self.assertRaisesRegex(PersistenceIntegrityError, "node.unexpected is not allowed"):
+            with self.assertRaisesRegex(PersistenceIntegrityError, "invalid-record-shape"):
                 store.read_snapshot()
 
     def test_verification_edge_and_evidence_payloads_are_rejected_before_persistence(self) -> None:

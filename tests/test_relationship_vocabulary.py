@@ -141,6 +141,19 @@ class RelationshipVocabularyTest(unittest.TestCase):
             [("relationship-endpoint-contract", edge.id)],
         )
 
+    def test_in_memory_admission_rejects_out_of_catalog_relationship_kind(self) -> None:
+        source = Node("source", NodeKind.SERVICE, "service")
+        target = Node("target", NodeKind.WORKSPACE, "workspace")
+        edge = Edge("invalid-kind", "owns", source.id, target.id)
+
+        result = validate_graph_integrity(GraphSnapshot((source, target), (edge,)))
+
+        self.assertEqual(result.status, "invalid")
+        self.assertEqual(
+            [(item.rule_id, item.affected_object_id) for item in result.metadata.diagnostics],
+            [("relationship-vocabulary-kind", edge.id)],
+        )
+
     def test_structural_contains_requires_complete_evidence_provenance(self) -> None:
         change = Node("change", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change")
         artifact = Node("artifact", NodeKind.OPENSPEC_ARTIFACT, "proposal")

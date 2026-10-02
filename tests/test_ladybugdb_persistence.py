@@ -30,7 +30,6 @@ from engineering_kg.ontology import (
     stable_id,
 )
 from engineering_kg.persistence import (
-    MIGRATION_BACKUP_FILE_NAME,
     PersistenceInitializationError,
     PersistenceIntegrityError,
     PersistenceWriteError,
@@ -122,12 +121,12 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             migrate_graph_snapshot(snapshot)
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
-            store._write_raw({"catalog_revision": CATALOG_REVISION, "node_order": [item.id for item in snapshot.nodes], "nodes": {item.id: item.as_dict() for item in snapshot.nodes}, "edge_order": [legacy_edge.id], "edges": {legacy_edge.id: legacy_edge.as_dict()}, "evidence_order": [item.id for item in snapshot.evidence], "evidence": {item.id: item.as_dict() for item in snapshot.evidence}})
+            store._write_raw({"ontology_schema_version": 1, "catalog_revision": CATALOG_REVISION, "node_order": [item.id for item in snapshot.nodes], "nodes": {item.id: item.as_dict() for item in snapshot.nodes}, "edge_order": [legacy_edge.id], "edges": {item.id: item.as_dict() for item in snapshot.edges}, "evidence_order": [item.id for item in snapshot.evidence], "evidence": {item.id: item.as_dict() for item in snapshot.evidence}})
             original = store._graph_file.read_text(encoding="utf-8")
-            with self.assertRaisesRegex(PersistenceIntegrityError, "canonical relationship catalog"):
+            with self.assertRaisesRegex(PersistenceIntegrityError, "relationship-vocabulary-kind"):
                 store.read_snapshot()
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
-            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+            self.assertFalse(tuple(store.path.glob("graph.pre-ontology-migration.*.json")))
 
     def test_readback_rejects_legacy_openspec_evidence_without_conversion(self) -> None:
         node = Node("node", NodeKind.OPENSPEC_ACTIVE_CHANGE, "change", evidence_ids=("legacy-evidence",))
@@ -298,13 +297,14 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             with self.subTest(mapping=mapping_name, field=field), tempfile.TemporaryDirectory() as tmp:
                 store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
                 store._write_raw({
+                    "ontology_schema_version": 1,
                     "catalog_revision": CATALOG_REVISION,
                     "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                     "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
                 })
                 with self.assertRaisesRegex(
                     PersistenceIntegrityError,
-                    f"{mapping_name if mapping_name == 'locator' else f'locator.{mapping_name}'}\\.{field} is not allowed",
+                    "forbidden-persistence-field",
                 ):
                     store.read_snapshot()
 
@@ -377,16 +377,16 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with self.assertRaises(PersistenceIntegrityError):
             migrate_graph_snapshot(GraphSnapshot(nodes=(legacy_spec, conflicting)))
 
-    def test_readback_rejection_preserves_graph_without_backup(self) -> None:
+    def test_supported_legacy_readback_rewrites_graph_with_backup(self) -> None:
         legacy_spec = Node("legacy-spec", "openspec-spec", "Payments", {"capability": "payments", "repository_id": "requirements"}, ("e",))
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({"catalog_revision": CATALOG_REVISION, "node_order": [legacy_spec.id], "nodes": {legacy_spec.id: legacy_spec.as_dict()}, "edge_order": [], "edges": {}, "evidence_order": ["e"], "evidence": {"e": Evidence("e", "fixture", "fixture").as_dict()}})
             original = store._graph_file.read_text(encoding="utf-8")
-            with self.assertRaises(PersistenceIntegrityError):
-                store.migrate_persisted_snapshot()
-            self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
-            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+            result = store.migrate_persisted_snapshot()
+            self.assertEqual(result.status, "migrated")
+            self.assertNotEqual(store._graph_file.read_text(encoding="utf-8"), original)
+            self.assertTrue(tuple(store.path.glob("graph.pre-ontology-migration.*.json")))
 
     def test_invalid_migration_preserves_original_snapshot(self) -> None:
         legacy_spec = Node(
@@ -418,7 +418,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             with self.assertRaises(PersistenceIntegrityError):
                 store.migrate_persisted_snapshot()
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
-            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+            self.assertFalse(tuple(store.path.glob("graph.pre-ontology-migration.*.json")))
 
     def test_current_readback_rejects_noncanonical_relationships_without_conversion(self) -> None:
         owner = Node("owner", NodeKind.SERVICE, "owner")
@@ -429,6 +429,7 @@ class LadybugDbPersistenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = initialize_ladybugdb_store(Path(tmp) / "ladybugdb")
             store._write_raw({
+                "ontology_schema_version": 1,
                 "catalog_revision": CATALOG_REVISION,
                 "node_order": [item.id for item in snapshot.nodes],
                 "nodes": {item.id: item.as_dict() for item in snapshot.nodes},
@@ -439,12 +440,12 @@ class LadybugDbPersistenceTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 PersistenceIntegrityError,
-                "canonical relationship catalog",
+                "relationship-vocabulary-kind",
             ):
                 store.read_snapshot()
 
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
-            self.assertFalse((store.path / MIGRATION_BACKUP_FILE_NAME).exists())
+            self.assertFalse(tuple(store.path.glob("graph.pre-ontology-migration.*.json")))
 
     def test_readback_rejects_missing_catalog_revision_without_writing(self) -> None:
         node = Node("node", NodeKind.REPOSITORY, "payments")
@@ -467,9 +468,10 @@ class LadybugDbPersistenceTest(unittest.TestCase):
             store._write_raw({"catalog_revision": "1"})
             original = store._graph_file.read_text(encoding="utf-8")
 
-            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: '1'"):
+            with self.assertRaisesRegex(PersistenceIntegrityError, "unsupported-catalog-revision: unsupported-catalog-revision") as raised:
                 store.read_snapshot()
 
+            self.assertNotIn("'1'", str(raised.exception))
             self.assertEqual(store._graph_file.read_text(encoding="utf-8"), original)
 
     def test_empty_store_initializes_and_reads_empty_snapshot(self) -> None:
@@ -586,7 +588,10 @@ class LadybugDbPersistenceTest(unittest.TestCase):
                 "node_order": [], "nodes": {}, "edge_order": [], "edges": {},
                 "evidence_order": [evidence.id], "evidence": {evidence.id: raw_evidence},
             })
-            with self.assertRaisesRegex(PersistenceIntegrityError, "invalid-source-artifact-identity"):
+            with self.assertRaisesRegex(
+                PersistenceIntegrityError,
+                "forbidden-persistence-field",
+            ):
                 store.read_snapshot()
 
     def test_persistence_readback_rejects_payload_body_and_content_identity_values(self) -> None:

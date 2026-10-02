@@ -10,47 +10,36 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from engineering_kg.ontology import (
-    CodeLocator,
-    ConfluencePageRef,
-    CrossGraphLinkClaim,
-    CrossGraphLinkEvidence,
-    CrossGraphLinkLifecycle,
-    Edge,
-    Evidence,
     GraphSnapshot,
-    Node,
-    OpenSpecLocator,
-    ProvenanceRecord,
-    SourceArtifactIdentity,
-    SourceArtifactLocator,
-    PullRequestImplementationEvidence,
-    PullRequestDeclaredAssociation,
-    PullRequestObservedRepositoryRelation,
-    ProvenanceKind,
-    evidence_requires_source_artifact_identity,
     source_artifact_identity_error,
     verification_payload_error,
-    EdgeKind,
     GraphMergeConflict,
     GraphMergeConflictError,
-    NodeKind,
-    openspec_requirement_id,
-    openspec_scenario_id,
-    openspec_specification_id,
-    stable_id,
 )
 from engineering_kg.validation import validate_graph_integrity
-from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, CATALOG_REVISION
+from engineering_kg.relationship_vocabulary import CATALOG_REVISION
+from engineering_kg.snapshot_codec import (
+    CURRENT_SCHEMA_VERSION,
+    SnapshotCodecError,
+    deserialize_snapshot,
+    empty_document,
+    serialize_snapshot,
+)
+from engineering_kg.snapshot_migration import (
+    SnapshotMigrationError,
+    SnapshotMigrationResult,
+    _safe_codec_diagnostic_id,
+    migrate_snapshot_document,
+)
 
 
 GRAPH_FILE_NAME = "graph.json"
-MIGRATION_BACKUP_FILE_NAME = "graph.pre-canonical-migration.json"
+ONTOLOGY_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION
 
 FORBIDDEN_PERSISTENCE_FIELDS = frozenset(
     {
@@ -124,13 +113,18 @@ class OntologyMigrationResult:
     migrated_edge_count: int = 0
     status: str | None = None
     diagnostics: tuple[str, ...] = ()
+    source_version: int | None = None
+    source_descriptor: str | None = None
+    target_version: int = ONTOLOGY_SCHEMA_VERSION
+    applied_migration_ids: tuple[str, ...] = ()
+    graph_counts: dict[str, int] | None = None
 
     @property
     def migrated(self) -> bool:
-        return bool(self.migrated_node_count or self.migrated_edge_count)
+        return self.status == "migrated" or bool(self.migrated_node_count or self.migrated_edge_count)
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "diagnostics": list(self.diagnostics),
             "graph_counts": {
                 "edge_count": self.snapshot.edge_count,
@@ -139,8 +133,15 @@ class OntologyMigrationResult:
             },
             "migrated_edge_count": self.migrated_edge_count,
             "migrated_node_count": self.migrated_node_count,
+            "source_version": self.source_version,
+            "source_descriptor": self.source_descriptor,
+            "target_version": self.target_version,
+            "applied_migration_ids": list(self.applied_migration_ids),
             "status": self.status or ("migrated" if self.migrated else "not-needed"),
         }
+        if self.graph_counts is not None:
+            data["graph_counts"] = dict(sorted(self.graph_counts.items()))
+        return data
 
 
 @dataclass(frozen=True)
@@ -154,9 +155,7 @@ class LadybugDbStore:
         store_path = Path(path).expanduser().resolve()
         try:
             if store_path.exists() and not store_path.is_dir():
-                raise PersistenceInitializationError(
-                    f"Persistence path is not a directory: {store_path}"
-                )
+                raise PersistenceInitializationError("Persistence path is not a directory")
             store_path.mkdir(parents=True, exist_ok=True)
             store = cls(path=store_path)
             if not store._graph_file.exists():
@@ -165,9 +164,7 @@ class LadybugDbStore:
         except PersistenceInitializationError:
             raise
         except OSError as exc:
-            raise PersistenceInitializationError(
-                f"Cannot initialize persistence store at {store_path}: {exc}"
-            ) from exc
+            raise PersistenceInitializationError("Cannot initialize persistence store") from exc
 
     @property
     def _graph_file(self) -> Path:
@@ -177,9 +174,10 @@ class LadybugDbStore:
         try:
             if error := verification_payload_error(snapshot):
                 raise PersistenceIntegrityError(error)
-            current = _snapshot_from_data(
-                self._migrate_raw_if_needed(self._read_raw())
-            )
+            source_data = self._read_raw()
+            migration = self._run_migration(source_data)
+            current_data = migration.document or source_data
+            current = _snapshot_from_data(current_data)
             try:
                 prospective = current.merged_with(snapshot)
             except GraphMergeConflictError as exc:
@@ -189,12 +187,15 @@ class LadybugDbStore:
             # Validate the full prospective graph, including constraints that
             # apply across writes, before replacing the persisted snapshot.
             _validate_snapshot(prospective)
-            self._write_raw(_snapshot_data(prospective))
-            return self.read_snapshot()
+            target_data = _snapshot_data(prospective)
+            if migration.status == "migrated":
+                self._backup_source(source_data, migration)
+            self._write_raw(target_data)
+            return _snapshot_from_data(target_data)
         except PersistenceError:
             raise
         except OSError as exc:
-            raise PersistenceWriteError(f"Cannot write graph snapshot: {exc}") from exc
+            raise PersistenceWriteError("Cannot write graph snapshot") from exc
 
     def read_snapshot(self) -> GraphSnapshot:
         try:
@@ -203,19 +204,23 @@ class LadybugDbStore:
         except PersistenceError:
             raise
         except OSError as exc:
-            raise PersistenceReadError(f"Cannot read graph snapshot: {exc}") from exc
+            raise PersistenceReadError("Cannot read graph snapshot") from exc
 
     def migrate_persisted_snapshot(self) -> OntologyMigrationResult:
-        """Read and verify the only supported canonical persisted format."""
+        """Migrate and atomically commit the logical snapshot when required."""
 
         try:
             data = self._read_raw()
-            _require_current_catalog_revision(data)
-            return OntologyMigrationResult(_snapshot_from_data(data))
+            migration = self._run_migration(data)
+            if migration.status == "migrated":
+                self._backup_source(data, migration)
+                self._write_raw(migration.document or data)
+            snapshot = _snapshot_from_data(migration.document or data)
+            return _persistence_migration_result(snapshot, migration)
         except PersistenceError:
             raise
         except OSError as exc:
-            raise PersistenceWriteError(f"Cannot migrate persisted graph snapshot: {exc}") from exc
+            raise PersistenceWriteError("Cannot migrate persisted graph snapshot") from exc
 
     def _read_raw(self) -> dict[str, Any]:
         if not self._graph_file.exists():
@@ -234,8 +239,36 @@ class LadybugDbStore:
         os.replace(temporary, self._graph_file)
 
     def _migrate_raw_if_needed(self, data: dict[str, Any]) -> dict[str, Any]:
-        _require_current_catalog_revision(data)
-        return data
+        migration = self._run_migration(data)
+        if migration.status == "migrated":
+            self._backup_source(data, migration)
+            self._write_raw(migration.document or data)
+        return migration.document or data
+
+    def _run_migration(self, data: dict[str, Any]) -> SnapshotMigrationResult:
+        try:
+            return migrate_snapshot_document(data)
+        except SnapshotMigrationError as exc:
+            raise PersistenceIntegrityError(f"{exc.code}: {exc}") from exc
+
+    def _backup_source(self, data: dict[str, Any], result: SnapshotMigrationResult) -> None:
+        descriptor = result.source_descriptor or f"v{result.source_version}"
+        safe_descriptor = "".join(char if char.isalnum() or char in "._-" else "_" for char in descriptor)
+        backup = self.path / f"graph.pre-ontology-migration.{safe_descriptor}.json"
+        with self._graph_file.open("rb") as source:
+            source_bytes = source.read()
+        if backup.exists():
+            if backup.read_bytes() != source_bytes:
+                raise PersistenceWriteError("Cannot overwrite non-equivalent ontology migration backup")
+            return
+        temporary = self.path / f"{backup.name}.tmp"
+        try:
+            temporary.write_bytes(source_bytes)
+            os.replace(temporary, backup)
+        except OSError as exc:
+            if temporary.exists():
+                temporary.unlink()
+            raise PersistenceWriteError("Cannot create ontology migration backup") from exc
 
 
 def initialize_ladybugdb_store(path: str | Path) -> LadybugDbStore:
@@ -276,733 +309,45 @@ def migrate_graph_snapshot(snapshot: GraphSnapshot) -> OntologyMigrationResult:
     except ValueError as exc:
         raise PersistenceIntegrityError(str(exc)) from exc
     _validate_snapshot(canonical)
-    return OntologyMigrationResult(canonical)
-
-
-def _reject_legacy_relationship_migration(snapshot: GraphSnapshot) -> None:
-    """Keep the retained domain migration from converting relationship aliases."""
-
-    for edge in sorted(snapshot.edges, key=lambda item: item.id):
-        kind = _value(edge.kind)
-        if kind != EdgeKind.ASSERTS.value and kind not in CATALOG_BY_KIND:
-            raise PersistenceIntegrityError(
-                f"legacy-relationship-migration-unsupported: {edge.id}: {kind}"
-            )
-
-
-def _require_current_catalog_revision(data: dict[str, Any]) -> None:
-    """Reject historical formats rather than converting them on readback."""
-    revision = data.get("catalog_revision")
-    if revision == CATALOG_REVISION:
-        legacy_candidates = any(
-            isinstance(record, dict)
-            and record.get("strategy_id") == "pr-code-candidate-extraction"
-            for record in (data.get("cross_graph_link_evidence") or {}).values()
-            if isinstance(data.get("cross_graph_link_evidence") or {}, dict)
-        )
-        if legacy_candidates and "pull_request_evidence" not in data:
-            raise PersistenceIntegrityError(
-                "legacy-pr-candidate-unsupported: missing base/head revisions and explicit association"
-            )
-        return
-    if revision is None:
-        raise PersistenceIntegrityError("missing-catalog-revision")
-    raise PersistenceIntegrityError(f"unsupported-catalog-revision: {revision!r}")
-
-
-def _migrate_legacy_evidence(snapshot: GraphSnapshot) -> tuple[GraphSnapshot, int]:
-    """Reject retired evidence records; persisted-data migration is unsupported."""
-
-    raise PersistenceIntegrityError("legacy-evidence-migration-unsupported")
-
-    evidence_ids: dict[str, str] = {}
-    evidence_by_id: dict[str, Evidence] = {}
-    provenance: list[ProvenanceRecord] = list(snapshot.provenance)
-    migrated = 0
-    for item in snapshot.evidence:
-        locator = item.locator
-        if isinstance(locator, OpenSpecLocator) and locator.source_artifact_identity is not None:
-            _coalesce_migrated_evidence(evidence_by_id, item)
-            continue
-        if isinstance(locator, SourceArtifactLocator):
-            _coalesce_migrated_evidence(evidence_by_id, item)
-            continue
-        if not evidence_requires_source_artifact_identity(item):
-            _coalesce_migrated_evidence(evidence_by_id, item)
-            continue
-        fields = item.properties.get("source_artifact_identity")
-        if not isinstance(fields, dict):
-            raise PersistenceIntegrityError(
-                "legacy-source-artifact-identity: authoritative evidence lacks sufficient authoritative identity fields"
-            )
-        try:
-            identity = SourceArtifactIdentity(
-                _expect_string(fields.get("source_type"), "legacy source_type"),
-                _expect_string(fields.get("source_identity"), "legacy source_identity"),
-                _expect_string(fields.get("artifact_type"), "legacy artifact_type"),
-                _expect_string(fields.get("revision_or_version"), "legacy revision_or_version"),
-                _expect_string(fields.get("stable_locator"), "legacy stable_locator"),
-            )
-        except (PersistenceIntegrityError, ValueError) as exc:
-            raise PersistenceIntegrityError(
-                "legacy-source-artifact-identity: authoritative evidence lacks sufficient authoritative identity fields"
-            ) from exc
-        if isinstance(locator, OpenSpecLocator):
-            if identity.artifact_type != locator.artifact_type or identity.stable_locator != locator.relative_file_path:
-                raise PersistenceIntegrityError(
-                    "legacy-source-artifact-identity: retained identity conflicts with OpenSpec locator"
-                )
-            migrated_locator = OpenSpecLocator(
-                locator.relative_file_path, locator.artifact_type,
-                locator.openspec_identity, locator.heading_name,
-                locator.line_start, locator.line_end, identity,
-            )
-            new_id = stable_id("evidence", identity.id, locator.openspec_identity)
-        else:
-            migrated_locator = SourceArtifactLocator(identity)
-            new_id = stable_id("evidence", identity.id)
-        evidence_ids[item.id] = new_id
-        properties = dict(item.properties)
-        properties.pop("source_artifact_identity")
-        provenance_fields = properties.pop("provenance", None)
-        if not isinstance(provenance_fields, dict):
-            raise PersistenceIntegrityError("legacy-provenance: authoritative evidence lacks complete retained provenance fields")
-        try:
-            record = ProvenanceRecord(
-                ProvenanceKind.EXTERNAL,
-                _expect_string(provenance_fields.get("observed_at"), "legacy provenance.observed_at"),
-                _expect_string(provenance_fields.get("content_hash_algorithm"), "legacy provenance.content_hash_algorithm"),
-                _expect_string(provenance_fields.get("content_hash"), "legacy provenance.content_hash"),
-                _expect_string(provenance_fields.get("extractor_id"), "legacy provenance.extractor_id"),
-                _expect_string(provenance_fields.get("extractor_version"), "legacy provenance.extractor_version"),
-                identity,
-            )
-        except (PersistenceIntegrityError, ValueError) as exc:
-            raise PersistenceIntegrityError("legacy-provenance: authoritative evidence lacks complete retained provenance fields") from exc
-        provenance.append(record)
-        _coalesce_migrated_evidence(evidence_by_id, Evidence(
-            new_id, item.source, migrated_locator, properties, (record.id,),
-        ))
-        migrated += 1
-    if not migrated:
-        return snapshot, 0
-    rewrite = lambda ids: tuple(sorted({evidence_ids.get(item, item) for item in ids}))
-    return GraphSnapshot(
-        nodes=tuple(Node(item.id, item.kind, item.name, item.properties, rewrite(item.evidence_ids)) for item in snapshot.nodes),
-        edges=tuple(Edge(item.id, item.kind, item.source_id, item.target_id, item.properties,
-                         rewrite(item.evidence_ids), item.confidence) for item in snapshot.edges),
-        evidence=tuple(evidence_by_id[item_id] for item_id in sorted(evidence_by_id)),
-        cross_graph_link_claims=snapshot.cross_graph_link_claims,
-        cross_graph_link_evidence=tuple(CrossGraphLinkEvidence(
-            item.claim_id, item.strategy_id, item.observation_id,
-            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id),
-            item.origin, item.status, item.confidence, item.trust_disposition,
-            item.pull_request_evidence_id, item.declared_association_id,
-            item.verification_evidence_id,
-        ) for item in snapshot.cross_graph_link_evidence),
-        cross_graph_link_lifecycle=tuple(CrossGraphLinkLifecycle(
-            item.claim_id, item.revision, item.state,
-            evidence_ids.get(item.provenance_evidence_id, item.provenance_evidence_id)
-        ) for item in snapshot.cross_graph_link_lifecycle),
-        provenance=tuple(sorted({item.id: item for item in provenance}.values(), key=lambda item: item.id)),
-        pull_request_evidence=snapshot.pull_request_evidence,
-        pull_request_declared_associations=snapshot.pull_request_declared_associations,
-        pull_request_observed_repository_relations=snapshot.pull_request_observed_repository_relations,
-    ), migrated
-
-
-def _coalesce_migrated_evidence(
-    evidence_by_id: dict[str, Evidence], item: Evidence
-) -> None:
-    """Retain one equivalent migrated record or reject conflicting provenance."""
-
-    existing = evidence_by_id.get(item.id)
-    if existing is None:
-        evidence_by_id[item.id] = item
-        return
-    if existing.as_dict() != item.as_dict():
-        raise PersistenceIntegrityError("legacy-source-artifact-identity: conflicting migrated evidence")
-
-
-def _repository_for_legacy_requirement(
-    nodes: tuple[Node, ...], requirement: Node, capability: str
-) -> str:
-    for node in nodes:
-        if _value(node.kind) != "openspec-spec":
-            continue
-        if node.properties.get("capability") == capability:
-            repository_id = node.properties.get("repository_id")
-            if isinstance(repository_id, str) and repository_id:
-                return repository_id
-    raise PersistenceIntegrityError(
-        f"Cannot migrate legacy requirement without a specification repository: {requirement.id}"
+    return OntologyMigrationResult(
+        snapshot=canonical,
+        status="not-needed",
+        source_version=ONTOLOGY_SCHEMA_VERSION,
+        target_version=ONTOLOGY_SCHEMA_VERSION,
+        graph_counts={
+            "edge_count": canonical.edge_count,
+            "evidence_count": canonical.evidence_count,
+            "node_count": canonical.node_count,
+            "provenance_count": canonical.provenance_count,
+        },
     )
 
 
-def _legacy_requirement_for_scenario(
-    edges: tuple[Edge, ...], nodes: tuple[Node, ...], scenario_id: str
-) -> Node:
-    nodes_by_id = {node.id: node for node in nodes}
-    for edge in edges:
-        if edge.target_id == scenario_id and _value(edge.kind) == "openspec-requirement-contains-scenario":
-            requirement = nodes_by_id.get(edge.source_id)
-            if requirement is not None and _value(requirement.kind) == "openspec-requirement":
-                return requirement
-    raise PersistenceIntegrityError(
-        f"Cannot migrate legacy scenario without its containing requirement: {scenario_id}"
+def _persistence_migration_result(
+    snapshot: GraphSnapshot, result: SnapshotMigrationResult,
+) -> OntologyMigrationResult:
+    return OntologyMigrationResult(
+        snapshot=snapshot,
+        migrated_node_count=result.migrated_node_count,
+        migrated_edge_count=result.migrated_edge_count,
+        status=result.status,
+        diagnostics=result.diagnostics,
+        source_version=result.source_version,
+        source_descriptor=result.source_descriptor,
+        target_version=result.target_version,
+        applied_migration_ids=result.applied_migration_ids,
+        graph_counts=result.graph_counts,
     )
-
-
-def _normalized(value: object) -> str:
-    return " ".join(str(value).strip().lower().split())
-
-
-def _migrated_edge_id(
-    edge: Edge,
-    kind: EdgeKind | str,
-    source_id: str,
-    target_id: str,
-    properties: dict[str, Any],
-    nodes_by_id: dict[str, Node],
-) -> str:
-    if _value(edge.kind) == _value(kind):
-        return edge.id
-    if _value(edge.kind) == "openspec-spec-contains-requirement":
-        return stable_id(
-            "edge", kind, source_id, target_id, "spec-requirement", "specification-requirement"
-        )
-    if _value(edge.kind) == "openspec-requirement-contains-scenario":
-        return stable_id(
-            "edge", kind, source_id, target_id, "requirement-scenario", "requirement-scenario"
-        )
-    if _value(edge.kind) == "openspec-change-touches-spec":
-        change = nodes_by_id[source_id]
-        specification = nodes_by_id[target_id]
-        return stable_id(
-            "edge",
-            kind,
-            source_id,
-            target_id,
-            "openspec-change-specification",
-            change.properties.get("change_identity", change.name),
-            specification.properties["capability"],
-        )
-    if _value(edge.kind) == "openspec-change-traces-to-spec":
-        return stable_id(
-            "edge",
-            kind,
-            properties["rule_id"],
-            source_id,
-            target_id,
-            *properties.get("input_edge_ids", ()),
-        )
-    if _value(edge.kind) == "openspec-related-spec":
-        source = nodes_by_id[source_id]
-        return stable_id(
-            "edge",
-            kind,
-            source_id,
-            target_id,
-            "related-spec",
-            source.properties["capability"],
-            properties["related_title"],
-        )
-    return stable_id("edge", kind, source_id, target_id, *sorted(properties.items()))
-
-
-def _value(value: object) -> object:
-    return getattr(value, "value", value)
 
 
 def _empty_graph_data() -> dict[str, dict[str, Any]]:
-    return {
-        "catalog_revision": CATALOG_REVISION,
-        "edge_order": [],
-        "edges": {},
-        "evidence": {},
-        "evidence_order": [],
-        "provenance": {},
-        "provenance_order": [],
-        "cross_graph_link_claims": {},
-        "cross_graph_link_claim_order": [],
-        "cross_graph_link_evidence": {},
-        "cross_graph_link_evidence_order": [],
-        "cross_graph_link_lifecycle": {},
-        "cross_graph_link_lifecycle_order": [],
-        "pull_request_evidence": {},
-        "pull_request_evidence_order": [],
-        "pull_request_declared_associations": {},
-        "pull_request_declared_association_order": [],
-        "pull_request_observed_repository_relations": {},
-        "pull_request_observed_repository_relation_order": [],
-        "node_order": [],
-        "nodes": {},
-    }
-
-
-def _merge_snapshot(data: dict[str, Any], snapshot: GraphSnapshot) -> dict[str, Any]:
-    try:
-        merged_snapshot = _snapshot_from_data(data).merged_with(snapshot)
-    except GraphMergeConflictError as exc:
-        raise PersistenceIntegrityError(str(exc), exc.conflicts) from exc
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    return _snapshot_data(merged_snapshot)
+    return empty_document(CATALOG_REVISION)
 
 
 def _snapshot_data(snapshot: GraphSnapshot) -> dict[str, Any]:
     """Serialize an already validated canonical snapshot for persistence."""
 
-    merged = {
-        "catalog_revision": CATALOG_REVISION,
-        "edge_order": [],
-        "edges": {},
-        "evidence": {},
-        "evidence_order": [],
-        "provenance": {},
-        "provenance_order": [],
-        "cross_graph_link_claims": {},
-        "cross_graph_link_claim_order": [],
-        "cross_graph_link_evidence": {},
-        "cross_graph_link_evidence_order": [],
-        "cross_graph_link_lifecycle": {},
-        "cross_graph_link_lifecycle_order": [],
-        "pull_request_evidence": {},
-        "pull_request_evidence_order": [],
-        "pull_request_declared_associations": {},
-        "pull_request_declared_association_order": [],
-        "pull_request_observed_repository_relations": {},
-        "pull_request_observed_repository_relation_order": [],
-        "node_order": [],
-        "nodes": {},
-    }
-
-    for node in snapshot.nodes:
-        merged["nodes"][node.id] = node.as_dict()
-        merged["node_order"].append(node.id)
-    for edge in snapshot.edges:
-        merged["edges"][edge.id] = edge.as_dict()
-        merged["edge_order"].append(edge.id)
-    for evidence in snapshot.evidence:
-        merged["evidence"][evidence.id] = evidence.as_dict()
-        merged["evidence_order"].append(evidence.id)
-    for provenance in snapshot.provenance:
-        merged["provenance"][provenance.id] = provenance.as_dict()
-        merged["provenance_order"].append(provenance.id)
-    for claim in snapshot.cross_graph_link_claims:
-        merged["cross_graph_link_claims"][claim.id] = claim.as_dict()
-        merged["cross_graph_link_claim_order"].append(claim.id)
-    for observation in snapshot.cross_graph_link_evidence:
-        merged["cross_graph_link_evidence"][observation.id] = observation.as_dict()
-        merged["cross_graph_link_evidence_order"].append(observation.id)
-    for lifecycle in snapshot.cross_graph_link_lifecycle:
-        merged["cross_graph_link_lifecycle"][lifecycle.id] = lifecycle.as_dict()
-        merged["cross_graph_link_lifecycle_order"].append(lifecycle.id)
-    for item in snapshot.pull_request_evidence:
-        merged["pull_request_evidence"][item.id] = item.as_dict()
-        merged["pull_request_evidence_order"].append(item.id)
-    for item in snapshot.pull_request_declared_associations:
-        merged["pull_request_declared_associations"][item.id] = item.as_dict()
-        merged["pull_request_declared_association_order"].append(item.id)
-    for item in snapshot.pull_request_observed_repository_relations:
-        merged["pull_request_observed_repository_relations"][item.id] = item.as_dict()
-        merged["pull_request_observed_repository_relation_order"].append(item.id)
-
-    _reject_forbidden_fields(merged)
-    return merged
-
-
-def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = False) -> GraphSnapshot:
-    nodes = tuple(
-        _node_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("nodes", {}), "nodes"),
-            _expect_string_tuple(data.get("node_order", []), "node_order"),
-        )
-    )
-    edges = tuple(
-        _edge_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("edges", {}), "edges"),
-            _expect_string_tuple(data.get("edge_order", []), "edge_order"),
-        )
-    )
-    evidence = tuple(
-        _evidence_from_dict(item, allow_legacy_evidence)
-        for item in _ordered_records(
-            _expect_mapping(data.get("evidence", {}), "evidence"),
-            _expect_string_tuple(data.get("evidence_order", []), "evidence_order"),
-        )
-    )
-    provenance = tuple(
-        _provenance_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("provenance", {}), "provenance"),
-            _expect_string_tuple(data.get("provenance_order", []), "provenance_order"),
-        )
-    )
-    claims = tuple(
-        _cross_graph_link_claim_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("cross_graph_link_claims", {}), "cross_graph_link_claims"),
-            _expect_string_tuple(data.get("cross_graph_link_claim_order", []), "cross_graph_link_claim_order"),
-        )
-    )
-    observations = tuple(
-        _cross_graph_link_evidence_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("cross_graph_link_evidence", {}), "cross_graph_link_evidence"),
-            _expect_string_tuple(data.get("cross_graph_link_evidence_order", []), "cross_graph_link_evidence_order"),
-        )
-    )
-    lifecycle = tuple(
-        _cross_graph_link_lifecycle_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("cross_graph_link_lifecycle", {}), "cross_graph_link_lifecycle"),
-            _expect_string_tuple(data.get("cross_graph_link_lifecycle_order", []), "cross_graph_link_lifecycle_order"),
-        )
-    )
-    pull_request_evidence = tuple(
-        _pull_request_evidence_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("pull_request_evidence", {}), "pull_request_evidence"),
-            _expect_string_tuple(data.get("pull_request_evidence_order", []), "pull_request_evidence_order"),
-        )
-    )
-    associations = tuple(
-        _pull_request_association_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("pull_request_declared_associations", {}), "pull_request_declared_associations"),
-            _expect_string_tuple(data.get("pull_request_declared_association_order", []), "pull_request_declared_association_order"),
-        )
-    )
-    repository_relations = tuple(
-        _pull_request_repository_relation_from_dict(item)
-        for item in _ordered_records(
-            _expect_mapping(data.get("pull_request_observed_repository_relations", {}), "pull_request_observed_repository_relations"),
-            _expect_string_tuple(data.get("pull_request_observed_repository_relation_order", []), "pull_request_observed_repository_relation_order"),
-        )
-    )
-    try:
-        snapshot = GraphSnapshot(
-            nodes, edges, evidence, claims, observations, lifecycle, provenance,
-            pull_request_evidence, associations, repository_relations,
-            allow_legacy_evidence=allow_legacy_evidence,
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    if not allow_legacy_evidence:
-        _validate_snapshot(snapshot)
-    return snapshot
-
-
-def _ordered_records(records: dict[str, Any], order: tuple[str, ...]) -> list[dict[str, Any]]:
-    if not order:
-        order = tuple(sorted(records))
-    missing = set(records) - set(order)
-    if missing:
-        order = (*order, *tuple(sorted(missing)))
-    values = []
-    for record_id in order:
-        if record_id not in records:
-            raise PersistenceIntegrityError(f"Persisted record order references unknown id: {record_id}")
-        record = _expect_mapping(records[record_id], record_id)
-        if record.get("id") != record_id:
-            raise PersistenceIntegrityError(f"Persisted record id mismatch: {record_id}")
-        values.append(record)
-    return values
-
-
-def _node_from_dict(data: dict[str, Any]) -> Node:
-    _expect_allowed_record_keys(
-        set(data), {"evidence_ids", "id", "kind", "name", "properties"}, "node",
-    )
-    try:
-        return Node(
-            id=_expect_string(data.get("id"), "node.id"),
-            kind=_expect_string(data.get("kind"), "node.kind"),
-            name=_expect_string(data.get("name"), "node.name"),
-            properties=dict(_expect_mapping(data.get("properties", {}), "node.properties")),
-            evidence_ids=tuple(_expect_string_tuple(data.get("evidence_ids", []), "node.evidence_ids")),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-
-
-def _edge_from_dict(data: dict[str, Any]) -> Edge:
-    _expect_allowed_record_keys(
-        set(data),
-        {"confidence", "evidence_ids", "id", "kind", "properties", "source_id", "target_id"},
-        "edge",
-    )
-    return Edge(
-        id=_expect_string(data.get("id"), "edge.id"),
-        kind=_expect_string(data.get("kind"), "edge.kind"),
-        source_id=_expect_string(data.get("source_id"), "edge.source_id"),
-        target_id=_expect_string(data.get("target_id"), "edge.target_id"),
-        properties=dict(_expect_mapping(data.get("properties", {}), "edge.properties")),
-        evidence_ids=tuple(_expect_string_tuple(data.get("evidence_ids", []), "edge.evidence_ids")),
-        confidence=_expect_optional_string(data.get("confidence"), "edge.confidence"),
-    )
-
-
-def _evidence_from_dict(data: dict[str, Any], allow_legacy_evidence: bool = False) -> Evidence:
-    try:
-        record = Evidence(
-            id=_expect_string(data.get("id"), "evidence.id"),
-            source=_expect_string(data.get("source"), "evidence.source"),
-            locator=_locator_from_value(data.get("locator")),
-            properties=dict(_expect_mapping(data.get("properties", {}), "evidence.properties")),
-            provenance_ids=tuple(_expect_string_tuple(data.get("provenance_ids", []), "evidence.provenance_ids")),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    if not allow_legacy_evidence and (error := source_artifact_identity_error(record)):
-        raise PersistenceIntegrityError(
-            f"invalid-source-artifact-identity: {error}"
-        )
-    return record
-
-
-def _provenance_from_dict(data: dict[str, Any]) -> ProvenanceRecord:
-    allowed = {"id", "kind", "observed_at", "content_hash_algorithm", "content_hash", "extractor_id", "extractor_version", "source_artifact_identity", "derivation_rule_id", "input_provenance_ids"}
-    _expect_allowed_locator_keys(set(data), allowed, "provenance")
-    identity_data = data.get("source_artifact_identity")
-    try:
-        record = ProvenanceRecord(
-            _expect_string(data.get("kind"), "provenance.kind"),
-            _expect_string(data.get("observed_at"), "provenance.observed_at"),
-            _expect_string(data.get("content_hash_algorithm"), "provenance.content_hash_algorithm"),
-            _expect_string(data.get("content_hash"), "provenance.content_hash"),
-            _expect_string(data.get("extractor_id"), "provenance.extractor_id"),
-            _expect_string(data.get("extractor_version"), "provenance.extractor_version"),
-            _source_artifact_identity_from_mapping(identity_data) if identity_data is not None else None,
-            _expect_optional_string(data.get("derivation_rule_id"), "provenance.derivation_rule_id"),
-            tuple(_expect_string_tuple(data.get("input_provenance_ids", []), "provenance.input_provenance_ids")),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "provenance")
-    return record
-
-
-def _cross_graph_link_claim_from_dict(data: dict[str, Any]) -> CrossGraphLinkClaim:
-    target = _locator_from_value(data.get("target"))
-    if not isinstance(target, CodeLocator):
-        raise PersistenceIntegrityError("cross_graph_link_claim.target must be a CodeLocator")
-    try:
-        record = CrossGraphLinkClaim(
-            _expect_string(data.get("subject_id"), "cross_graph_link_claim.subject_id"),
-            _expect_string(data.get("relation_kind"), "cross_graph_link_claim.relation_kind"), target,
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "cross_graph_link_claim")
-    return record
-
-
-def _cross_graph_link_evidence_from_dict(data: dict[str, Any]) -> CrossGraphLinkEvidence:
-    _expect_allowed_record_keys(
-        set(data),
-        {
-            "claim_id", "confidence", "id", "observation_id", "origin",
-            "provenance_evidence_id", "status", "strategy_id", "trust_disposition",
-            "pull_request_evidence_id", "declared_association_id", "verification_evidence_id",
-        },
-        "cross_graph_link_evidence",
-    )
-    if data.get("strategy_id") == "pr-code-candidate-extraction" and (
-        data.get("pull_request_evidence_id") is None
-        or data.get("declared_association_id") is None
-    ):
-        raise PersistenceIntegrityError(
-            "legacy-pr-candidate-readback-unsupported: PR candidate lacks explicit PR evidence and association"
-        )
-    try:
-        record = CrossGraphLinkEvidence(
-            _expect_string(data.get("claim_id"), "cross_graph_link_evidence.claim_id"),
-            _expect_string(data.get("strategy_id"), "cross_graph_link_evidence.strategy_id"),
-            _expect_string(data.get("observation_id"), "cross_graph_link_evidence.observation_id"),
-            _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_evidence.provenance_evidence_id"),
-            _expect_string(data.get("origin"), "cross_graph_link_evidence.origin"),
-            _expect_string(data.get("status"), "cross_graph_link_evidence.status"),
-            _expect_string(data.get("confidence"), "cross_graph_link_evidence.confidence"),
-            _expect_string(data.get("trust_disposition"), "cross_graph_link_evidence.trust_disposition"),
-            _expect_optional_string(data.get("pull_request_evidence_id"), "cross_graph_link_evidence.pull_request_evidence_id"),
-            _expect_optional_string(data.get("declared_association_id"), "cross_graph_link_evidence.declared_association_id"),
-            _expect_optional_string(data.get("verification_evidence_id"), "cross_graph_link_evidence.verification_evidence_id"),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "cross_graph_link_evidence")
-    return record
-
-
-def _cross_graph_link_lifecycle_from_dict(data: dict[str, Any]) -> CrossGraphLinkLifecycle:
-    revision = data.get("revision")
-    if isinstance(revision, bool) or not isinstance(revision, int):
-        raise PersistenceIntegrityError("cross_graph_link_lifecycle.revision must be an integer")
-    try:
-        record = CrossGraphLinkLifecycle(
-            _expect_string(data.get("claim_id"), "cross_graph_link_lifecycle.claim_id"), revision,
-            _expect_string(data.get("state"), "cross_graph_link_lifecycle.state"),
-            _expect_string(data.get("provenance_evidence_id"), "cross_graph_link_lifecycle.provenance_evidence_id"),
-            _expect_string(data.get("origin"), "cross_graph_link_lifecycle.origin"),
-            _expect_string(data.get("status"), "cross_graph_link_lifecycle.status"),
-            _expect_string(data.get("confidence"), "cross_graph_link_lifecycle.confidence"),
-            _expect_string(data.get("trust_disposition"), "cross_graph_link_lifecycle.trust_disposition"),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "cross_graph_link_lifecycle")
-    return record
-
-
-def _pull_request_evidence_from_dict(data: dict[str, Any]) -> PullRequestImplementationEvidence:
-    try:
-        record = PullRequestImplementationEvidence(
-            _expect_string(data.get("pull_request_id"), "pull_request_evidence.pull_request_id"),
-            _expect_string(data.get("repository_id"), "pull_request_evidence.repository_id"),
-            _expect_string(data.get("base_revision"), "pull_request_evidence.base_revision"),
-            _expect_string(data.get("head_revision"), "pull_request_evidence.head_revision"),
-            data.get("merged"),
-            _expect_string(data.get("source_evidence_id"), "pull_request_evidence.source_evidence_id"),
-            _expect_string(data.get("provenance_evidence_id"), "pull_request_evidence.provenance_evidence_id"),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "pull_request_evidence")
-    if data.get("node_id") != record.node_id:
-        raise PersistenceIntegrityError("pull_request_evidence.node_id does not match its stable identity")
-    return record
-
-
-def _pull_request_association_from_dict(data: dict[str, Any]) -> PullRequestDeclaredAssociation:
-    try:
-        record = PullRequestDeclaredAssociation(
-            _expect_string(data.get("pull_request_evidence_id"), "pull_request_declared_association.pull_request_evidence_id"),
-            _expect_string(data.get("intended_change_id"), "pull_request_declared_association.intended_change_id"),
-            _expect_string(data.get("source_evidence_id"), "pull_request_declared_association.source_evidence_id"),
-            _expect_string(data.get("provenance_evidence_id"), "pull_request_declared_association.provenance_evidence_id"),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "pull_request_declared_association")
-    if data.get("origin") != "declared":
-        raise PersistenceIntegrityError("pull_request_declared_association.origin must be declared")
-    return record
-
-
-def _pull_request_repository_relation_from_dict(data: dict[str, Any]) -> PullRequestObservedRepositoryRelation:
-    try:
-        record = PullRequestObservedRepositoryRelation(
-            _expect_string(data.get("pull_request_evidence_id"), "pull_request_observed_repository_relation.pull_request_evidence_id"),
-            _expect_string(data.get("repository_id"), "pull_request_observed_repository_relation.repository_id"),
-            _expect_string(data.get("source_evidence_id"), "pull_request_observed_repository_relation.source_evidence_id"),
-            _expect_string(data.get("provenance_evidence_id"), "pull_request_observed_repository_relation.provenance_evidence_id"),
-        )
-    except ValueError as exc:
-        raise PersistenceIntegrityError(str(exc)) from exc
-    _expect_record_id(data, record.id, "pull_request_observed_repository_relation")
-    if data.get("origin") != "observed":
-        raise PersistenceIntegrityError("pull_request_observed_repository_relation.origin must be observed")
-    return record
-
-
-def _expect_record_id(data: dict[str, Any], expected: str, context: str) -> None:
-    if data.get("id") != expected:
-        raise PersistenceIntegrityError(f"{context}.id does not match its stable identity")
-
-
-def _locator_from_value(
-    value: Any,
-) -> str | CodeLocator | ConfluencePageRef | OpenSpecLocator | SourceArtifactLocator:
-    if isinstance(value, str):
-        return value
-    data = _expect_mapping(value, "evidence.locator")
-    keys = set(data)
-    if keys == {"file", "repository", "revision", "symbol"}:
-        return CodeLocator(
-            repository=_expect_string(data["repository"], "locator.repository"),
-            revision=_expect_string(data["revision"], "locator.revision"),
-            file=_expect_string(data["file"], "locator.file"),
-            symbol=_expect_string(data["symbol"], "locator.symbol"),
-        )
-    if keys == {"page_id"}:
-        return ConfluencePageRef(page_id=_expect_string(data["page_id"], "locator.page_id"))
-    if keys == {"navigation_detail", "source_artifact_identity"}:
-        try:
-            identity = _source_artifact_identity_from_mapping(data["source_artifact_identity"])
-            locator = SourceArtifactLocator(
-                identity,
-                dict(_expect_mapping(data["navigation_detail"], "locator.navigation_detail")),
-            )
-        except ValueError as exc:
-            raise PersistenceIntegrityError(str(exc)) from exc
-        return locator
-    if {"artifact_type", "openspec_identity", "relative_file_path"}.issubset(keys):
-        allowed_keys = {
-            "artifact_type", "heading_name", "line_end", "line_start",
-            "openspec_identity", "relative_file_path", "source_artifact_identity",
-        }
-        _expect_allowed_locator_keys(keys, allowed_keys)
-        identity_value = data.get("source_artifact_identity")
-        identity = None
-        if identity_value is not None:
-            try:
-                identity = _source_artifact_identity_from_mapping(identity_value)
-            except ValueError as exc:
-                raise PersistenceIntegrityError(str(exc)) from exc
-        return OpenSpecLocator(
-            relative_file_path=_expect_string(data["relative_file_path"], "locator.relative_file_path"),
-            artifact_type=_expect_string(data["artifact_type"], "locator.artifact_type"),
-            openspec_identity=_expect_string(data["openspec_identity"], "locator.openspec_identity"),
-            heading_name=_expect_optional_string(data.get("heading_name", ""), "locator.heading_name") or "",
-            line_start=_expect_optional_int(data.get("line_start"), "locator.line_start"),
-            line_end=_expect_optional_int(data.get("line_end"), "locator.line_end"),
-            source_artifact_identity=identity,
-        )
-    raise PersistenceIntegrityError(f"Unsupported evidence locator shape: {sorted(keys)}")
-
-
-def _source_artifact_identity_from_mapping(value: Any) -> SourceArtifactIdentity:
-    """Deserialize the complete persisted identity without dropping unknown fields."""
-
-    identity_data = _expect_mapping(value, "locator.source_artifact_identity")
-    _expect_allowed_locator_keys(
-        set(identity_data),
-        {"artifact_type", "id", "revision_or_version", "source_identity", "source_type", "stable_locator"},
-        "locator.source_artifact_identity",
-    )
-    identity = SourceArtifactIdentity(
-        _expect_string(identity_data.get("source_type"), "source_artifact_identity.source_type"),
-        _expect_string(identity_data.get("source_identity"), "source_artifact_identity.source_identity"),
-        _expect_string(identity_data.get("artifact_type"), "source_artifact_identity.artifact_type"),
-        _expect_string(identity_data.get("revision_or_version"), "source_artifact_identity.revision_or_version"),
-        _expect_string(identity_data.get("stable_locator"), "source_artifact_identity.stable_locator"),
-    )
-    _expect_record_id(identity_data, identity.id, "source_artifact_identity")
-    return identity
-
-
-def _expect_allowed_locator_keys(
-    keys: set[str], allowed_keys: set[str], context: str = "locator",
-) -> None:
-    unknown_keys = sorted(keys - allowed_keys)
-    if unknown_keys:
-        raise PersistenceIntegrityError(
-            f"invalid-source-artifact-identity: {context}.{unknown_keys[0]} is not allowed"
-        )
-
-
-def _expect_allowed_record_keys(
-    keys: set[str], allowed_keys: set[str], context: str,
-) -> None:
-    unknown_keys = sorted(keys - allowed_keys)
-    if unknown_keys:
-        raise PersistenceIntegrityError(
-            f"{context}.{unknown_keys[0]} is not allowed"
-        )
+    return serialize_snapshot(snapshot, CATALOG_REVISION)
 
 
 def _validate_snapshot(snapshot: GraphSnapshot) -> None:
@@ -1016,7 +361,16 @@ def _validate_snapshot(snapshot: GraphSnapshot) -> None:
     validation = validate_graph_integrity(snapshot)
     errors = [item for item in validation.metadata.diagnostics if item.severity == "error"]
     if errors:
-        raise PersistenceIntegrityError(errors[0].message)
+        diagnostic = errors[0]
+        safe_summaries = {
+            "cross-graph-implementation-trust": "requires authoritative declared support",
+            "relationship-vocabulary-kind": "canonical relationship catalog violation",
+            "retired-openspec-domain-vocabulary": "Retired OpenSpec-prefixed domain vocabulary",
+        }
+        summary = safe_summaries.get(diagnostic.rule_id, "graph integrity validation failed")
+        raise PersistenceIntegrityError(
+            f"{diagnostic.rule_id}: {summary}"
+        )
 
 
 def _reject_forbidden_fields(value: Any, path: str = "graph") -> None:
@@ -1039,40 +393,12 @@ def _is_forbidden_persistence_field(key: str) -> bool:
         for character in key
     ).replace("-", "_").casefold()
     tokens = set(folded.split("_")) | set(normalized.split("_"))
-    return folded in {field.casefold() for field in FORBIDDEN_PERSISTENCE_FIELDS} or bool(
-        tokens.intersection({"provider", "framework", "ci"})
-    )
+    return folded in {field.casefold() for field in FORBIDDEN_PERSISTENCE_FIELDS}
 
 
-def _expect_mapping(value: Any, context: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise PersistenceIntegrityError(f"{context} must be a mapping")
-    return value
-
-
-def _expect_string(value: Any, context: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise PersistenceIntegrityError(f"{context} must be a non-empty string")
-    return value
-
-
-def _expect_optional_string(value: Any, context: str) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise PersistenceIntegrityError(f"{context} must be a string")
-    return value
-
-
-def _expect_optional_int(value: Any, context: str) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int):
-        raise PersistenceIntegrityError(f"{context} must be an integer")
-    return value
-
-
-def _expect_string_tuple(value: Any, context: str) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        raise PersistenceIntegrityError(f"{context} must be a list")
-    return tuple(_expect_string(item, f"{context}[]") for item in value)
+def _snapshot_from_data(data: dict[str, Any], allow_legacy_evidence: bool = False) -> GraphSnapshot:
+    """Decode through the shared logical codec and map errors at the adapter boundary."""
+    try:
+        return deserialize_snapshot(data, allow_legacy_evidence=allow_legacy_evidence)
+    except SnapshotCodecError as exc:
+        raise PersistenceIntegrityError(_safe_codec_diagnostic_id(exc)) from exc
