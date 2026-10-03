@@ -18,6 +18,22 @@ from engineering_kg.query import EngineeringKgQuery
 
 
 class LocalEkgQueryApiTest(unittest.TestCase):
+    def test_default_traceability_marks_conflicting_endpoint_node_unresolved_in_both_orders(self) -> None:
+        change, _, _, graph = _graph()
+        incompatible_endpoint = Node(change.id, NodeKind.REPOSITORY, "conflicting endpoint")
+        for nodes in ((*graph.nodes, incompatible_endpoint), (incompatible_endpoint, *graph.nodes)):
+            with self.subTest(first=nodes[0].kind):
+                snapshot = GraphSnapshot(
+                    nodes=nodes, edges=graph.edges, evidence=graph.evidence,
+                    provenance=graph.provenance,
+                )
+                trace = EngineeringKgQuery.from_snapshot(snapshot).get_traceability(change.id)
+                projected = next(
+                    item for item in trace["relationships"] if item["edge_id"] == "trace"
+                )
+                self.assertEqual(projected["evidence_use"]["disposition"], "unresolved")
+                self.assertIn("conflicting", projected["evidence_use"]["reason_codes"])
+
     def test_lists_canonical_requirements_with_openspec_provenance(self) -> None:
         change, specification, requirement, graph = _graph()
         result = EngineeringKgQuery.from_snapshot(graph).list_requirements(change=change.name)
@@ -123,6 +139,29 @@ class LocalEkgQueryApiTest(unittest.TestCase):
         self.assertEqual(change_result["properties"]["traceability_spec_ids"], [specification.id])
         self.assertNotIn("repository_ids", service_result["properties"])
 
+    def test_traceability_dangling_evidence_stays_visible_unresolved(self) -> None:
+        change, specification, _, graph = _graph()
+        invalid_trace = Edge(
+            "invalid-trace", EdgeKind.TRACES_TO, change.id, specification.id,
+            evidence_ids=("missing-evidence",),
+        )
+        snapshot = GraphSnapshot(
+            nodes=graph.nodes,
+            edges=(*graph.edges, invalid_trace),
+            evidence=graph.evidence,
+            provenance=graph.provenance,
+        )
+
+        result = EngineeringKgQuery.from_snapshot(snapshot).get_traceability(change.id)
+
+        relationship = next(
+            item for item in result["relationships"] if item["edge_id"] == "invalid-trace"
+        )
+        self.assertEqual(relationship["evidence_use"]["disposition"], "unresolved")
+        self.assertIn("unknown", relationship["evidence_use"]["reason_codes"])
+        self.assertEqual(relationship["evidence_use"]["evidence_ids"], [])
+        self.assertEqual(relationship["evidence_use"]["provenance_ids"], [])
+
     def test_filters_canonical_requirements_by_evidence_reference(self) -> None:
         _, _, requirement, graph = _graph()
         result = EngineeringKgQuery.from_snapshot(graph).list_requirements(
@@ -186,6 +225,41 @@ class LocalEkgQueryApiTest(unittest.TestCase):
 
         self.assertEqual(link["current_lifecycle_disposition"], "rejected")
         self.assertEqual([entry["revision"] for entry in link["lifecycle"]], [1, 2, 3])
+
+    def test_cross_graph_evidence_use_preserves_subject_and_lifecycle_conflicts(self) -> None:
+        subject, graph = _trusted_cross_graph_snapshot()
+        self.assertTrue(graph.trusted_cross_graph_links)
+        claim = graph.cross_graph_link_claims[0]
+        observation = graph.cross_graph_link_evidence[0]
+        trusted_lifecycle = graph.cross_graph_link_lifecycle[0]
+        conflicting_subject = Node(subject.id, NodeKind.REPOSITORY, "conflicting subject")
+        conflicting_lifecycle = CrossGraphLinkLifecycle(
+            claim.id, trusted_lifecycle.revision, "candidate",
+            graph.evidence[1].id, trusted_lifecycle.origin, trusted_lifecycle.status,
+            trusted_lifecycle.confidence, trusted_lifecycle.trust_disposition,
+        )
+
+        cohorts = (
+            ("subject", (subject, conflicting_subject), (trusted_lifecycle,)),
+            ("lifecycle", (subject,), (trusted_lifecycle, conflicting_lifecycle)),
+        )
+        for conflict_kind, nodes, lifecycle in cohorts:
+            for reverse in (False, True):
+                ordered_nodes = tuple(reversed(nodes)) if reverse else nodes
+                ordered_lifecycle = tuple(reversed(lifecycle)) if reverse else lifecycle
+                with self.subTest(conflict=conflict_kind, reversed=reverse):
+                    snapshot = GraphSnapshot(
+                        nodes=ordered_nodes,
+                        evidence=graph.evidence, provenance=graph.provenance,
+                        cross_graph_link_claims=graph.cross_graph_link_claims,
+                        cross_graph_link_evidence=(observation,),
+                        cross_graph_link_lifecycle=ordered_lifecycle,
+                    )
+                    link = EngineeringKgQuery.from_snapshot(snapshot).get_traceability(subject.id)["cross_graph_links"][0]
+                    for projected in (link, link["claim"], link["observations"][0]):
+                        self.assertEqual(projected["evidence_use"]["disposition"], "unresolved")
+                        self.assertIn("conflicting", projected["evidence_use"]["reason_codes"])
+                    self.assertFalse(link["trusted_projection"])
 
 
 def _graph():
@@ -276,6 +350,27 @@ def _cross_graph_fixture():
         ),
     )
     return subject, graph, external, derived
+
+
+def _trusted_cross_graph_snapshot():
+    original_subject, graph, _, _ = _cross_graph_fixture()
+    subject = Node(original_subject.id, NodeKind.REPOSITORY, original_subject.name)
+    claim = CrossGraphLinkClaim(subject.id, "implements", graph.cross_graph_link_claims[0].target)
+    observation = CrossGraphLinkEvidence(
+        claim.id, "fixture", "declared-observation", graph.evidence[0].id,
+        "declared", "authoritative", "fixture", "trusted",
+    )
+    lifecycle = CrossGraphLinkLifecycle(
+        claim.id, 1, "trusted", graph.evidence[0].id,
+        "declared", "authoritative", "fixture", "trusted",
+    )
+    snapshot = GraphSnapshot(
+        nodes=(subject,), evidence=graph.evidence, provenance=graph.provenance,
+        cross_graph_link_claims=(claim,),
+        cross_graph_link_evidence=(observation,),
+        cross_graph_link_lifecycle=(lifecycle,),
+    )
+    return subject, snapshot
 
 
 if __name__ == "__main__":

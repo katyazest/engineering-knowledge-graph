@@ -102,6 +102,22 @@ def register_query_tools(
             )
         )
 
+    @server.tool()
+    def explain_critical_conclusion(
+        conclusion_type: str,
+        subject_id: str,
+        target_id: str | None = None,
+        checked_revisions: list[dict[str, str]] | None = None,
+        current_required: bool = False,
+    ) -> dict[str, Any]:
+        """Explain a bounded ownership or change-readiness conclusion from local graph facts."""
+        return _call_tool(
+            lambda: _query(factory, bound_graph_store_path).explain_critical_conclusion(
+                conclusion_type, subject_id, target_id,
+                checked_revisions=checked_revisions, current_required=current_required,
+            )
+        )
+
     return server
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any
 
 from engineering_kg.ontology import (
@@ -20,10 +21,12 @@ from engineering_kg.ontology import (
     _validate_verification_support_reference,
     OpenSpecLocator,
     has_complete_resolvable_provenance,
+    graph_merge_conflicts,
 )
 from engineering_kg.persistence import read_graph_snapshot
 from engineering_kg.freshness import (FreshnessAssessor, FreshnessInputError,
     current_evidence_eligibility, normalize_checked_revisions)
+from engineering_kg.evidence_use import evaluate_evidence_use
 from engineering_kg.relationship_vocabulary import CATALOG_BY_KIND, relationship_error
 from engineering_kg.validation import GraphValidationResult, validate_graph_integrity
 
@@ -190,6 +193,37 @@ class EngineeringKgQuery:
         self._nodes_by_id = {node.id: node for node in snapshot.nodes}
         self._evidence_by_id = {item.id: item for item in snapshot.evidence}
         self._provenance_by_id = {item.id: item for item in snapshot.provenance}
+        record_conflicts = graph_merge_conflicts(snapshot)
+        self._node_conflicts = {
+            conflict.canonical_id for conflict in record_conflicts
+            if conflict.collection == "node"
+        }
+        self._edge_conflicts = {
+            conflict.canonical_id: conflict for conflict in record_conflicts
+            if conflict.collection == "edge"
+        }
+        self._evidence_conflicts = {
+            conflict.canonical_id for conflict in record_conflicts
+            if conflict.collection == "evidence"
+        }
+        self._provenance_conflicts = {
+            conflict.canonical_id for conflict in record_conflicts
+            if conflict.collection == "provenance"
+        }
+        self._cross_graph_lifecycle_conflicts = {
+            conflict.canonical_id for conflict in record_conflicts
+            if conflict.collection == "cross-graph-link-lifecycle"
+        }
+        owner_targets: dict[str, set[str]] = {}
+        for edge in snapshot.edges:
+            if _value(edge.kind) == EdgeKind.OWNED_BY.value:
+                owner_targets.setdefault(edge.source_id, set()).add(edge.target_id)
+        self._cardinality_conflicted_owners = {
+            source_id for source_id, targets in owner_targets.items()
+            if len(targets) > 1
+            and CATALOG_BY_KIND[EdgeKind.OWNED_BY.value].max_targets_per_source is not None
+            and len(targets) > CATALOG_BY_KIND[EdgeKind.OWNED_BY.value].max_targets_per_source
+        }
         self._assessor = FreshnessAssessor(self._provenance_by_id, {})
 
     def _set_checked_revisions(self, checked_revisions: Any) -> None:
@@ -371,6 +405,100 @@ class EngineeringKgQuery:
             support_records=support_records,
             cross_graph_links=self._cross_graph_links_for(object_id),
         ).as_dict() | ({"current_evidence_eligibility": current_evidence_eligibility(current_required_evidence_ids, self._evidence_by_id, self._assessor)} if current_required_evidence_ids else {})
+
+    def explain_critical_conclusion(
+        self,
+        conclusion_type: str,
+        subject_id: str,
+        target_id: str | None = None,
+        *,
+        checked_revisions: Any = None,
+        current_required: bool = False,
+    ) -> dict[str, Any]:
+        """Explain only represented, bounded critical conclusions; never infer a path."""
+        self._validate_query_identifier(subject_id)
+        if target_id is not None:
+            self._validate_query_identifier(target_id)
+        if not isinstance(conclusion_type, str) or conclusion_type not in {
+            "implementation_ownership", "change_readiness",
+        }:
+            raise GraphQueryInputError("unsupported critical conclusion kind")
+        if not isinstance(current_required, bool):
+            raise GraphQueryInputError("current_required must be a boolean")
+        self._set_checked_revisions(checked_revisions)
+        validation = self.validation or validate_graph_integrity(self.snapshot)
+        _raise_if_invalid(validation)
+
+        def unresolved(reasons: Any, basis: str = "required represented evidence path is absent") -> dict[str, Any]:
+            return {
+                "basis": basis,
+                "conclusion_type": conclusion_type,
+                "disposition": "unresolved",
+                "path": {"edge_ids": [], "evidence_ids": [], "node_ids": [], "provenance_ids": []},
+                "reason_codes": sorted(set(reasons)),
+                "subject_id": subject_id,
+                "target_id": target_id,
+            }
+
+        if conclusion_type == "change_readiness":
+            return unresolved(["unknown"], "no approved change-readiness decision contract exists")
+        subject = self._nodes_by_id.get(subject_id)
+        target = self._nodes_by_id.get(target_id) if target_id is not None else None
+        if subject is None or target is None or _value(subject.kind) not in {
+            NodeKind.SERVICE.value, NodeKind.REPOSITORY.value,
+        }:
+            return unresolved(["unknown"])
+        edges = [edge for edge in self.snapshot.edges
+                 if edge.source_id == subject_id and edge.target_id == target_id
+                 and _value(edge.kind) == EdgeKind.OWNED_BY.value]
+        if not edges:
+            return unresolved(["unknown"])
+        edge = sorted(edges, key=lambda item: item.id)[0]
+        if relationship_error(edge.kind, subject, target) is not None or not edge.evidence_ids:
+            return unresolved(["unknown"])
+        if any(not self._has_complete_provenance(item) for item in edge.evidence_ids):
+            return unresolved(["unknown"])
+        evidence_ids = tuple(sorted(edge.evidence_ids))
+        freshness = [self._assessor.evidence(self._evidence_by_id[item]) for item in evidence_ids]
+        reasons = []
+        if current_required:
+            reasons = ["stale" if item["status"] == "stale" else "unknown"
+                       for item in freshness if item["status"] != "fresh"]
+        if reasons:
+            return unresolved(reasons, "direct ownership support does not satisfy current-required freshness")
+        provenance_ids = sorted({pid for eid in evidence_ids for pid in self._transitive_provenance(eid)})
+        return {
+            "conclusion_type": conclusion_type,
+            "disposition": "supported",
+            "path": {"edge_ids": [edge.id], "evidence_ids": list(evidence_ids),
+                     "node_ids": [subject_id, target_id], "provenance_ids": provenance_ids},
+            "reason_codes": [],
+            "subject_id": subject_id,
+            "target_id": target_id,
+            "trust_disposition": "represented-semantic-edge",
+            "classification": "canonical",
+            "lifecycle": "not-applicable",
+            "evidence_freshness": freshness,
+        }
+
+    @staticmethod
+    def _validate_query_identifier(value: Any) -> None:
+        if not isinstance(value, str) or len(value) > 256 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value):
+            raise GraphQueryInputError("identifier must be a safe graph identifier")
+
+    def _transitive_provenance(self, evidence_id: str) -> set[str]:
+        found: set[str] = set()
+        evidence = self._evidence_by_id.get(evidence_id)
+        pending = list(evidence.provenance_ids) if evidence is not None else []
+        while pending:
+            provenance_id = pending.pop()
+            if provenance_id in found:
+                continue
+            found.add(provenance_id)
+            record = self._provenance_by_id.get(provenance_id)
+            if record is not None:
+                pending.extend(record.input_provenance_ids)
+        return found
 
     def get_scenario_test_traceability(
         self,
@@ -588,6 +716,87 @@ class EngineeringKgQuery:
             "source_id": edge.source_id,
             "target_id": edge.target_id,
         }
+        kind = _value(edge.kind)
+        conflict = self._edge_conflicts.get(edge.id)
+        conflicted_support = (
+            any(item in self._evidence_conflicts for item in edge.evidence_ids)
+            or any(
+                provenance_id in self._provenance_conflicts
+                for evidence_id in edge.evidence_ids
+                for provenance_id in self._transitive_provenance(evidence_id)
+            )
+        )
+        cardinality_conflict = (
+            kind == EdgeKind.OWNED_BY.value
+            and edge.source_id in self._cardinality_conflicted_owners
+        )
+        endpoint_conflict = (
+            edge.source_id in self._node_conflicts
+            or edge.target_id in self._node_conflicts
+        )
+        if conflict is not None or conflicted_support or cardinality_conflict or endpoint_conflict:
+            evidence_ids = sorted(item for item in edge.evidence_ids if item in self._evidence_by_id)
+            provenance_ids = sorted({
+                provenance_id for evidence_id in edge.evidence_ids
+                for provenance_id in self._transitive_provenance(evidence_id)
+                if provenance_id in self._provenance_by_id
+            })
+            if conflict is not None:
+                evidence_ids = sorted(set(evidence_ids) | set(conflict.contributor_evidence_ids))
+                provenance_ids = sorted(set(provenance_ids) | set(conflict.contributor_provenance_ids))
+            evidence_ids = [item for item in evidence_ids if item in self._evidence_by_id]
+            provenance_ids = [item for item in provenance_ids if item in self._provenance_by_id]
+            conflict_reasons = ["conflicting"]
+            if kind == EdgeKind.TOUCHES.value:
+                conflict_reasons.append("candidate")
+            if not edge.evidence_ids or any(
+                not self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids
+            ):
+                conflict_reasons.append("unknown")
+            data["evidence_use"] = evaluate_evidence_use(
+                eligible=False,
+                reason_codes=conflict_reasons,
+                edge_id=edge.id,
+                evidence_ids=evidence_ids,
+                provenance_ids=provenance_ids,
+            ).as_dict()
+        else:
+            # TOUCHES records an implementation observation/candidate, not an
+        # authoritative implementation relationship, even though the catalog
+        # admits it as a semantic edge for traceability display. OpenSpec title
+        # matches are likewise explicitly non-confident REFERENCES; do not
+        # promote those based on their complete source provenance. Keep the
+        # confidence check narrow so declared PR REFERENCES remain eligible.
+            non_confident_reference = (
+                kind == EdgeKind.REFERENCES.value and edge.confidence == "non-confident"
+            )
+            if (
+                self._is_trusted_semantic_edge(edge)
+                and all(self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids)
+                and kind != EdgeKind.TOUCHES.value
+                and not non_confident_reference
+            ):
+                data["evidence_use"] = evaluate_evidence_use(
+                    eligible=True, edge_id=edge.id, evidence_ids=sorted(edge.evidence_ids), provenance_ids=sorted({
+                    provenance_id for evidence_id in edge.evidence_ids
+                    for provenance_id in self._transitive_provenance(evidence_id)
+                })).as_dict()
+            else:
+                reasons = ["candidate"] if kind == EdgeKind.TOUCHES.value else ["unknown"]
+                if kind == EdgeKind.TOUCHES.value and (
+                    not edge.evidence_ids
+                    or any(not self._has_complete_provenance(evidence_id) for evidence_id in edge.evidence_ids)
+                ):
+                    reasons.append("unknown")
+                data["evidence_use"] = evaluate_evidence_use(
+                    eligible=False, reason_codes=reasons, edge_id=edge.id,
+                    evidence_ids=sorted(item for item in edge.evidence_ids if item in self._evidence_by_id),
+                    provenance_ids=sorted({
+                        pid for eid in edge.evidence_ids
+                        for pid in self._transitive_provenance(eid)
+                        if pid in self._provenance_by_id
+                    }),
+                ).as_dict()
         if edge.confidence is not None:
             data["confidence"] = edge.confidence
         locators = self._locators_for(edge.evidence_ids)
@@ -640,9 +849,39 @@ class EngineeringKgQuery:
     def _is_traceability_edge(self, edge: Edge) -> bool:
         """Return whether an admitted edge belongs in object traceability."""
 
+        if (
+            edge.id in self._edge_conflicts
+            or any(item in self._evidence_conflicts for item in edge.evidence_ids)
+            or any(
+                provenance_id in self._provenance_conflicts
+                for evidence_id in edge.evidence_ids
+                for provenance_id in self._transitive_provenance(evidence_id)
+            )
+            or (
+                _value(edge.kind) == EdgeKind.OWNED_BY.value
+                and edge.source_id in self._cardinality_conflicted_owners
+            )
+            or edge.source_id in self._node_conflicts
+            or edge.target_id in self._node_conflicts
+        ):
+            return True
         if self._is_trusted_semantic_edge(edge):
             return True
-        if _value(edge.kind) != EdgeKind.CONTAINS.value:
+        kind = _value(edge.kind)
+        definition = CATALOG_BY_KIND.get(kind)
+        if (
+            definition is not None
+            and definition.classification == "semantic"
+            and relationship_error(
+                kind, self._nodes_by_id.get(edge.source_id), self._nodes_by_id.get(edge.target_id)
+            ) is None
+            and bool(edge.evidence_ids)
+            and any(evidence_id not in self._evidence_by_id for evidence_id in edge.evidence_ids)
+        ):
+            # Keep dangling evidence references visible for diagnosis;
+            # _edge_result marks them unresolved and filters absent IDs.
+            return True
+        if kind != EdgeKind.CONTAINS.value:
             return False
         source = self._nodes_by_id.get(edge.source_id)
         target = self._nodes_by_id.get(edge.target_id)
@@ -730,9 +969,108 @@ class EngineeringKgQuery:
                         observation, claim, self._nodes_by_id, self.snapshot.edges,
                         self._evidence_by_id, self._provenance_by_id,
                     )
+            lifecycle_records = tuple(
+                entry for entry in self.snapshot.cross_graph_link_lifecycle if entry.claim_id == claim.id
+            )
+            canonical_relationship_conflict = (
+                claim.subject_id in self._node_conflicts
+                or any(entry.id in self._cross_graph_lifecycle_conflicts for entry in lifecycle_records)
+            )
+            current_state = str(_value(max(lifecycle_records, key=lambda item: (item.revision, item.id)).state)) if lifecycle_records else None
+            trusted_projection = next(
+                (link for link in self.snapshot.trusted_cross_graph_links if link.claim_id == claim.id),
+                None,
+            )
+            if canonical_relationship_conflict:
+                # Do not expose a projection that depended on selecting one
+                # record from a conflicting canonical subject/lifecycle cohort.
+                trusted_projection = None
+            eligible_observations = tuple(
+                observation for observation in claim_observations
+                if trusted_projection is not None
+                and observation.id in trusted_projection.supporting_evidence_ids
+                and _value(observation.origin) == "declared"
+                and _value(observation.status) == "authoritative"
+                and _value(observation.trust_disposition) == "trusted"
+                and observation.provenance_evidence_id in self._evidence_by_id
+                and self._has_complete_provenance(observation.provenance_evidence_id)
+            )
+            projection_evidence_ids = sorted({
+                observation.provenance_evidence_id for observation in eligible_observations
+            })
+            projection_provenance_ids = sorted({
+                provenance_id for evidence_id in projection_evidence_ids
+                for provenance_id in self._transitive_provenance(evidence_id)
+            })
+            canonical_support_conflict = any(
+                observation.provenance_evidence_id in self._evidence_conflicts
+                or any(
+                    provenance_id in self._provenance_conflicts
+                    for provenance_id in self._transitive_provenance(
+                        observation.provenance_evidence_id
+                    )
+                )
+                for observation in claim_observations
+            ) or any(
+                entry.provenance_evidence_id in self._evidence_conflicts
+                or any(
+                    provenance_id in self._provenance_conflicts
+                    for provenance_id in self._transitive_provenance(
+                        entry.provenance_evidence_id
+                    )
+                )
+                for entry in lifecycle_records
+            )
+            missing_support = any(
+                observation.provenance_evidence_id is None
+                or not self._has_complete_provenance(observation.provenance_evidence_id)
+                for observation in claim_observations
+            ) or any(
+                not self._has_complete_provenance(entry.provenance_evidence_id)
+                for entry in lifecycle_records
+            ) or not claim_observations
+            projection_evidence_use = evaluate_evidence_use(
+                eligible=(bool(eligible_observations) and current_state == "trusted"
+                          and not canonical_relationship_conflict),
+                reason_codes=() if (eligible_observations and current_state == "trusted"
+                                    and not canonical_relationship_conflict) else (
+                    ["inferred"] if any(_value(item.origin) == "inferred" for item in claim_observations) else []
+                ) + (["candidate"] if current_state == "candidate" or any(
+                    _value(item.origin) == "observed" for item in claim_observations
+                ) else []) + (["conflicting"] if canonical_support_conflict or canonical_relationship_conflict else [])
+                + (["unknown"] if missing_support else []) or ["unknown"],
+                claim_id=claim.id,
+                evidence_ids=projection_evidence_ids,
+                provenance_ids=projection_provenance_ids,
+            ).as_dict()
             observations = [
                 {
                     **observation.as_dict(),
+                    "evidence_use": evaluate_evidence_use(
+                        eligible=(observation in eligible_observations and current_state == "trusted"
+                                  and not canonical_relationship_conflict),
+                        reason_codes=() if (observation in eligible_observations and current_state == "trusted"
+                                            and not canonical_relationship_conflict) else (
+                            (["inferred"] if _value(observation.origin) == "inferred" else [])
+                            + (["candidate"] if current_state == "candidate" or _value(observation.origin) == "observed" else [])
+                            + (["conflicting"] if (
+                                observation.provenance_evidence_id in self._evidence_conflicts
+                                or any(
+                                    provenance_id in self._provenance_conflicts
+                                    for provenance_id in self._transitive_provenance(
+                                        observation.provenance_evidence_id
+                                    )
+                                )
+                            ) or canonical_relationship_conflict else [])
+                            + (["unknown"] if (
+                                observation.provenance_evidence_id is None
+                                or not self._has_complete_provenance(observation.provenance_evidence_id)
+                            ) else [])
+                            or ["unknown"]
+                        ), claim_id=claim.id,
+                        evidence_ids=[observation.provenance_evidence_id] if observation.provenance_evidence_id in self._evidence_by_id else [],
+                        provenance_ids=sorted(self._transitive_provenance(observation.provenance_evidence_id)),
+                    ).as_dict(),
                     "evidence_freshness": self._freshness_for((observation.provenance_evidence_id,)),
                     "provenance": list(
                         self._provenance_for((observation.provenance_evidence_id,))
@@ -764,15 +1102,14 @@ class EngineeringKgQuery:
             )
             links.append(
                 {
-                    "claim": claim.as_dict(),
+                    "claim": claim.as_dict() | {"evidence_use": projection_evidence_use},
                     "current_lifecycle_disposition": (
                         current_lifecycle["state"] if current_lifecycle is not None else None
                     ),
+                    "evidence_use": projection_evidence_use,
                     "lifecycle": lifecycle,
                     "observations": observations,
-                    "trusted_projection": any(
-                        link.claim_id == claim.id for link in self.snapshot.trusted_cross_graph_links
-                    ),
+                    "trusted_projection": trusted_projection is not None,
                 }
             )
         return tuple(links)

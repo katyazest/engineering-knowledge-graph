@@ -79,6 +79,24 @@ class PullRequestImplementationEvidenceTest(unittest.TestCase):
         self.assertEqual(validate_graph_integrity(merged).status, "valid")
         self.assertNotIn("provider_payload", merged.as_json())
 
+    def test_declared_pr_reference_remains_supported(self) -> None:
+        normalized = normalize_pull_request_evidence(self.raw)
+        graph = GraphSnapshot(nodes=(self.repository, self.change)).merged_with(
+            extract_pr_code_candidates((normalized,), GraphSnapshot(nodes=(self.repository, self.change))).graph
+        )
+        declared_edge = pull_request_projection_edge(
+            graph.pull_request_evidence[0], graph.pull_request_declared_associations[0]
+        )
+
+        result = EngineeringKgQuery.from_snapshot(graph).get_traceability(normalized.pull_request.node_id)
+        projected = next(
+            item for item in result["relationships"] if item["edge_id"] == declared_edge.id
+        )
+
+        self.assertIsNone(declared_edge.confidence)
+        self.assertEqual(projected["evidence_use"]["disposition"], "supported")
+        self.assertEqual(projected["evidence_use"]["reason_codes"], [])
+
     def test_repeated_complete_evidence_coalesces_pr_relations_and_candidates(self) -> None:
         normalized = normalize_pull_request_evidence(self.raw)
         graph = GraphSnapshot(nodes=(self.repository, self.change))

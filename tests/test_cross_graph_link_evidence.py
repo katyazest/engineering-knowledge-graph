@@ -13,6 +13,7 @@ from engineering_kg.ontology import (
     normalized_support_classification,
 )
 from engineering_kg.persistence import PersistenceIntegrityError, initialize_ladybugdb_store
+from engineering_kg.mcp.factmcp_server import register_query_tools
 from engineering_kg.query import EngineeringKgQuery, GraphQueryValidationError
 from engineering_kg.relationship_vocabulary import CATALOG_REVISION
 from engineering_kg.validation import validate_graph_integrity
@@ -37,6 +38,109 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
     def snapshot(self, observations=(), lifecycle=None):
         lifecycle = lifecycle or CrossGraphLinkLifecycle(self.claim.id, 1, "candidate", self.derived_evidence.id, "observed", "derived", "candidate", "untrusted")
         return GraphSnapshot(nodes=(self.subject,), evidence=(self.external_evidence, self.derived_evidence), provenance=(self.external, self.derived), cross_graph_link_claims=(self.claim,), cross_graph_link_evidence=observations, cross_graph_link_lifecycle=(lifecycle,))
+
+    def support_conflict_snapshot(self, evidence_records):
+        return GraphSnapshot(
+            nodes=(self.subject,),
+            evidence=(*evidence_records, self.derived_evidence),
+            provenance=(self.external, self.derived),
+            cross_graph_link_claims=(self.claim,),
+            cross_graph_link_evidence=(self.support(),),
+            cross_graph_link_lifecycle=(self.support(observation=False),),
+            allow_legacy_evidence=True,
+        )
+
+    def test_cross_graph_evidence_use_retains_conflicting_support_reason_in_both_orders(self) -> None:
+        conflicting_evidence = Evidence(
+            self.external_evidence.id, "conflicting-fixture", self.external_evidence.locator,
+            self.external_evidence.properties, self.external_evidence.provenance_ids,
+        )
+        for evidence_records in (
+            (self.external_evidence, conflicting_evidence),
+            (conflicting_evidence, self.external_evidence),
+        ):
+            with self.subTest(first=evidence_records[0].source):
+                graph = self.support_conflict_snapshot(evidence_records)
+                self.assertEqual(graph.trusted_cross_graph_links, ())
+                link = EngineeringKgQuery.from_snapshot(graph).get_traceability(
+                    self.subject.id
+                )["cross_graph_links"][0]
+                self.assertFalse(link["trusted_projection"])
+                self.assertEqual(link["evidence_use"]["disposition"], "unresolved")
+                self.assertIn("conflicting", link["evidence_use"]["reason_codes"])
+
+    def test_registered_mcp_preserves_cross_graph_conflict_reason_in_both_orders(self) -> None:
+        conflicting_evidence = Evidence(
+            self.external_evidence.id, "conflicting-fixture", self.external_evidence.locator,
+            self.external_evidence.properties, self.external_evidence.provenance_ids,
+        )
+
+        class Server:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self):
+                def register(function):
+                    self.tools[function.__name__] = function
+                    return function
+                return register
+
+        for evidence_records in (
+            (self.external_evidence, conflicting_evidence),
+            (conflicting_evidence, self.external_evidence),
+        ):
+            with self.subTest(first=evidence_records[0].source):
+                graph = self.support_conflict_snapshot(evidence_records)
+                server = Server()
+                register_query_tools(
+                    server, graph_store_path=".",
+                    query_factory=lambda _, graph=graph: EngineeringKgQuery.from_snapshot(graph),
+                )
+                result = server.tools["get_traceability"](self.subject.id)
+                self.assertTrue(result["ok"])
+                link = result["result"]["cross_graph_links"][0]
+                self.assertFalse(link["trusted_projection"])
+                self.assertEqual(link["evidence_use"]["disposition"], "unresolved")
+                self.assertIn("conflicting", link["evidence_use"]["reason_codes"])
+
+    def test_candidate_lifecycle_without_observations_is_unknown_locally_and_through_mcp(self) -> None:
+        graph = self.snapshot()
+        query = EngineeringKgQuery.from_snapshot(graph)
+
+        local = query.get_traceability(self.subject.id)["cross_graph_links"][0]
+
+        self.assertEqual(local["current_lifecycle_disposition"], "candidate")
+        self.assertEqual(local["evidence_use"]["disposition"], "unresolved")
+        self.assertEqual(local["evidence_use"]["reason_codes"], ["candidate", "unknown"])
+        self.assertEqual(local["evidence_use"]["evidence_ids"], [])
+        self.assertEqual(local["evidence_use"]["provenance_ids"], [])
+        self.assertFalse(local["trusted_projection"])
+        self.assertEqual(local["observations"], [])
+
+        class Server:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self):
+                def register(function):
+                    self.tools[function.__name__] = function
+                    return function
+                return register
+
+        server = Server()
+        register_query_tools(
+            server, graph_store_path=".",
+            query_factory=lambda _, query=query: query,
+        )
+        result = server.tools["get_traceability"](self.subject.id)
+
+        self.assertTrue(result["ok"])
+        forwarded = result["result"]["cross_graph_links"][0]
+        self.assertEqual(forwarded["evidence_use"], local["evidence_use"])
+        self.assertEqual(forwarded["evidence_use"]["reason_codes"], ["candidate", "unknown"])
+        self.assertEqual(forwarded["evidence_use"]["evidence_ids"], [])
+        self.assertEqual(forwarded["evidence_use"]["provenance_ids"], [])
+        self.assertFalse(forwarded["trusted_projection"])
 
     def test_classification_is_required_payload_safe_and_part_of_identity(self) -> None:
         with self.assertRaisesRegex(TypeError, "required positional"):
@@ -155,6 +259,29 @@ class CrossGraphLinkEvidenceTest(unittest.TestCase):
         graph = self.snapshot((self.support(),), self.support(observation=False))
         self.assertEqual(validate_graph_integrity(graph).status, "valid")
         self.assertEqual([item.claim_id for item in graph.trusted_cross_graph_links], [self.claim.id])
+
+    def test_trusted_cross_graph_projection_is_supported_with_resolvable_path(self) -> None:
+        graph = self.snapshot((self.support(),), self.support(observation=False))
+        self.assertEqual(validate_graph_integrity(graph).status, "valid")
+        self.assertTrue(graph.trusted_cross_graph_links)
+
+        link = EngineeringKgQuery.from_snapshot(graph).get_traceability(self.subject.id)["cross_graph_links"][0]
+
+        self.assertEqual(link["evidence_use"]["disposition"], "supported")
+        self.assertEqual(link["evidence_use"]["reason_codes"], [])
+        self.assertEqual(link["evidence_use"]["claim_id"], self.claim.id)
+        self.assertEqual(link["evidence_use"]["evidence_ids"], [self.external_evidence.id])
+        self.assertEqual(link["evidence_use"]["provenance_ids"], [self.external.id])
+
+    def test_cross_graph_claim_and_link_attach_evidence_use(self) -> None:
+        graph = self.snapshot((self.support(),), self.support(observation=False))
+
+        link = EngineeringKgQuery.from_snapshot(graph).get_traceability(self.subject.id)["cross_graph_links"][0]
+
+        self.assertIn("evidence_use", link)
+        self.assertIn("evidence_use", link["claim"])
+        self.assertEqual(link["claim"]["evidence_use"], link["evidence_use"])
+        self.assertEqual(link["claim"]["id"], self.claim.id)
 
     def test_trusted_projection_is_blocked_by_generic_canonical_conflict(self) -> None:
         conflicting_subject = Node(self.subject.id, NodeKind.JIRA_STORY, "conflicting subject")

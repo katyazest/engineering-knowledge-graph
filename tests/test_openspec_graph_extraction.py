@@ -18,6 +18,7 @@ from engineering_kg.ingest.openspec import (
 from engineering_kg.ontology import EdgeKind, NodeKind
 from engineering_kg.project import load_workspace_registry
 from engineering_kg.persistence import initialize_ladybugdb_store
+from engineering_kg.query import EngineeringKgQuery
 from engineering_kg.validation import validate_graph_integrity
 
 ROOT = REPO_ROOT / "tests/fixtures/non-git-workspace/openspec/requirements_repo"
@@ -106,6 +107,32 @@ class OpenSpecGraphExtractionTest(unittest.TestCase):
             evidence.locator.as_dict()["relative_file_path"],
             "openspec/specs/payments/spec.md",
         )
+
+    def test_non_confident_related_reference_stays_visible_but_unresolved(self) -> None:
+        graph = _extract().graph
+        specifications = {
+            node.properties["capability"]: node
+            for node in graph.nodes
+            if node.kind == NodeKind.SPECIFICATION
+        }
+        source = specifications["payments"]
+        target = specifications["settlement"]
+        reference = next(
+            edge for edge in graph.edges
+            if edge.kind == EdgeKind.REFERENCES
+            and edge.source_id == source.id
+            and edge.target_id == target.id
+            and edge.confidence == "non-confident"
+        )
+
+        projected = EngineeringKgQuery.from_snapshot(graph).get_traceability(source.id)
+        result = next(item for item in projected["relationships"] if item["edge_id"] == reference.id)
+
+        self.assertEqual(result["kind"], EdgeKind.REFERENCES.value)
+        self.assertEqual(result["confidence"], "non-confident")
+        self.assertEqual(result["evidence_use"]["disposition"], "unresolved")
+        self.assertEqual(result["evidence_use"]["reason_codes"], ["unknown"])
+        self.assertEqual(result["evidence_use"]["evidence_ids"], list(reference.evidence_ids))
 
     def test_change_only_nested_capability_creates_canonical_facts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
